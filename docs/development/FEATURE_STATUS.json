@@ -1,0 +1,565 @@
+{
+  "schema": "aether-feature-status-v1",
+  "review_date": "2026-10-17",
+  "timezone": "Asia/Shanghai",
+  "version": "0.2.0",
+  "scope": "Local personal research product. Status describes implementation and available verification, not investment performance. Earlier paid/provider/browser evidence is reused; read-only endpoint checks do not refresh external data.",
+  "status_definitions": {
+    "verified": "Implemented with the listed software, saved live or browser evidence. Each row states which evidence exists.",
+    "experimental": "Implemented and exercised, with research-quality or generalization limits.",
+    "partial": "Only the stated subset is implemented or available.",
+    "unconfigured": "Adapter exists and offline contracts pass; actual external integration has not been verified.",
+    "not_implemented": "Not delivered as a working product capability."
+  },
+  "features": [
+    {
+      "id": "H01",
+      "category": "Harness",
+      "name": "Local Deep Agents / LangGraph with Doubao Pro",
+      "zh": "本地 Deep Agents / LangGraph + 豆包 Pro",
+      "status": "verified",
+      "verification": "Real Pro research/report and follow-up jobs completed; configuration read back from running service.",
+      "tests": [
+        "test_agent",
+        "test_online",
+        "test_model_recovery"
+      ],
+      "limit": "Authorized /api/plan/v3 only. Provider failures remain possible; no Lite or extra-billing fallback."
+    },
+    {
+      "id": "H02",
+      "category": "Harness",
+      "name": "Flexible tools, host terminal and Python SDK",
+      "zh": "通用工具、真实终端与 Python SDK",
+      "status": "verified",
+      "verification": "12 business tools and 8 framework tools asserted; real terminal/socket capture and registered custom calculation exercised.",
+      "tests": [
+        "test_harness_sdk",
+        "test_product"
+      ],
+      "limit": "Trusted local host execution; not a multiuser OS sandbox. Analysis methods remain optional."
+    },
+    {
+      "id": "H03",
+      "category": "Harness",
+      "name": "Four progressively loaded research skills",
+      "zh": "四个按需加载的研究 skill",
+      "status": "verified",
+      "verification": "Packaged research, quantitative-analysis, strategy-research and portfolio-analysis skills; clean-wheel skill discovery checked.",
+      "tests": [
+        "test_harness_sdk"
+      ],
+      "limit": "Skills guide methods; they do not force a fixed tool sequence. Synchronous subagent delegation is disabled."
+    },
+    {
+      "id": "H04",
+      "category": "Harness",
+      "name": "Session checkpoints, traces, stop and recovery",
+      "zh": "会话保存、任务轨迹、停止与中断恢复",
+      "status": "verified",
+      "verification": "SQLite conversation persistence, cancellation, provider-format repair and abandoned-job recovery tests; saved live traces retained.",
+      "tests": [
+        "test_agent",
+        "test_knowledge",
+        "test_model_recovery",
+        "test_product"
+      ],
+      "limit": "Continuing failed work is explicit; failed drafts do not become valid answers."
+    },
+    {
+      "id": "D01",
+      "category": "Data",
+      "name": "ETH/BTC quotes and completed candles",
+      "zh": "ETH/BTC 行情与已结束的小时／日 K 线",
+      "status": "verified",
+      "verification": "Saved real provider receipts and current dashboard endpoint inspected; normalization and unfinished-bar tests pass.",
+      "tests": [
+        "test_product",
+        "test_data",
+        "test_strategy_history"
+      ],
+      "limit": "Single-venue USD data, with source and retrieval times. Cached success is not proof of freshness."
+    },
+    {
+      "id": "D02",
+      "category": "Data",
+      "name": "Returns, volume, volatility, drawdown and ETH/BTC comparison",
+      "zh": "收益变化、成交量、波动率、回撤和 ETH/BTC 对比",
+      "status": "verified",
+      "verification": "Window alignment, missing observations, completed-bar time and reproducible calculation contracts tested.",
+      "tests": [
+        "test_metrics",
+        "test_simulation"
+      ],
+      "limit": "Descriptive indicators, not predictive guarantees; volume and turnover are different quantities."
+    },
+    {
+      "id": "D03",
+      "category": "Data",
+      "name": "Funding rates and open-interest snapshots",
+      "zh": "资金费率与持仓量快照变化",
+      "status": "verified",
+      "verification": "Saved OKX source availability inspected; same-interval funding and same-contract OI arithmetic tested.",
+      "tests": [
+        "test_metrics"
+      ],
+      "limit": "One venue/contract. OI change uses an explicit saved interval and includes repricing, not proven capital inflow."
+    },
+    {
+      "id": "D04",
+      "category": "Data",
+      "name": "Visible spread/depth and hypothetical purchase cost",
+      "zh": "盘口价差、可见深度与假设买入成本",
+      "status": "verified",
+      "verification": "Partial coverage, price bands, VWAP and full intended-fee handling tested; saved real book available.",
+      "tests": [
+        "test_metrics",
+        "test_investment_api"
+      ],
+      "limit": "Top saved levels only; no guaranteed fill, latency model or order placement."
+    },
+    {
+      "id": "D05",
+      "category": "Data",
+      "name": "DeFi TVL, stablecoins, DEX activity and Aave fees",
+      "zh": "DeFi TVL、稳定币、DEX 活动及 Aave 费用数据",
+      "status": "verified",
+      "verification": "Saved real source receipts and per-source dashboard status inspected; normalization tests preserve native units and gaps.",
+      "tests": [
+        "test_data",
+        "test_product"
+      ],
+      "limit": "Provider coverage varies; stocks, flows, fees and revenue are distinct metrics."
+    },
+    {
+      "id": "D06",
+      "category": "Data",
+      "name": "Read-only Ethereum RPC and bounded Aave WETH analysis",
+      "zh": "以太坊只读 RPC 与限定范围 Aave WETH 分析",
+      "status": "verified",
+      "verification": "Saved real RPC/event capture and ABI/filter tests; available through terminal SDK.",
+      "tests": [
+        "test_onchain",
+        "test_harness_sdk"
+      ],
+      "limit": "Specific pool/reserve/block window only. Historical liquidity may be unavailable; not full-chain inflow or buying pressure."
+    },
+    {
+      "id": "D07",
+      "category": "Data",
+      "name": "Broader macro, ETF, liquidation and consensus coverage",
+      "zh": "更全面的宏观、ETF、清算及共识指标",
+      "status": "partial",
+      "verification": "Optional archive adapters and explicit missing-data behavior exist; comprehensive live coverage is not accepted.",
+      "tests": [
+        "test_data"
+      ],
+      "limit": "No claim of complete live coverage; unavailable or permission-limited fields remain gaps."
+    },
+    {
+      "id": "N01",
+      "category": "News and memory",
+      "name": "Web search, publisher feeds and original-page capture",
+      "zh": "联网搜索、新闻源与原文抓取",
+      "status": "verified",
+      "verification": "Real Pro search/original-page workflow completed; citation annotations, extraction and raw-integrity tests pass.",
+      "tests": [
+        "test_online",
+        "test_product"
+      ],
+      "limit": "Search excerpts are separate from originals; publication dates may be unknown; search uses configured provider quota."
+    },
+    {
+      "id": "N02",
+      "category": "News and memory",
+      "name": "Persistent news, event revisions and correction timeline",
+      "zh": "新闻保存、事件版本及更正时间线",
+      "status": "verified",
+      "verification": "Reviewed source-backed event revisions, cutoff tests and browser timeline accepted; running API retains saved versions.",
+      "tests": [
+        "test_knowledge",
+        "test_desk"
+      ],
+      "limit": "Event grouping/classification is an analyst judgment. Saved versions are not a large independently observed revision corpus."
+    },
+    {
+      "id": "N03",
+      "category": "News and memory",
+      "name": "Cross-session recall of evidence and prior research",
+      "zh": "跨会话召回证据与历史研究",
+      "status": "verified",
+      "verification": "News FTS/lexical recall, original source identity, answer-context index and restart behavior tested; actual saved context recalled.",
+      "tests": [
+        "test_knowledge",
+        "test_research_memory",
+        "test_harness_sdk"
+      ],
+      "limit": "Prior AI conclusions are research context, not a new fact source or current user preference."
+    },
+    {
+      "id": "N04",
+      "category": "News and memory",
+      "name": "Relevance, MMR and coverage evidence selection",
+      "zh": "相关性、MMR 与 coverage 证据选择",
+      "status": "experimental",
+      "verification": "Budget, time, duplicate and linked-update contracts; frozen matched selector comparisons completed.",
+      "tests": [
+        "test_memory_selection",
+        "test_memory_benchmark"
+      ],
+      "limit": "Lexical training-free methods; coverage scored below relevance/MMR in the pilot. Context cost is an estimate."
+    },
+    {
+      "id": "R01",
+      "category": "Research and evidence",
+      "name": "Manual research questions and reviewed answers",
+      "zh": "主动提问与来源审核后的回答",
+      "status": "verified",
+      "verification": "Real Pro current-data and saved-history answers completed; numeric, unit and source gates tested.",
+      "tests": [
+        "test_agent",
+        "test_review",
+        "test_knowledge",
+        "test_advice"
+      ],
+      "limit": "Separate-context review uses the same model family and remains fallible AI assessment."
+    },
+    {
+      "id": "R02",
+      "category": "Research and evidence",
+      "name": "Structured reports and publication gates",
+      "zh": "结构化报告及发布核验",
+      "status": "verified",
+      "verification": "Real report publication with numeric and source support checks; failed-review/export drafts retained.",
+      "tests": [
+        "test_agent",
+        "test_review",
+        "test_product"
+      ],
+      "limit": "Attribution is inspectable, not guaranteed truth. Unsupported claims must be revised, removed or qualified."
+    },
+    {
+      "id": "R03",
+      "category": "Research and evidence",
+      "name": "Claim-to-original evidence reader",
+      "zh": "逐条结论与原始证据并排阅读",
+      "status": "verified",
+      "verification": "Report and chat advice/history citation mapping checked in desktop/mobile browser; exact-quote contracts tested.",
+      "tests": [
+        "test_review",
+        "test_advice"
+      ],
+      "limit": "Unmatched citation context falls back to source view; quote integrity alone does not establish semantic correctness."
+    },
+    {
+      "id": "R04",
+      "category": "Research and evidence",
+      "name": "Registered autonomous Python calculations",
+      "zh": "模型自主编写并登记可复现计算",
+      "status": "verified",
+      "verification": "Real terminal calculation rerun, recipe/input hashes, lineage and publication-number checks.",
+      "tests": [
+        "test_harness_sdk",
+        "test_product",
+        "test_replay"
+      ],
+      "limit": "Unregistered terminal prose is not automatically citable. Reproducibility does not prove a method is suitable."
+    },
+    {
+      "id": "R05",
+      "category": "Research and evidence",
+      "name": "Evidence ZIP, integrity verification and offline replay",
+      "zh": "证据包导出、完整性验证及离线重放",
+      "status": "verified",
+      "verification": "Real report package integrity and custom recipe replay passed; tampering, missing-file and traversal cases tested.",
+      "tests": [
+        "test_audit",
+        "test_replay"
+      ],
+      "limit": "Local exports can contain cited private portfolio data; public source delivery excludes them. Archived code replay executes on the host."
+    },
+    {
+      "id": "R06",
+      "category": "Research and evidence",
+      "name": "Saved report history and changes",
+      "zh": "历史报告与内容变化对比",
+      "status": "verified",
+      "verification": "Immutable earlier reports and literal claim/source/judgment diffs tested; browser comparison inspected.",
+      "tests": [
+        "test_desk"
+      ],
+      "limit": "Literal wording differences are not automatically material market events."
+    },
+    {
+      "id": "A01",
+      "category": "Advice",
+      "name": "Evidence-linked conditional suggestions",
+      "zh": "连接数据与来源的条件性建议",
+      "status": "verified",
+      "verification": "Real current-data advice published; conditions, counterpoints, invalidation, gaps and review triggers validated/reviewed.",
+      "tests": [
+        "test_advice",
+        "test_review"
+      ],
+      "limit": "No established accuracy rate, causal price effect or profitable investment edge."
+    },
+    {
+      "id": "A02",
+      "category": "Advice",
+      "name": "Qualified historical-case reasoning",
+      "zh": "有来源及适用范围的历史案例参考",
+      "status": "verified",
+      "verification": "Real saved-experiment follow-up; case end, receipt time, underlying inputs and transfer limits tested.",
+      "tests": [
+        "test_advice",
+        "test_research_memory"
+      ],
+      "limit": "Unavailable analogies remain gaps; retrospective observations are not promoted to point-in-time evidence or invented win rates."
+    },
+    {
+      "id": "A03",
+      "category": "Advice",
+      "name": "Research preferences and paper scenarios",
+      "zh": "研究期限、风险偏好与假设方案比较",
+      "status": "verified",
+      "verification": "Unknown versus explicit-zero context, loss scenarios and common-window buy/hold, staged-entry and momentum calculations tested.",
+      "tests": [
+        "test_advice",
+        "test_simulation",
+        "test_product"
+      ],
+      "limit": "Defaults are labelled assumptions; hypothetical loss is not a probability estimate or actual P&L."
+    },
+    {
+      "id": "P01",
+      "category": "Portfolio",
+      "name": "Manual USD/ETH/BTC ledger and CSV operations",
+      "zh": "手工 USD／ETH／BTC 台账及 CSV 操作",
+      "status": "verified",
+      "verification": "Atomic imports, duplicates/conflicts, void/restore and export tests; disposable UI acceptance completed.",
+      "tests": [
+        "test_investment_ledger",
+        "test_investment_api"
+      ],
+      "limit": "Actual ledger currently empty; no demo holdings inserted. Manual records are not exchange-verified balances."
+    },
+    {
+      "id": "P02",
+      "category": "Portfolio",
+      "name": "FIFO basis, fees and realized/unrealized P&L",
+      "zh": "FIFO 成本、费用及已实现／浮动盈亏",
+      "status": "verified",
+      "verification": "Exact cash/fee accounting, transfers, cutoff and missing-mark/basis cases tested.",
+      "tests": [
+        "test_investment_ledger"
+      ],
+      "limit": "Unknown basis remains unknown. This is not tax accounting and excludes unrecorded outside holdings."
+    },
+    {
+      "id": "P03",
+      "category": "Portfolio",
+      "name": "Read-only portfolio context and purchase constraints",
+      "zh": "持仓关联研究与买入约束预览",
+      "status": "verified",
+      "verification": "Private snapshot lineage and cash/concentration/depth/conditional-loss preview tested.",
+      "tests": [
+        "test_investment_api",
+        "test_advice"
+      ],
+      "limit": "Business analyst has no ledger-write tool. Preview is not a trade or complete suitability assessment."
+    },
+    {
+      "id": "S01",
+      "category": "Strategy Lab",
+      "name": "Local logistic/tree training and walk-forward evaluation",
+      "zh": "本地逻辑回归／树模型训练与滚动评估",
+      "status": "experimental",
+      "verification": "Real saved completed-OHLCV experiment and model inspection; temporal labels, purging, refit and future-invariance tests.",
+      "tests": [
+        "test_strategy_models",
+        "test_strategy_history"
+      ],
+      "limit": "Small inspectable research baselines, not demonstrated professional forecasting or validated profitable models."
+    },
+    {
+      "id": "S02",
+      "category": "Strategy Lab",
+      "name": "Cost-aware common-window simulations and exports",
+      "zh": "同区间含成本策略比较与实验导出",
+      "status": "verified",
+      "verification": "Common calendar/costs, delayed execution, baseline comparisons, artifact JSON and deterministic report tested.",
+      "tests": [
+        "test_strategy_models",
+        "test_simulation"
+      ],
+      "limit": "Idealized daily-open fills; no real latency/market impact. Repeated experiments weaken holdout independence."
+    },
+    {
+      "id": "T01",
+      "category": "Monitoring",
+      "name": "Persistent once/daily/weekly briefs and interval monitors",
+      "zh": "持久化单次／每日／每周简报及间隔监测",
+      "status": "verified",
+      "verification": "Real scheduled report completed; timezone, restart, duplicate prevention and bounded retry tests.",
+      "tests": [
+        "test_scheduler"
+      ],
+      "limit": "Local computer and service must run. Three saved product schedules are currently disabled; no new schedule was enabled in this review."
+    },
+    {
+      "id": "T02",
+      "category": "Monitoring",
+      "name": "Changes-only triggers and in-app run status",
+      "zh": "仅变化触发、应用内提醒与执行状态",
+      "status": "verified",
+      "verification": "Quiet baseline, unchanged-no-model-call, busy deferral and saved run-state tests; status UI inspected.",
+      "tests": [
+        "test_scheduler",
+        "test_desk"
+      ],
+      "limit": "Thresholds are user monitoring preferences. External email/SMS/push channels are not implemented."
+    },
+    {
+      "id": "U01",
+      "category": "Dashboard",
+      "name": "English Home, Research and Portfolio workspace",
+      "zh": "英文 Home、Research、Portfolio 三入口工作台",
+      "status": "verified",
+      "verification": "Real desktop/390px checks of three primary destinations, nested news/reports/updates, embedded chat, optional preferences and More menu; existing evidence/history access preserved.",
+      "tests": [
+        "test_desk",
+        "test_investment_api"
+      ],
+      "limit": "ETH is the primary workspace and BTC a comparison asset; not an arbitrary-asset trading terminal."
+    },
+    {
+      "id": "U02",
+      "category": "Dashboard",
+      "name": "Persistent inbox, comparison point and disconnected recovery",
+      "zh": "持久化收件箱、比较基准及断线恢复",
+      "status": "verified",
+      "verification": "Seen state, irregular quote-baseline semantics and CSRF tests; real disconnect/reconnect and reload acceptance.",
+      "tests": [
+        "test_desk",
+        "test_agent"
+      ],
+      "limit": "Saved quote change is not personal profit. Reconnect does not silently restart model research."
+    },
+    {
+      "id": "V01",
+      "category": "Validation",
+      "name": "Offline application regression and clean-wheel startup",
+      "zh": "离线回归与干净安装启动验证",
+      "status": "verified",
+      "verification": "167 tests across 26 modules, offline harness probe and isolated wheel-state acceptance; no paid model calls in software tests.",
+      "tests": [
+        "test_agent",
+        "test_product",
+        "test_investment_api"
+      ],
+      "limit": "Dependencies reused from locked local runtime; Linux/Python-version CI is configured but not remotely executed here."
+    },
+    {
+      "id": "V02",
+      "category": "Validation",
+      "name": "Frozen historical and memory evaluations",
+      "zh": "冻结历史与 memory 评测",
+      "status": "verified",
+      "verification": "Saved 3-case historical gate pilot; 13 official-source snapshots, 12 groups, 39 probes and 77 frozen contract checks.",
+      "tests": [
+        "test_evaluation",
+        "test_memory_benchmark",
+        "test_memory_selection"
+      ],
+      "limit": "Small, AI-authored pilot labels and current captures; not a large independent market benchmark."
+    },
+    {
+      "id": "V03",
+      "category": "Validation",
+      "name": "Matched paired Pro answers and recorded failures/costs",
+      "zh": "配对 Pro 回答对比及失败／消耗记录",
+      "status": "experimental",
+      "verification": "Four fixed cases by three selectors produced 12 outputs with shared inputs/model and actual token/latency records.",
+      "tests": [
+        "test_memory_answers"
+      ],
+      "limit": "No same-model truth judge; response-mode agreement is not semantic accuracy. No statistically established improvement."
+    },
+    {
+      "id": "V04",
+      "category": "Validation",
+      "name": "Independent human adjudication and richer real revision histories",
+      "zh": "独立人工复核及更丰富的真实更正历史",
+      "status": "not_implemented",
+      "verification": "Explicit gap preserved in acceptance and evaluation guide.",
+      "tests": [],
+      "limit": "Labels await independent review; twelve independently observed multiversion real event histories are not available. New tuning needs untouched confirmation data."
+    },
+    {
+      "id": "X01",
+      "category": "Optional / future",
+      "name": "Jev external semantic assessment",
+      "zh": "Jev 外部语义检测",
+      "status": "experimental",
+      "verification": "Offline adapter validation/abstention/credential tests plus one authorized real event-status smoke test on 2026-10-23: jev-1.14.0, expected synthetic planned status, 588 input/63 output tokens, 1.223 seconds.",
+      "tests": [
+        "test_jev"
+      ],
+      "limit": "Separate TypeSafe credential. Three-stage integration and task/report quality remain unverified. No price-prediction claim."
+    },
+    {
+      "id": "X02",
+      "category": "Optional / future",
+      "name": "Public-chain audit anchoring",
+      "zh": "公开链证据哈希存证",
+      "status": "partial",
+      "verification": "Contract/client and local EVM tests retained; public Sepolia probe lacked test funds.",
+      "tests": [],
+      "limit": "No verified public deployment/transaction. Optional audit dependencies are separate; no mainnet deployment."
+    },
+    {
+      "id": "X03",
+      "category": "Optional / future",
+      "name": "Exchange sync, automated orders and public multiuser deployment",
+      "zh": "交易所同步、自动下单及公开多用户部署",
+      "status": "not_implemented",
+      "verification": "No working exchange-order or account-sync integration is delivered; service is loopback-only.",
+      "tests": [],
+      "limit": "Current release is a local single-user research application, not a broker, cloud service or production account system."
+    },
+    {
+      "id": "X01",
+      "category": "Optional research extensions",
+      "name": "RPC resilience and bounded capability observations",
+      "status": "verified",
+      "evidence": "23 offline transport cases plus low-load real cache/header/log probe",
+      "boundary": "Provider maxima unknown; archived state authorization gap"
+    },
+    {
+      "id": "X02",
+      "category": "Optional research extensions",
+      "name": "Frozen per-signal evaluation",
+      "status": "experimental",
+      "evidence": "4960 real bars,18 cases,23 variants,three cost scenarios; exact saved-source replay",
+      "boundary": "Retrospective single venue; full-model Brier did not beat the constant prior aggregate baseline"
+    },
+    {
+      "id": "X03",
+      "category": "Optional research extensions",
+      "name": "Optional strategy-code workshop",
+      "status": "experimental",
+      "evidence": "Two real Deep Agents/Pro author/reviewer rounds, all artifacts, final code lock and8 confirmation cases",
+      "boundary": "Selected source has a deterministically reproduced mean-formula bug and is blocked for correction; no promotion or orders"
+    },
+    {
+      "id": "X04",
+      "category": "Optional research extensions",
+      "name": "Optional advanced research panel",
+      "status": "verified",
+      "evidence": "Local API and desktop/mobile acceptance; disabled state and core compatibility tests",
+      "boundary": "Argo is not integrated and funding arbitrage is deferred"
+    }
+  ],
+  "status_update_date": "2026-10-26",
+  "status_update_scope": "Jev connection status reconciled against the saved live receipt. Production application unchanged; current offline framework probe passed. See PROJECT_REVIEW_20261026.md."
+}

@@ -1,0 +1,11 @@
+# Optional additions, constrained by requirements.lock.txt; resolved on Python3.14/macOS.
+filelock==4.2.4
+fsspec==2026.9.0
+hf-xet==1.7.0
+huggingface_hub==2.3.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+model2vec==0.10.0
+safetensors==0.8.0
+tokenizers==0.23.3
+tqdm==4.70.1

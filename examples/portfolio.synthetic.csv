@@ -1,0 +1,4 @@
+external_id,time,kind,asset,quantity,price_usd,fee_usd,cost_basis_usd,note
+synthetic-funding,2025-01-01T00:00:00Z,deposit,USD,10000,,0,,SYNTHETIC EXAMPLE ONLY
+synthetic-buy,2025-01-02T00:00:00Z,buy,ETH,1,2500,2.5,,SYNTHETIC EXAMPLE ONLY
+synthetic-sell,2025-02-01T00:00:00Z,sell,ETH,0.25,2800,0.7,,SYNTHETIC EXAMPLE ONLY

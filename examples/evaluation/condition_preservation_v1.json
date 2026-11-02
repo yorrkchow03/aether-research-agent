@@ -1,0 +1,785 @@
+{
+  "schema": "aether-condition-preservation-v1",
+  "version": "1.1",
+  "provenance": "synthetic_minimal_sources",
+  "label_author": "Codex AI-authored before provider evaluation; inspectable diagnostic labels, not human truth",
+  "held_out": false,
+  "intended_use": "Counterfactual diagnostic and regression; no estimate of population accuracy or investment returns.",
+  "protocol": {
+    "task": "support",
+    "context_budget_characters": 2400,
+    "maximum_sources": 3,
+    "maximum_provider_attempts_per_case": 1,
+    "provider_input": "question and only cutoff-eligible original sources; reference labels and obligations excluded",
+    "comparison": "Same question, eligible original bytes, support criteria, context budget, one first attempt and configured confidence thresholds; confidence thresholds must be reported separately.",
+    "metrics": [
+      "first_attempt_completion",
+      "label_agreement_with_ai_reference",
+      "usable_label_agreement",
+      "abstentions",
+      "errors",
+      "source_quote_integrity",
+      "required_condition_coverage",
+      "latency_seconds",
+      "provider_usage"
+    ],
+    "semantic_correctness": null,
+    "independent_adjudication": "pending",
+    "cost_rule": "Report provider denominators, actual usage and saved price assumptions; missing cost remains null.",
+    "limitations": [
+      "Synthetic paired variations are not independent real news examples.",
+      "Exact quotations and required condition coverage verify transport, not semantic correctness.",
+      "AI-authored reference labels may be ambiguous; preserve disagreements for independent review.",
+      "No profit, causal market explanation, or deployment superiority is measured."
+    ],
+    "version": "1.1",
+    "observation_clock_rule": "When source observed_at or period_end is supplied, it must be timezone-aware and no later than source publication and acquisition. Future planned event_at is not treated as an observed outcome."
+  },
+  "cases": [
+    {
+      "case_id": "event-status-proposed",
+      "pair_id": "event-status",
+      "family": "event-status",
+      "variant": "proposed",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-02T00:00:00Z",
+      "question": "The Zephyr pilot is active on Ethereum mainnet as of October 1, 2026.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-event-status-proposed",
+          "title": "SYNTHETIC diagnostic source event-status-proposed",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: As of October 1, 2026, Zephyr is a proposed pilot. It has not been activated on Ethereum mainnet.",
+          "published_at": "2026-10-01T01:00:00Z",
+          "retrieved_at": "2026-10-01T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/event-status-proposed"
+          },
+          "observed_at": "2026-10-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-event-status-proposed"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "event_status",
+          "record_id": "condition-fixture-event-status-proposed",
+          "exact_quote": "It has not been activated on Ethereum mainnet."
+        }
+      ],
+      "reference": {
+        "label": "contradicted",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "event-status-active",
+      "pair_id": "event-status",
+      "family": "event-status",
+      "variant": "active",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-02T00:00:00Z",
+      "question": "The Zephyr pilot is active on Ethereum mainnet as of October 1, 2026.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-event-status-active",
+          "title": "SYNTHETIC diagnostic source event-status-active",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: Zephyr was activated on Ethereum mainnet on September 1 and remains active as of October 1, 2026.",
+          "published_at": "2026-10-01T01:00:00Z",
+          "retrieved_at": "2026-10-01T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/event-status-active"
+          },
+          "observed_at": "2026-10-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-event-status-active"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "event_status",
+          "record_id": "condition-fixture-event-status-active",
+          "exact_quote": "remains active as of October 1, 2026."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "eligibility-restricted",
+      "pair_id": "eligibility",
+      "family": "eligibility",
+      "variant": "restricted",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "All validators are eligible for the program regardless of validation history.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-eligibility-restricted",
+          "title": "SYNTHETIC diagnostic source eligibility-restricted",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: Only validators with at least three months of active validation history are eligible. Other validators are ineligible.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/eligibility-restricted"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-eligibility-restricted"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "eligibility",
+          "record_id": "condition-fixture-eligibility-restricted",
+          "exact_quote": "Only validators with at least three months of active validation history are eligible."
+        }
+      ],
+      "reference": {
+        "label": "contradicted",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "eligibility-unrestricted",
+      "pair_id": "eligibility",
+      "family": "eligibility",
+      "variant": "unrestricted",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "All validators are eligible for the program regardless of validation history.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-eligibility-unrestricted",
+          "title": "SYNTHETIC diagnostic source eligibility-unrestricted",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: All validators are eligible regardless of validation history.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/eligibility-unrestricted"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-eligibility-unrestricted"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "eligibility",
+          "record_id": "condition-fixture-eligibility-unrestricted",
+          "exact_quote": "All validators are eligible regardless of validation history."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "horizon-weekly",
+      "pair_id": "horizon",
+      "family": "horizon",
+      "variant": "weekly",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-02T00:00:00Z",
+      "question": "The source reports that ETH declined over the full calendar month of September 2026.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-horizon-weekly",
+          "title": "SYNTHETIC diagnostic source horizon-weekly",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: ETH declined over September 1 through September 7, 2026. No observation is supplied for the rest of the month.",
+          "published_at": "2026-09-08T01:00:00Z",
+          "retrieved_at": "2026-09-08T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/horizon-weekly"
+          },
+          "observed_at": "2026-09-08T00:00:00Z",
+          "period_end": "2026-09-08T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-horizon-weekly"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "horizon",
+          "record_id": "condition-fixture-horizon-weekly",
+          "exact_quote": "No observation is supplied for the rest of the month."
+        }
+      ],
+      "reference": {
+        "label": "insufficient",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "horizon-monthly",
+      "pair_id": "horizon",
+      "family": "horizon",
+      "variant": "monthly",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-02T00:00:00Z",
+      "question": "The source reports that ETH declined over the full calendar month of September 2026.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-horizon-monthly",
+          "title": "SYNTHETIC diagnostic source horizon-monthly",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: ETH declined over the full calendar month of September 2026.",
+          "published_at": "2026-10-01T01:00:00Z",
+          "retrieved_at": "2026-10-01T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/horizon-monthly"
+          },
+          "observed_at": "2026-10-01T00:00:00Z",
+          "period_end": "2026-10-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-horizon-monthly"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "horizon",
+          "record_id": "condition-fixture-horizon-monthly",
+          "exact_quote": "ETH declined over the full calendar month of September 2026."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "correction-before",
+      "pair_id": "correction",
+      "family": "correction",
+      "variant": "before",
+      "split": "development_diagnostic",
+      "cutoff": "2026-09-04T12:00:00Z",
+      "question": "According to the latest eligible release, the September 3 net inflow is USD 38 million.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-flow-original",
+          "title": "SYNTHETIC diagnostic source flow-original",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC initial release: the September 3 net inflow is USD 38 million.",
+          "published_at": "2026-09-04T00:00:00Z",
+          "retrieved_at": "2026-09-04T01:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/flow-original"
+          },
+          "observed_at": "2026-09-04T00:00:00Z",
+          "period_end": "2026-09-04T00:00:00Z"
+        },
+        {
+          "record_id": "condition-fixture-flow-correction",
+          "title": "SYNTHETIC diagnostic source flow-correction",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC correction: the September 3 net inflow is USD 21 million, replacing the initial USD 38 million. The earlier figure was incorrect.",
+          "published_at": "2026-09-05T00:00:00Z",
+          "retrieved_at": "2026-09-05T01:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/flow-correction"
+          },
+          "observed_at": "2026-09-05T00:00:00Z",
+          "period_end": "2026-09-04T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-flow-original"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "correction",
+          "record_id": "condition-fixture-flow-original",
+          "exact_quote": "the September 3 net inflow is USD 38 million."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "correction-after",
+      "pair_id": "correction",
+      "family": "correction",
+      "variant": "after",
+      "split": "development_diagnostic",
+      "cutoff": "2026-09-06T00:00:00Z",
+      "question": "According to the latest eligible release, the September 3 net inflow is USD 38 million.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-flow-original",
+          "title": "SYNTHETIC diagnostic source flow-original",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC initial release: the September 3 net inflow is USD 38 million.",
+          "published_at": "2026-09-04T00:00:00Z",
+          "retrieved_at": "2026-09-04T01:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/flow-original"
+          },
+          "observed_at": "2026-09-04T00:00:00Z",
+          "period_end": "2026-09-04T00:00:00Z"
+        },
+        {
+          "record_id": "condition-fixture-flow-correction",
+          "title": "SYNTHETIC diagnostic source flow-correction",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC correction: the September 3 net inflow is USD 21 million, replacing the initial USD 38 million. The earlier figure was incorrect.",
+          "published_at": "2026-09-05T00:00:00Z",
+          "retrieved_at": "2026-09-05T01:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/flow-correction"
+          },
+          "observed_at": "2026-09-05T00:00:00Z",
+          "period_end": "2026-09-04T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-flow-original",
+        "condition-fixture-flow-correction"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "correction",
+          "record_id": "condition-fixture-flow-correction",
+          "exact_quote": "USD 21 million, replacing the initial USD 38 million."
+        }
+      ],
+      "reference": {
+        "label": "contradicted",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "capture-cutoff-before",
+      "pair_id": "capture-cutoff",
+      "family": "capture-cutoff",
+      "variant": "before",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-05T00:00:00Z",
+      "question": "The captured source reports that the Delta vote passed on September 1.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-late-capture",
+          "title": "SYNTHETIC diagnostic source late-capture",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: The Delta vote passed on September 1.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-10-10T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/late-capture"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "acquisition_time",
+          "record_id": "condition-fixture-late-capture",
+          "exact_quote": "The Delta vote passed on September 1."
+        }
+      ],
+      "reference": {
+        "label": "insufficient",
+        "required_obligation_ids": [],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "capture-cutoff-after",
+      "pair_id": "capture-cutoff",
+      "family": "capture-cutoff",
+      "variant": "after",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-11T00:00:00Z",
+      "question": "The captured source reports that the Delta vote passed on September 1.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-late-capture",
+          "title": "SYNTHETIC diagnostic source late-capture",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: The Delta vote passed on September 1.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-10-10T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/late-capture"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-late-capture"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "acquisition_time",
+          "record_id": "condition-fixture-late-capture",
+          "exact_quote": "The Delta vote passed on September 1."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "user-horizon-unknown",
+      "pair_id": "user-horizon",
+      "family": "user-horizon",
+      "variant": "unknown",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The supplied fictional user scenario establishes a willingness to hold for at least 90 days.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-user-horizon-unknown",
+          "title": "SYNTHETIC diagnostic source user-horizon-unknown",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC PUBLIC FICTIONAL SCENARIO: The user asks for ETH research. Holding period and risk preferences are unknown.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/user-horizon-unknown"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-user-horizon-unknown"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "user_context",
+          "record_id": "condition-fixture-user-horizon-unknown",
+          "exact_quote": "Holding period and risk preferences are unknown."
+        }
+      ],
+      "reference": {
+        "label": "insufficient",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "user-horizon-specified",
+      "pair_id": "user-horizon",
+      "family": "user-horizon",
+      "variant": "specified",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The supplied fictional user scenario establishes a willingness to hold for at least 90 days.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-user-horizon-specified",
+          "title": "SYNTHETIC diagnostic source user-horizon-specified",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC PUBLIC FICTIONAL SCENARIO: The user explicitly states a willingness to hold for at least 90 days.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/user-horizon-specified"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-user-horizon-specified"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "user_context",
+          "record_id": "condition-fixture-user-horizon-specified",
+          "exact_quote": "The user explicitly states a willingness to hold for at least 90 days."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "certainty-possible",
+      "pair_id": "certainty",
+      "family": "certainty",
+      "variant": "possible",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The supplied experiment has demonstrated lower processing delays.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-certainty-possible",
+          "title": "SYNTHETIC diagnostic source certainty-possible",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: The proposed method may reduce processing delays. Whether any experiment has demonstrated lower delays is unknown in the supplied source.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/certainty-possible"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-certainty-possible"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "uncertainty",
+          "record_id": "condition-fixture-certainty-possible",
+          "exact_quote": "Whether any experiment has demonstrated lower delays is unknown in the supplied source."
+        }
+      ],
+      "reference": {
+        "label": "insufficient",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "certainty-measured",
+      "pair_id": "certainty",
+      "family": "certainty",
+      "variant": "measured",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The supplied experiment has demonstrated lower processing delays.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-certainty-measured",
+          "title": "SYNTHETIC diagnostic source certainty-measured",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: In the supplied experiment, lower processing delays were demonstrated. This does not establish results outside the experiment.",
+          "published_at": "2026-09-01T00:00:00Z",
+          "retrieved_at": "2026-09-02T00:00:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/certainty-measured"
+          },
+          "observed_at": "2026-09-01T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-certainty-measured"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "uncertainty",
+          "record_id": "condition-fixture-certainty-measured",
+          "exact_quote": "In the supplied experiment, lower processing delays were demonstrated."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "competing-explanations-different-scope",
+      "pair_id": "competing-explanations",
+      "family": "competing-explanations",
+      "variant": "different-scope",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The two assertions give opposite relationships to the same reference average for exactly the same venue and observation time.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-competing-explanations-different-scope",
+          "title": "SYNTHETIC diagnostic source competing-explanations-different-scope",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: A says the Coinbase ETH daily close is below its 100-day average on September 3. B says the OKX ETH hourly close is above its 20-hour average on September 4. The venues, reference windows and times differ.",
+          "published_at": "2026-09-05T01:00:00Z",
+          "retrieved_at": "2026-09-05T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/competing-explanations-different-scope"
+          },
+          "observed_at": "2026-09-05T00:00:00Z",
+          "period_end": "2026-09-05T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-competing-explanations-different-scope"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "scope",
+          "record_id": "condition-fixture-competing-explanations-different-scope",
+          "exact_quote": "The venues, reference windows and times differ."
+        }
+      ],
+      "reference": {
+        "label": "contradicted",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    },
+    {
+      "case_id": "competing-explanations-same-scope",
+      "pair_id": "competing-explanations",
+      "family": "competing-explanations",
+      "variant": "same-scope",
+      "split": "development_diagnostic",
+      "cutoff": "2026-10-01T00:00:00Z",
+      "question": "The two assertions give opposite relationships to the same reference average for exactly the same venue and observation time.",
+      "sources": [
+        {
+          "record_id": "condition-fixture-competing-explanations-same-scope",
+          "title": "SYNTHETIC diagnostic source competing-explanations-same-scope",
+          "dataset_id": "synthetic.condition_preservation.v1",
+          "asset": "ETH",
+          "source_kind": "synthetic_fixture",
+          "text": "SYNTHETIC: A says Coinbase ETH daily close on September 3 is below its 100-day average. B says the same Coinbase ETH daily close on September 3 is above that same 100-day average. Both use identical definitions.",
+          "published_at": "2026-09-05T01:00:00Z",
+          "retrieved_at": "2026-09-05T01:01:00Z",
+          "source": {
+            "name": "Synthetic fixture; not an actual publisher",
+            "url": "https://example.invalid/conditions/competing-explanations-same-scope"
+          },
+          "observed_at": "2026-09-05T00:00:00Z",
+          "period_end": "2026-09-05T00:00:00Z"
+        }
+      ],
+      "expected_eligible_ids": [
+        "condition-fixture-competing-explanations-same-scope"
+      ],
+      "obligations": [
+        {
+          "obligation_id": "condition-1",
+          "kind": "scope",
+          "record_id": "condition-fixture-competing-explanations-same-scope",
+          "exact_quote": "Both use identical definitions."
+        }
+      ],
+      "reference": {
+        "label": "supported",
+        "required_obligation_ids": [
+          "condition-1"
+        ],
+        "rationale": "Inspect exact condition and entire synthetic source; the declared label is an AI-authored reference, not an automated semantic proof."
+      }
+    }
+  ],
+  "revision": {
+    "kind": "disclosed_development_fixture_correction",
+    "supersedes_canonical_hash": "fc5498d7597ce86156e841218ca2ebb3440b0a0ded2f5ec0b254c2a7dd35d769",
+    "reason": "Independent review identified observation-period/publication-clock inconsistencies and two ambiguous source wordings before revised provider evaluation.",
+    "prior_results": "Original frozen dataset, offline artifacts and provider attempts remain unchanged; revised results require new inputs and are not rescored original outcomes."
+  }
+}

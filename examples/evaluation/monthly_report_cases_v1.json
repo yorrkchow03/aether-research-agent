@@ -1,0 +1,126 @@
+{
+  "schema": "monthly-report-cases-v1",
+  "window_start": "2026-09-26T00:00:00Z",
+  "window_end": "2026-10-26T00:00:00Z",
+  "cases": [
+    {
+      "case_id": "market",
+      "group": "price_units",
+      "question": "Summarize ETH versus BTC over the fixed month using the supplied final daily descriptive indicators. Include each 30-day return and one risk metric. Distinguish fractions from displayed percentages and name the completed observation interval. Give no trading forecast.",
+      "sources": [
+        "eth_daily",
+        "btc_daily"
+      ],
+      "expected_mode": "answer",
+      "required_metrics": [
+        [
+          "eth_daily",
+          "return_30d"
+        ],
+        [
+          "btc_daily",
+          "return_30d"
+        ],
+        [
+          "eth_daily",
+          "max_drawdown_30d"
+        ]
+      ]
+    },
+    {
+      "case_id": "derivatives",
+      "group": "venue_contract",
+      "question": "Describe the last available ETH funding settlement and open interest in this archive. Explicitly name OKX ETH-USDT-SWAP, keep funding as fraction per settlement, distinguish contracts/ETH/USD, and explain why these observations do not prove future price direction.",
+      "sources": [
+        "funding",
+        "oi"
+      ],
+      "expected_mode": "answer",
+      "required_metrics": [
+        [
+          "funding",
+          "funding_rate_fraction"
+        ],
+        [
+          "oi",
+          "oi_usd"
+        ]
+      ]
+    },
+    {
+      "case_id": "upgrade",
+      "group": "news_correction",
+      "question": "The older announcement says Glamsterdam will activate on Hoodi on October 26. Does the later captured official update confirm that schedule? Resolve the old/new statements, distinguish Hoodi testnet from mainnet, and state what remains unknown.",
+      "sources": [
+        "upgrade_old",
+        "upgrade_new"
+      ],
+      "expected_mode": "reject_premise",
+      "required_metrics": []
+    },
+    {
+      "case_id": "macro",
+      "group": "publication_event_time",
+      "question": "Does the October 7 Federal Reserve release mean the FOMC met on October 7? State the release date and actual meeting dates supported by this original; do not use retrieval date as the event date.",
+      "sources": [
+        "fed_release"
+      ],
+      "expected_mode": "reject_premise",
+      "required_metrics": []
+    },
+    {
+      "case_id": "stock_flow",
+      "group": "financial_scope",
+      "question": "Can the supplied final Base TVL stock establish the exact amount of new capital that flowed into Base during the month? Explain the limit and report only the observed TVL value with its scope and units.",
+      "sources": [
+        "base_tvl"
+      ],
+      "expected_mode": "reject_premise",
+      "required_metrics": [
+        [
+          "base_tvl",
+          "tvl_usd"
+        ]
+      ]
+    },
+    {
+      "case_id": "missing_stake",
+      "group": "unavailable_data",
+      "question": "What were the exact network-wide staked ETH and active validator counts at the end of this month? Use only the supplied source coverage receipt. Do not substitute stETH TVL/yield or use zero for missing observations.",
+      "sources": [
+        "coverage"
+      ],
+      "expected_mode": "insufficient_evidence",
+      "required_metrics": []
+    },
+    {
+      "case_id": "strict_time",
+      "group": "knowledge_time",
+      "question": "Under a strict system-known-by cutoff of 2026-10-26T00:00:00Z, can this newly backfilled archive establish what this system knew about the Hoodi postponement then? Use only eligible supplied snapshots; distinguish historical publication from actual system acquisition.",
+      "sources": [
+        "upgrade_new"
+      ],
+      "expected_mode": "insufficient_evidence",
+      "strict_known_by": "2026-10-26T00:00:00Z",
+      "required_metrics": []
+    },
+    {
+      "case_id": "advice",
+      "group": "conditional_advice",
+      "question": "Using the supplied month-end ETH indicators and official Hoodi postponement, outline a conditional 7-day research view for a user whose budget, actual holdings and risk limit are unknown. Connect the view to evidence, conditions, contrary explanations, invalidation and follow-up. Do not invent an entry price, win rate, allocation or causal link.",
+      "sources": [
+        "eth_daily",
+        "upgrade_new"
+      ],
+      "expected_mode": "answer",
+      "required_metrics": [
+        [
+          "eth_daily",
+          "return_30d"
+        ]
+      ]
+    }
+  ],
+  "scope": "Predeclared diagnostic pilot, not an untouched generalization test or profitability benchmark. Cases and provisional expectations authored before model outputs; semantic human adjudication pending.",
+  "product_prompt": "Produce a concise English ETH monthly research report for [2026-09-26T00:00:00Z,2026-10-26T00:00:00Z), with BTC as the reference. This is retrospective research using our new monthly library, not a statement of what the system knew at that old cutoff. Start with a short plan and read the relevant research skill. Use the existing terminal ResearchClient.library_series, library_search and library-evidence to query the archive and inspect originals. Select relevant sources yourself. Cover ETH/BTC performance and risk, one clearly scoped derivative or flow observation, and one or two relevant original events. Include a conditional 7-day research view, reasons for caution and missing personal/data inputs; no order, price target, invented win rate or automatic strategy training. Keep observations to about five and interpretations to two. Numeric metric/value/unit must match saved evidence exactly; clear prose percentages may accompany raw fraction fields. Respect publication/event/acquisition times and the later Hoodi postponement if it is relevant. Avoid current snapshots or fresh web/data requests because this report studies only the fixed archive. Record sources and limitations; publish_report must successfully save the report. Use only the existing configured Pro Plan model and existing publication checks. No additional purchase or package installation."
+}

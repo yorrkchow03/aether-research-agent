@@ -1,0 +1,28 @@
+.investment-banner{display:flex;justify-content:space-between;align-items:center;gap:20px;margin:0 0 25px;padding:25px 28px;border:1px solid #e3def7;border-radius:16px;background:linear-gradient(110deg,#f4f1ff,#fcfbff)}
+.investment-banner h2{font-size:30px;letter-spacing:-.8px;margin:8px 0}.investment-banner p{color:#737487;margin:0;font-size:16px}.eyebrow{font-size:14px;letter-spacing:1.6px;color:#7867b6;font-weight:700}.investment-actions{display:flex;flex-wrap:wrap;gap:8px}.csv-label{cursor:pointer}.ledger-note{display:block;color:#9291a3;margin-top:4px;max-width:220px;white-space:normal}.voided{opacity:.55}.constraint-list{background:#faf6ed;border-radius:10px;padding:8px 14px;margin-top:15px;font-size:16px;color:#826337}.constraint-list p{margin:8px 0}
+.strategy-layout{display:grid;grid-template-columns:minmax(240px,.75fr) minmax(0,1.8fr);gap:22px;align-items:start}.experiment-item{display:block;text-align:left;width:100%;padding:12px;border:1px solid #eae8f3;border-radius:10px;margin:9px 0;background:#fff;color:inherit;cursor:pointer}.experiment-item:hover,.experiment-item.selected{border-color:#aa9bed;background:#faf8ff}.experiment-item strong{display:flex;justify-content:space-between;gap:8px;align-items:center;font-size:16px}.experiment-item small{display:block;color:#9390a1;margin-top:7px;font-size:15px}.strategy-score-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:22px 0}.strategy-score-grid small{display:block;color:#8d899e;font-size:14px}.strategy-score-grid strong{display:block;font-size:25px;letter-spacing:-.6px;margin-top:8px}.research-assessment{padding:14px 16px;border-radius:10px;background:#f1f8f6;color:#477c69;font-size:16px;line-height:1.7}.research-assessment.caution{background:#faf6ed;color:#8b6c3b}.strategy-equity-chart svg{display:block;width:100%;margin-top:20px}.curve-legend{display:flex;flex-wrap:wrap;gap:15px;font-size:14px;color:#8d899e;margin:0 0 20px}.curve-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px}#strategy-result{min-width:0}#strategy-result pre,#jev-result pre{white-space:pre-wrap;word-break:break-word;max-height:350px;overflow:auto;font-size:15px;line-height:1.7;background:#f8f7fb;padding:15px;border-radius:8px}#tx-feedback{max-width:65%;line-height:1.5}.full-width{grid-column:1/-1}a.button{text-decoration:none;text-align:center}#view-portfolio .data-table td{white-space:nowrap}
+#view-strategies{container-type:inline-size}
+@container(max-width:700px){.strategy-layout{grid-template-columns:1fr}.strategy-layout>section>.form-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){.investment-banner{align-items:flex-start;flex-direction:column;padding:20px}.investment-banner h2{font-size:28px}.strategy-score-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.strategy-layout>section>.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.investment-actions{margin-top:12px}#view-portfolio .card-heading,#strategy-result .card-heading{flex-wrap:wrap;gap:12px}.investment-banner .pill{white-space:normal}.strategy-layout{gap:16px}}
+.curve-range{font-size:14px;color:#8d899e;margin:4px 0 12px}
+
+/* Optional research extension: keep dense comparisons readable and contained. */
+#research-lab-panel .button-row{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0}
+#research-lab-panel .table-wrap{overflow-x:auto;margin:18px 0;border:1px solid var(--border,#e8e8ef);border-radius:12px;max-width:100%}
+#research-lab-panel table{border-collapse:collapse;width:100%;min-width:700px;font-size:16px;line-height:1.5}
+#research-lab-panel th,#research-lab-panel td{padding:13px 16px;text-align:left;border-bottom:1px solid var(--border,#e8e8ef);vertical-align:top}
+#research-lab-panel th{background:#f7f7fb;font-size:14px;color:#626479;font-weight:600}
+#research-lab-panel tbody tr:last-child td{border-bottom:0}
+#research-lab-panel h4{margin:24px 0 12px}
+#research-lab-panel label{display:block;font-size:16px}
+#research-lab-panel select{display:block;max-width:100%;width:100%;margin-top:10px;font-size:16px;padding:12px;border:1px solid #d9d9e5;border-radius:10px;background:white}
+#research-lab-panel pre{max-width:100%;overflow-x:auto;padding:16px;background:#f7f7fb;border-radius:10px}
+#research-lab-panel .body-copy{overflow-wrap:anywhere}
+
+/* Saved semantic comparisons stay inside their advanced disclosure on phones. */
+#semantic-validation-panel .table-wrap{max-width:100%;overflow-x:auto;margin:18px 0;border:1px solid var(--border,#e8e8ef);border-radius:12px}
+#semantic-validation-panel table{width:100%;min-width:650px;border-collapse:collapse;font-size:16px;line-height:1.5}
+#semantic-validation-panel th,#semantic-validation-panel td{padding:12px 14px;text-align:left;vertical-align:top;border-bottom:1px solid var(--border,#e8e8ef)}
+#semantic-validation-panel th{background:#f7f7fb;font-size:14px;color:#626479}
+#semantic-validation-panel .body-copy,#semantic-validation-panel .card-note,#semantic-validation-panel code{overflow-wrap:anywhere}
+#semantic-validation-panel td small{display:block;margin-top:6px;color:var(--muted,#7d869a);font-size:13px;line-height:1.5}

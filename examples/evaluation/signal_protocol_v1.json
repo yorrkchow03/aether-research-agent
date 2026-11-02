@@ -1,0 +1,41 @@
+{
+  "schema": "aether-signal-protocol-v1",
+  "assets": ["ETH", "BTC"],
+  "start": "2020-01-01T00:00:00Z",
+  "end": "2026-10-16T00:00:00Z",
+  "windows": [
+    {"id":"dev-2021","split":"development","start":"2021-01-01T00:00:00Z","end":"2022-01-01T00:00:00Z"},
+    {"id":"dev-2022","split":"development","start":"2022-01-01T00:00:00Z","end":"2023-01-01T00:00:00Z"},
+    {"id":"dev-2023","split":"development","start":"2023-01-01T00:00:00Z","end":"2024-01-01T00:00:00Z"},
+    {"id":"validation-2024-h1","split":"validation","start":"2024-01-01T00:00:00Z","end":"2024-07-01T00:00:00Z"},
+    {"id":"validation-2024-h2","split":"validation","start":"2024-07-01T00:00:00Z","end":"2025-01-01T00:00:00Z"},
+    {"id":"confirmation-2025-h1","split":"confirmation","start":"2025-01-01T00:00:00Z","end":"2025-07-01T00:00:00Z"},
+    {"id":"confirmation-2025-h2","split":"confirmation","start":"2025-07-01T00:00:00Z","end":"2026-01-01T00:00:00Z"},
+    {"id":"confirmation-2026-h1","split":"confirmation","start":"2026-01-01T00:00:00Z","end":"2026-07-01T00:00:00Z"},
+    {"id":"confirmation-2026-h2","split":"confirmation","start":"2026-07-01T00:00:00Z","end":"2026-10-16T00:00:00Z"}
+  ],
+  "evaluation": {
+    "execution_delay_bars": 1,
+    "minimum_training_samples": 100,
+    "model_families": ["full_logistic","full_random_forest","single_signal_logistic","drop_one_logistic","constant_prior"],
+    "logistic_C": 0.2,
+    "allocation_cap": 0.5,
+    "long_probability": 0.6,
+    "cash_probability": 0.4,
+    "cost_scenarios": [
+      {"id":"zero_cost_reference","fee_bps":0,"slippage_bps":0},
+      {"id":"base","fee_bps":10,"slippage_bps":10},
+      {"id":"stress","fee_bps":20,"slippage_bps":30}
+    ],
+    "bootstrap_block_days": 14,
+    "bootstrap_draws": 300,
+    "seed": 20261016
+  },
+  "workshop": {
+    "maximum_rounds": 3,
+    "selection": "Maximum net log growth on the common validation windows at base costs; rejected code/reviews are ineligible. Ties retain the earlier attempt.",
+    "final_selection_does_not_use": ["confirmation prices","confirmation metrics","future outcomes"],
+    "confirmation_policy": "Lock code/input/config hashes after refinement; evaluate the confirmation partition once and do not feed it to model roles."
+  },
+  "scope": "Preregistered retrospective research protocol, not authenticated point-in-time data or a profitable-investment claim. Overlapping features and windows do not create independent statistical observations."
+}
