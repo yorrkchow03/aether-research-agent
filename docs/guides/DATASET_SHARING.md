@@ -1,8 +1,8 @@
 # 小组共享数据集
 
-源码与数据分开保存。源码在私有仓库，数据在同一仓库的
+源码与数据分开保存。源码在公开仓库，数据在同一仓库的
 [Half-year research dataset v1 Release](https://github.com/yorrkchow03/aether-research-agent/releases/tag/data-halfyear-v1)。
-先接受仓库邀请，再下载数据；仅转发私有仓库链接不会赋予访问权限。
+直接分享仓库和 Release 链接即可查看、下载，不需要邀请或授予访问权限。
 
 ## 包内有什么
 
@@ -57,12 +57,12 @@ python -m research_data.library search --root data/library-halfyear-20260426-202
 
 ## 分享仓库给组员
 
-仓库首页 **Settings → Access → Collaborators → Add people**，选择准确的
-GitHub 用户名并发送邀请。组员接受后，即可访问源码和同仓库的 Release。
-无需发送你的 GitHub 登录密码或个人模型凭证。后续数据更新使用新 Release，
+直接转发以下两个链接：
+
+- [源码仓库](https://github.com/yorrkchow03/aether-research-agent)：点击 **Code → Download ZIP**，或用 Git 克隆。
+- [半年数据包](https://github.com/yorrkchow03/aether-research-agent/releases/tag/data-halfyear-v1)：下载 ZIP 和 `SHA256SUMS`，按上面的步骤恢复。
+
+仓库公开后，所有人都能查看和下载源码、数据 Release 及历史 CI 记录。
+公开访问不授予直接推送代码的权限；若组员需要直接推送修改，再单独添加协作者。
+无需发送 GitHub 登录密码或个人模型凭证。后续数据更新使用新 Release，
 保留旧版用于复现实验。
-
-当前是个人账号的私有仓库，协作者同时具有读写权限；它不是只读分享链接。
-若需要严格只读，可另行使用组织仓库的 Read 角色。
-
-[GitHub 官方邀请说明](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/repository-access-and-collaboration/inviting-collaborators-to-a-personal-repository)。
