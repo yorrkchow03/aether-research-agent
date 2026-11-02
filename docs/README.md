@@ -6,6 +6,8 @@
   choose a module and verify changes.
 - [Product guide](guides/PRODUCT_GUIDE.md): use the local dashboard.
 - [Model setup](guides/MODEL_API_QUICKSTART.md): local provider configuration.
+- [Shared dataset](guides/DATASET_SHARING.md): download, verify and restore the
+  half-year snapshot; invite teammates to the private repository.
 - [Contribution guide](../CONTRIBUTING.md): development and review conventions.
 
 ## Current architecture and research

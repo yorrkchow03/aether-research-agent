@@ -40,6 +40,9 @@ research; see [model setup](docs/guides/MODEL_API_QUICKSTART.md).
 The checkout opens with empty local data and portfolio state. Credentials,
 downloaded datasets, model weights and personal research history are not shared.
 
+The optional [team dataset Release](docs/guides/DATASET_SHARING.md) provides a
+separately checked half-year research snapshot and a local restore command.
+
 ## Repository layout
 
 ```text
