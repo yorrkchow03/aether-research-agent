@@ -16,6 +16,8 @@ their own decisions.
   a manual portfolio and an optional Strategy Lab.
 - **Experiments:** optional Jev classification/checks and reproducible comparisons
   of evidence selection, report quality, latency and usage.
+  The [NLP course study](docs/guides/JEV_NLP_COURSE.md) adds frozen stage comparisons,
+  confidence routing and source-bound context evaluation.
 
 Jev is auxiliary; mandatory publication review remains in place. Historical
 coverage has documented gaps, and simulations do not establish an investment
