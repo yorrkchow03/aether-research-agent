@@ -13,4 +13,4 @@ python scripts/dev/check_framework.py
 
 生产环境仍使用 `src/research_agent/runtime.py`：豆包 API、本机终端/SDK、SQLite checkpoint、来源库和发布审核都在那里组装。教学示例用临时目录和内存 checkpoint，不是另一个需要维护的产品 harness，也不能用它的单个演示工具替换生产工具集。
 
-完整接手顺序、代码入口和扩展方法见 [团队交接指南](../../docs/development/TEAM_HANDOFF.md)。
+完整接手顺序、代码入口和扩展方法见 [团队交接指南](../../docs/guides/LOCAL_SETUP.md)。

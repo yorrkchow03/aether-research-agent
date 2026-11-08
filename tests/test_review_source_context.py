@@ -165,7 +165,7 @@ class ReviewSourceContextTests(unittest.TestCase):
         calls={call.args[0]['record_id']:[t['claim_id'] for t in call.kwargs['targets']] for call in serializer.call_args_list}
         self.assertEqual(calls,{'source-a':['O1'],'source-b':['O2']})
         self.assertEqual(result['review_version'],REVIEW_VERSION)
-        self.assertTrue(REVIEW_VERSION.startswith('support-v6-'))
+        self.assertTrue(REVIEW_VERSION.startswith('support-v14-'))
         self.assertEqual(len(requests),1)
 
     def test_changed_review_version_cannot_reuse_a_prior_cached_verdict(self):

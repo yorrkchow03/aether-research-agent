@@ -1,6 +1,7 @@
 """Shared source and numeric contract for observations and advice evidence."""
 from decimal import Decimal, InvalidOperation
 from fnmatch import fnmatchcase
+import json
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -30,11 +31,44 @@ class Claim(BaseModel):
         return self
 
 
-def validate_claims(claims, lookup):
+def _diagnostic_scalar(value, limit=100):
+    """Expose only a bounded requested field, never an enclosing source body."""
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        return {'type': type(value).__name__, 'scope': 'Read the cited source field.'}
+    if isinstance(value, str) and len(value) > limit:
+        return {'preview': value[:limit], 'truncated': True}
+    return value
+
+
+def _numeric_error(reason, claim, records, path, index):
+    label = path or 'claim[' + str(index) + ']'
+    submitted = {key: _diagnostic_scalar(getattr(claim, key)) for key in ('metric', 'value', 'unit')}
+    sources = []
+    for rid, record in zip(claim.evidence_ids, records):
+        values = record.get('values', {})
+        matching_units = {pattern: _diagnostic_scalar(unit) for pattern, unit in record.get('units', {}).items()
+                          if fnmatchcase(claim.metric, pattern)}
+        sources.append({'record_id': rid, 'values_key_present': claim.metric in values,
+                        'value': _diagnostic_scalar(values.get(claim.metric)), 'units': matching_units})
+    repair = 'Use the exact saved values key/value/unit; never invent a field. '
+    repair += ('If the figure exists only in page text, keep it in statement + evidence_ids for source review '
+               'and omit all three numeric annotations. ')
+    if path:
+        edits = [{'path': path + '/' + key, 'op': 'remove'} for key in ('metric', 'value', 'unit')]
+        repair += 'For that text-only case, publish_saved_report edits=' + json.dumps(edits, separators=(',', ':')) + '. '
+    else:
+        repair += 'Remove metric, value and unit together from this claim; source review still applies. '
+    return ValueError(reason + ' at ' + label + ' (' + claim.statement[:100] + '). submitted='
+        + json.dumps(submitted, ensure_ascii=False, separators=(',', ':')) + '. ' + repair
+        + 'Cited field checks=' + json.dumps(sources, ensure_ascii=False, separators=(',', ':')))
+
+
+def validate_claims(claims, lookup, *, claim_paths=None):
     checked = set()
     numeric = 0
     records_by_id = {}
-    for claim in claims:
+    for index, claim in enumerate(claims):
+        path = claim_paths[index] if claim_paths is not None else None
         # One validation invocation inspects one source snapshot. Do not replay
         # a many-thousand-row collection again for every metric on that source.
         # The cache is local; the next submission revalidates original inputs.
@@ -59,14 +93,14 @@ def validate_claims(claims, lookup):
                 if value.is_finite() and claim.unit in units:
                     candidates.append(value)
             if claim.unit is None or not candidates:
-                raise ValueError("Numeric unit or cited field mismatch: " + claim.metric)
+                raise _numeric_error("Numeric unit or cited field mismatch", claim, records, path, index)
             try:actual = Decimal(claim.value)
             except (InvalidOperation, ValueError):
-                raise ValueError('Numeric claim is not a decimal value: ' + claim.metric) from None
+                raise _numeric_error('Numeric claim is not a decimal value', claim, records, path, index) from None
             if not actual.is_finite() or not any(
                 abs(actual - value) <= max(abs(value) * Decimal('1e-10'), Decimal('1e-12'))
                 for value in candidates
             ):
-                raise ValueError("Numeric value differs from saved evidence: " + claim.metric)
+                raise _numeric_error("Numeric value differs from saved evidence", claim, records, path, index)
             numeric += 1
     return checked, numeric

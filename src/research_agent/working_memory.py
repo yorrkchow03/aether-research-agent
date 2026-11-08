@@ -21,6 +21,27 @@ def _serial(value):
     return value if isinstance(value, str) else json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
 
 
+def _issue_navigation(rows, maximum):
+    """Index all review targets before fitting bounded, attributed previews."""
+    targets=list(dict.fromkeys(str(row.get('review_family') or 'report')+':'+row['claim_id']
+        for row in rows if row.get('kind')=='review_issue' and row.get('claim_id')))
+    result={'unresolved_count':len(rows), 'review_targets':targets, 'items':[],
+        'details':'Full state revision above retains every issue and its exact artifact pointer.'}
+    ordered=sorted(enumerate(rows),key=lambda pair:(pair[1].get('kind')!='review_issue',-pair[0]))
+    for _,row in ordered:
+        item={k:row[k] for k in ('kind','claim_id','claim_path','issue_kind','tool','artifact_id')
+            if row.get(k)}
+        for key in ('correction','error','reason'):
+            if not row.get(key):continue
+            text=str(row[key]);item[key]=text if len(text)<=180 else text[:180]+' [Preview; read full state.]'
+            break
+        candidate={**result,'items':[*result['items'],item]}
+        if len(dumps(candidate))<=maximum:
+            result=candidate
+    result['omitted_item_count']=len(rows)-len(result['items'])
+    return result
+
+
 class WorkingMemory:
     def __init__(self, root, *, redact=None, evidence_lookup=None):
         self.root = Path(root).resolve()
@@ -193,53 +214,24 @@ class WorkingMemory:
             'sha256':hashlib.sha256(body).hexdigest(),'revision':state['revision']}
 
     def progressive_tool_view(self, job_id, tool_name, payload, status='success', max_chars=6000):
-        """Small model view; SDK/Python return values are never changed here.
+        """Bound the complete model result; keep the exact SDK result on disk.
 
-        Review, publication and failed outputs are protected even when they
-        exceed this soft target. Large source/console results retain an exact
-        redacted artifact and clear omissions, never invented summaries.
+        Explicit filesystem expansions already have backend line limits and do
+        not get recursively re-offloaded. Other large outputs, including review
+        and failures, expose structured navigation and atomic actionable fields.
         """
-        from .research_state import envelope, PUBLICATION_TOOLS, REVIEW_TOOLS
-        if not 800<=max_chars<=32000:raise ValueError('Tool view budget must be 800..32000 characters')
+        from .research_state import envelope
+        from .tool_result_views import compact_tool_result
+        if not 800<=max_chars<=180000:raise ValueError('Tool view budget must be 800..180000 characters')
         text=self.redact(_serial(payload));obj=envelope(text)
         # An explicit file read is already a requested expansion. Offloading its
         # decorated response again creates recursive artifacts and unreadable JSON.
         if (tool_name in ('read_file','ls','glob','grep','edit_file','write_file','write_todos')
-                or len(text)<=max_chars or status=='error' or tool_name in PUBLICATION_TOOLS|REVIEW_TOOLS
-                or obj.get('status') in ('error','failed','needs_revision') or obj.get('exit_code',0) not in (0,None)):
+                or len(text)<=max_chars):
             return text
         receipt=self.record_tool(job_id,tool_name,text)
-        core={key:obj[key] for key in ('status','record_id','collection_record_id','dataset_id','data_file',
-            'record_count','total','input_record_count','query_result_fully_materialized','cutoff','mode')
-            if key in obj and isinstance(obj[key],(str,int,float,bool,type(None)))}
-        record=obj.get('record') if isinstance(obj.get('record'),dict) else obj
-        for key in ('record_id','dataset_id','published_at','retrieved_at','observed_at','period_end','available_at'):
-            if key in record and isinstance(record[key],(str,type(None))):core[key]=record[key]
-        if isinstance(record.get('source'),dict):
-            core['source']={key:record['source'][key] for key in ('source_id','name','url','sha256','retrieved_at') if key in record['source']}
-        # Never split a numeric value/unit or conflict pair into misleading parts.
-        for key in ('values','units','gaps','conflicts','validation','review'):
-            if key in record:core[key]=record[key]
-        if isinstance(obj.get('results'),list):
-            core['result_count']=len(obj['results'])
-            core['result_sources']=[{key:row[key] for key in ('record_id','report_id','output_id','answer_id','title','published_at','retrieved_at','acquired_at','source_kind','memory_status','memory_notices','next_report_ids','notice_gaps','notice_scope','original_source_evidence_ids') if key in row}
-                for row in obj['results'][:30] if isinstance(row,dict)]
-            if len(obj['results'])>30:core['result_source_preview_incomplete']=True
-        view={'view':'progressive-tool-view-v2','tool':tool_name,'status':status,
-            'artifact':{key:receipt[key] for key in ('artifact_id','path','sha256','bytes')},
-            'metadata':core,'read_before_citing':True,'preview_is_not_full_source':True,
-            'scope':'Full redacted result is stored in the task artifact. This navigation view is not a substitute for original evidence or omitted conditions.',
-            'original_characters':len(text),'omissions':'The full text/rows and any fields absent from this view must be read from the artifact before using them.'}
-        overhead=len(dumps(view));remaining=max_chars-overhead-150
-        if remaining>160:
-            view['preview']=text[:remaining//2]+'\n[…]\n'+text[-remaining//2:]
-        rendered=dumps(view,sort_keys=True)
-        if len(rendered)>max_chars:
-            # Protected metadata can exceed the soft view target; disclose this
-            # rather than silently lose conflicts, numbers, units or review issues.
-            view['protected_metadata_exceeds_target']=True
-            rendered=dumps(view,sort_keys=True)
-        return rendered
+        return compact_tool_result(tool_name,text,obj,receipt,status=status,
+            max_chars=max_chars,root=self.root)
 
     def record_tool(self, job_id, name, output, evidence_ids=None):
         self.state(job_id)
@@ -315,8 +307,12 @@ class WorkingMemory:
         # A long user request must not crowd unresolved conflicts out of memory.
         goal=state['goal'];goal_preview=goal if len(goal)<=300 else goal[:300]+' [Read original request.]'
         fields=[('Goal','goal',goal_preview),('Cutoff/mode','time_scope',str(state.get('cutoff'))+' / '+state.get('mode','observed'))]
-        critical=research.get('unknowns',[])
-        fields += [('Unresolved tool/review issues','research_unknowns',critical),
+        critical=[row for row in research.get('unknowns',[]) if row.get('status') != 'superseded']
+        # A single long failure must not hide every later correction. Put the
+        # full target index first; issue details remain in immutable artifacts.
+        critical_limit=min(3600,max(900,budget_chars//2))
+        critical_view=_issue_navigation(critical,critical_limit) if critical else []
+        fields += [('Unresolved tool/review issues','research_unknowns',critical_view),
             ('Conflicts to preserve','conflicts',[*state.get('conflicts',[]),*research.get('conflicts',[])]),
             ('Unknowns','unknowns',state.get('unknowns',[])),
             ('Saved publication receipts','publications',research.get('publications',[])),
@@ -340,7 +336,10 @@ class WorkingMemory:
         for label,key,value in fields:
             if not value:continue
             text=value if isinstance(value,str) else dumps(value)
-            if len(text)>1600:
+            if key=='research_unknowns' and (critical_view.get('omitted_item_count')
+                    or any('[Preview;' in str(item) for item in critical_view.get('items',[]))):
+                truncated_fields.append(key)
+            if key!='research_unknowns' and len(text)>1600:
                 truncated_fields.append(key)
                 if isinstance(value,list):
                     selected=[]

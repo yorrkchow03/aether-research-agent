@@ -79,12 +79,46 @@ class WorkingMemoryV2Tests(unittest.TestCase):
         self.assertEqual(json.loads(restored)['record']['text'],payload['record']['text'].replace('fixture-secret','[REDACTED]'))
         self.assertNotIn('fixture-secret',restored)
 
-    def test_review_rejection_and_failed_outputs_are_not_compacted_away(self):
+    def test_review_rejection_and_failed_outputs_have_bounded_exact_artifacts(self):
         payload={'status':'needs_revision','error':'Important condition. '*500}
         text=self.store.progressive_tool_view('job-a','publish_report',payload,max_chars=800)
-        self.assertEqual(json.loads(text),payload)
+        self.assertLessEqual(len(text),800)
+        view=json.loads(text)
+        self.assertEqual(view['metadata']['status'],'needs_revision')
+        self.assertEqual(json.loads(self.store.read_artifact('job-a',view['artifact']['artifact_id'])['text']),payload)
         failed=self.store.progressive_tool_view('job-a','execute',{'error':'x'*6000},status='error',max_chars=800)
-        self.assertEqual(json.loads(failed)['error'],'x'*6000)
+        self.assertLessEqual(len(failed),800)
+        view=json.loads(failed)
+        self.assertEqual(view['status'],'error')
+        self.assertEqual(json.loads(self.store.read_artifact('job-a',view['artifact']['artifact_id'])['text'])['error'],'x'*6000)
+
+    def test_oversized_first_failure_cannot_hide_later_review_targets(self):
+        self.store.observe_tool('job-a','publish_report',{'error':'old issue '*600},status='error')
+        ids=['O5','S1','M3','M4','L3','L4','L5','DOC3']
+        payload={'status':'error','error':'Report needs source corrections.', 'review':{
+            'review_id':'review-current','status':'needs_revision','verdicts':[
+                {'claim_id':cid,'status':'insufficient','reason':'source detail '*60,
+                    'correction':'Bind the saved source for '+cid+'.'} for cid in ids]}}
+        self.store.observe_tool('job-a','publish_saved_report',payload,status='error')
+        view=self.store.context('job-a',budget_chars=6000)
+        for cid in ids:self.assertIn('report:'+cid,view['text'])
+        self.assertIn('Bind the saved source for',view['text'])
+        self.assertLessEqual(view['characters'],6000)
+        full=json.loads(Path(view['state_file']).read_text())
+        current=[r for r in full['research_state']['unknowns'] if r['kind']=='review_issue']
+        self.assertEqual([r['claim_id'] for r in current],ids)
+
+    def test_current_issue_index_does_not_repeat_all_prior_negative_attempts(self):
+        for attempt in range(4):
+            self.store.observe_tool('job-a','publish_saved_report',{'review':{
+                'review_id':'review-'+str(attempt),'status':'needs_revision','verdicts':[
+                    {'claim_id':'L3','status':'insufficient','correction':'Bind saved meeting source.'}]}},
+                tool_call_id='review-'+str(attempt))
+        view=self.store.context('job-a',budget_chars=6000)
+        self.assertIn('"unresolved_count": 1',view['text'])
+        full=json.loads(Path(view['state_file']).read_text())
+        issues=full['research_state']['unknowns']
+        self.assertEqual([r['status'] for r in issues],['superseded']*3+['unresolved'])
 
     def test_untrusted_console_results_do_not_populate_review_state(self):
         self.store.observe_tool('job-a','execute',{'status':'saved','review':{'status':'reviewed'}})

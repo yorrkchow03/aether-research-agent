@@ -11,8 +11,10 @@ from research_data.normalize import iso,timestamp
 ETH_FEED='https://blog.ethereum.org/feed.xml'
 
 
-def scan_feed(store,url=ETH_FEED):
+def scan_feed(store,url=ETH_FEED,*,publisher='Ethereum Foundation',asset=None,since=None,match=None):
     fetched=fetch_page(url);root=ET.fromstring(fetched['raw']);now=utcnow()
+    if root.tag.split('}')[-1] not in ('rss','feed','RDF'):
+        raise ValueError('Publisher did not return an RSS or Atom document')
     digest=hashlib.sha256(fetched['raw']).hexdigest()
     raw=store.root/'feed-cache'/(digest+'.xml');raw.parent.mkdir(exist_ok=True);raw.write_bytes(fetched['raw'])
     entries=root.findall('./channel/item') or root.findall('{*}entry');ids=[]
@@ -32,11 +34,14 @@ def scan_feed(store,url=ETH_FEED):
             except (ValueError,TypeError):
                 try:date=iso(parsedate_to_datetime(published))
                 except (ValueError,TypeError):pass
+        if since and (not date or timestamp(date)<timestamp(since)):continue
+        if match and not match.search(title+' '+text):continue
         rid='web-'+hashlib.sha256((link+digest+now).encode()).hexdigest()[:24]
         row={'record_id':rid,'dataset_id':'online.publisher.feed','source_kind':'feed_item','title':title,'url':link,
              'text':text,'published_at':date,'observed_at':date or now,'retrieved_at':now,'available_at':now,
              'values':{},'units':{},'quality_flags':['publisher_feed_excerpt','article_not_independently_fetched','publication_time_unverified'],
-             'source':{'source_id':rid,'name':'Ethereum Foundation blog feed','url':url,'sha256':digest,'retrieved_at':now},
+             'source':{'source_id':rid,'name':publisher+' feed','url':url,'sha256':digest,'retrieved_at':now},
              'provider_annotation':{'article_url':link,'publication_metadata':published},'raw_path':str(raw)}
-        store.register(row);ids.append(rid)
-    return {'status':'ok','items':len(ids),'retrieved_at':now,'source_url':url}
+        if asset:row['asset']=asset
+        ids.append(store.observe_feed_item(row))
+    return {'status':'ok','items':len(ids),'record_ids':ids,'retrieved_at':now,'source_url':url}

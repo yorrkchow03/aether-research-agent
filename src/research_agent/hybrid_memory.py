@@ -99,10 +99,12 @@ class HybridMemoryRetriever:
             return [(rid,float(score)) for rid,score in db.execute('SELECT record_id,bm25(eligible,0,4,1) FROM eligible WHERE eligible MATCH ? ORDER BY bm25(eligible,0,4,1),record_id',(match,))]
 
     def query(self,query='',*,cutoff=None,mode='observed',asset='ALL',limit=8,
-              source_limit=10000,candidate_limit=60,entity_key=None,event_key=None):
+              source_limit=10000,candidate_limit=60,entity_key=None,event_key=None,start=None,end=None,acquisition_cutoff=None):
         if not isinstance(query,str) or len(query)>2000 or not 1<=limit<=30 or not limit<=candidate_limit<=200:
             raise ValueError('Invalid hybrid source query')
-        packet=self.index.eligible_sources(cutoff=cutoff,mode=mode,asset=asset,source_limit=source_limit)
+        window={k:v for k,v in {'start':start,'end':end}.items() if v is not None}
+        if acquisition_cutoff:window['acquisition_cutoff']=acquisition_cutoff
+        packet=self.index.eligible_sources(cutoff=cutoff,mode=mode,asset=asset,source_limit=source_limit,**window)
         sources=packet.pop('sources');by_id={s['record_id']:s for s in sources}
         if entity_key is not None or event_key is not None:
             # These are explicit candidate keys, never inferred event identity.
@@ -141,6 +143,8 @@ class HybridMemoryRetriever:
                 totals[rid]=totals.get(rid,0.0)+1.0/(self.rrf_k+rank)
         ordered=sorted(totals,key=lambda rid:(-totals[rid],rid))
         links=self.index.eligible_links(list(by_id),cutoff=packet['as_of'],mode=mode)
+        if acquisition_cutoff:
+            links=[link for link in links if link.get('known_at') and timestamp(link['known_at'])<=timestamp(acquisition_cutoff)]
         dependencies={}
         for link in links:
             if link['predicate'] in ('contradicts','unresolved_conflict','corrects','supersedes','content_revision_of'):

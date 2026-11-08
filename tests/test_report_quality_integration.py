@@ -25,11 +25,14 @@ class ReportQualityIntegrationTests(unittest.TestCase):
         base={'statement':'Synthetic saved result','evidence_ids':[calc['record_id']]}
         draft=ReportDraft(title='Synthetic brief',summary='Saved result',observations=[base],key_changes=[{**base,'metric':'return_fraction','value':calc['values']['return_fraction'],'unit':'fraction'}],questions_to_watch=['Check later official announcements.'],limitations=['Synthetic'])
         targets=review_targets(draft)
-        self.assertEqual({t['claim_id'] for t in targets},{'O1','K1','S1','M1'})
+        self.assertEqual({t['claim_id'] for t in targets},{'O1','K1','S1','M1','L1'})
         self.assertEqual(next(t for t in targets if t['claim_id']=='M1')['kind'],'research_action')
         self.assertEqual(report_evidence_ids(draft.model_dump()),{calc['record_id']})
         result=self.service.publish(draft)
         self.assertEqual(result['validation']['numeric_claims_checked'],1)
+        report_id=Path(result['report_path']).stem
+        with TestClient(create_app(self.runtime),base_url='http://127.0.0.1:8765') as client:
+            self.assertIn(report_id,[item['report_id'] for item in client.get('/api/reports').json()['items']])
         draft.key_changes[0].value='999'
         with self.assertRaises(ValueError):self.service.publish(draft)
 
@@ -49,10 +52,10 @@ class ReportQualityIntegrationTests(unittest.TestCase):
     def test_monitor_questions_cannot_smuggle_an_unsupported_fact(self):
         draft=ReportDraft(title='Synthetic',summary='Fixture',observations=[{'statement':'Fixture','evidence_ids':['test']}],questions_to_watch=['Future check'],limitations=['Synthetic'])
         targets=review_targets(draft)
-        response={'verdicts':[{'claim_id':t['claim_id'],'status':'conditional' if t['kind']=='research_action' else 'supported','reason':'Fixture','quotes':[] if t['kind']=='research_action' else [{'record_id':'test','text':'Fixture'}]} for t in targets]}
+        response={'verdicts':[{'claim_id':t['claim_id'],'status':'conditional' if t['kind']=='research_action' else 'supported','reason':'Fixture','scope_alignment':'aligned','premise_assessment':'none' if t['kind']=='research_action' else 'supported' if t.get('premise_check_required') else None,'quotes':[] if t['kind']=='research_action' else [{'record_id':'test','text':'Fixture'}]} for t in targets]}
         self.assertEqual(check_review(response,targets,{'test':'Fixture'})['status'],'reviewed')
-        response['verdicts'][-1]['status']='supported'
-        with self.assertRaises(ValueError):check_review(response,targets,{'test':'Fixture'})
+        next(v for v in response['verdicts'] if v['claim_id']=='M1')['status']='supported'
+        self.assertEqual(check_review(response,targets,{'test':'Fixture'})['status'],'needs_revision')
 
     def test_genuine_failed_qualitative_annotation_is_rejected_before_publication(self):
         from research_agent.claims import Claim

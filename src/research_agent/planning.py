@@ -15,14 +15,14 @@ from typing_extensions import NotRequired
 
 
 PLANNING_INSTRUCTIONS = """Plan-first research contract:
-Before collecting or recalling evidence, computing, writing research files, or
+Before collecting new evidence, computing, writing research files, or
 publishing substantive findings, call write_todos to save a plan for THIS request.
 For detailed questions, the plan must state the objective, asset/time scope and
 relevant unknowns, then actionable research steps and completion criteria
 (source checks, calculations if needed, and the requested answer/report).
 Choose the steps to fit the question; no fixed list of indicators or data sources
 is required. A small research request may use a short two-step plan.
-You may first read applicable skills, inspect source metadata or user preferences,
+You may first read saved evidence, task notes, applicable skills, source metadata or user preferences,
 or ask a clarification-only question. Pure clarification needs no research plan.
 Use one write_todos call in its own tool turn and wait for success before research
 tools. Old session plans do not authorize a new request: refresh the plan, retaining
@@ -31,15 +31,24 @@ Execute according to the plan. Keep the active step in_progress; update the list
 when steps finish, evidence changes the approach, or a blocker needs another path.
 Only mark work completed after it succeeds. Record unavailable data and unresolved
 questions honestly; never label a blocked investigation completed. After a successful
-submission, update the plan to reflect the actual completed work.
+submission, the host records report completion without an extra plan-only model turn.
 """
 
 PLAN_TOOL_DESCRIPTION = """Save or update this request's research plan. Required before
 substantive research, even when an earlier session plan exists. Include the objective
 and scope, actionable steps, and completion checks. Initially provide 2–12 distinct
-items with at least one in_progress item. Status is pending, in_progress or completed.
+items. Status is pending, in_progress or completed; the host activates the first
+pending step when no step is active, avoiding an extra planning round.
 Call once in a separate tool turn before research; update honestly as work progresses.
 Clarification-only replies do not require a plan."""
+
+CONVERSATION_PLANNING_INSTRUCTIONS = """For this chat turn, answer directly from the
+conversation and the supplied saved context when they suffice. You may read saved
+reports, recall local material and inspect existing evidence without a plan.
+Use write_todos when the request requires a new investigation, calculation or fresh
+collection. Keep that plan proportional to the actual missing work and reuse
+completed work. Do not create a research plan merely to explain an existing result.
+"""
 
 
 class ResearchPlanningState(AgentState):
@@ -49,12 +58,25 @@ class ResearchPlanningState(AgentState):
 class ResearchPlanningMiddleware(AgentMiddleware):
     state_schema = ResearchPlanningState
 
-    def __init__(self, job_id, emit=lambda *_: None):
+    def __init__(self, job_id, emit=lambda *_: None, *, allow_saved_context=False,continued_from=None):
         self.job_id = job_id
         self.emit = emit
+        self.allow_saved_context = allow_saved_context
+        self.continued_from=continued_from
+
+    @staticmethod
+    def _saved_context_read(call):
+        if call['name'] in {'recall_memory','read_evidence','get_private_portfolio',
+                            'get_research_context','list_data_sources','ls','glob','grep'}:
+            return True
+        if call['name']=='read_file':
+            path=call.get('args',{}).get('file_path')
+            return isinstance(path,str) and '..' not in PurePosixPath(path).parts
+        return False
 
     def _accepted(self, state):
-        return state.get("research_plan_job_id") == self.job_id
+        saved=state.get('research_plan_job_id')
+        return saved==self.job_id or bool(self.continued_from and saved==self.continued_from)
 
     @staticmethod
     def _preparation(call):
@@ -81,6 +103,8 @@ class ResearchPlanningMiddleware(AgentMiddleware):
 
     def _check(self, request):
         call, state = request.tool_call, request.state
+        if self.allow_saved_context and self._saved_context_read(call):
+            return None
         if call["name"] == "write_todos":
             todos = call.get("args", {}).get("todos")
             minimum = 1 if self._accepted(state) else 2
@@ -94,12 +118,11 @@ class ResearchPlanningMiddleware(AgentMiddleware):
                 if content in seen:
                     return self._error(call, "Plan items must describe distinct work.")
                 seen.add(content)
-            if not all(item["status"] == "completed" for item in todos) or not self._accepted(state):
-                if not any(item["status"] == "in_progress" for item in todos):
-                    return self._error(call, "The current plan needs an in_progress step; a new request cannot start with all work completed.")
+            if not self._accepted(state) and all(item['status']=='completed' for item in todos):
+                return self._error(call, 'A new request cannot start with all work completed.')
         elif not self._accepted(state) and not self._preparation(call):
             return self._error(call, "No plan has been saved for this research request; the requested tool has not executed.")
-        elif self._accepted(state) and not any(item.get("status") == "in_progress" for item in state.get("todos", [])) and call["name"] not in {"submit_research_answer", "publish_report"} and not self._preparation(call):
+        elif self._accepted(state) and not any(item.get("status") == "in_progress" for item in state.get("todos", [])) and call["name"] not in {"submit_research_answer", "publish_report","publish_saved_report"} and not self._preparation(call):
             return self._error(call, "The saved plan has no active step; update it before starting further research.")
         return None
 
@@ -112,6 +135,12 @@ class ResearchPlanningMiddleware(AgentMiddleware):
             isinstance(message, ToolMessage) and message.tool_call_id == request.tool_call["id"] and message.status != "error" for message in messages
         ) or any(isinstance(message, ToolMessage) and message.status == "error" for message in messages):
             return result  # A failed/non-saving tool call cannot authorize research.
+        if not any(item['status']=='in_progress' for item in update['todos']):
+            todos=[dict(item) for item in update['todos']]
+            for item in todos:
+                if item['status']=='pending':
+                    item['status']='in_progress';break
+            update={**update,'todos':todos}
         self.emit("plan_updated" if self._accepted(request.state) else "plan_saved", {
             "job_id": self.job_id, "call_id": request.tool_call["id"], "todos": update["todos"]})
         return replace(result, update={**update, "research_plan_job_id": self.job_id})

@@ -10,6 +10,8 @@ from .claims import Claim, validate_claims
 from .advice import ResearchAdvice, advice_evidence_ids, validate_advice, render_advice
 from .research_explanations import (ResearchExplanation, explanation_evidence_ids,
                                     validate_explanations, render_explanations)
+from .report_presentation import (FeaturedDocument, ReportChart, ReportScope,
+                                  presentation_evidence_ids, resolve_report_media)
 
 
 def distinct_sources(sources):
@@ -48,7 +50,16 @@ class PurchaseDecision(BaseModel):
 class ReportDraft(BaseModel):
     title: str = Field(min_length=1,max_length=200)
     summary: str = Field(min_length=1,max_length=3000)
-    observations: list[Claim] = Field(min_length=1,max_length=30)
+    scope: ReportScope | None = Field(default=None, description="Research assets and time window. Required for new current research reports.")
+    charts: list[ReportChart] = Field(default_factory=list, max_length=3,
+        description="Select only central time-series metrics. Give a saved series or candle ID and exact metric. The host supplies points, dates and units.")
+    documents: list[FeaturedDocument] = Field(default_factory=list, max_length=5,
+        description="Select only important originals. Cite each saved page ID with an exact excerpt and explain its relevance. Label background, corrections and updates outside the window.")
+    narrative_evidence_ids: list[str] = Field(default_factory=list,max_length=10,
+        exclude_if=lambda value:not value,
+        description="Optional saved source IDs for summary, questions, limitations and judgment only. Explicitly bind narrative-only facts here; IDs written inside plain strings do not bind. Other claims retain their own evidence_ids.")
+    delivery_kind: Literal["full","minimal","evidence_gap"] = Field(default="full", exclude_if=lambda value:value=="full")
+    observations: list[Claim] = Field(min_length=0,max_length=30)
     key_changes: list[Claim] = Field(default_factory=list,max_length=6,
         description="Optional recent changes supported by original evidence. Compare actual dates/sources; do not invent a previous report or confirmed event. For dates/status/reasons use statement and evidence_ids only; omit metric/value/unit.")
     interpretations: list[Claim] = Field(default_factory=list,max_length=20)
@@ -75,6 +86,15 @@ class ReportDraft(BaseModel):
     def judgment_has_reason(self):
         if self.judgment!='informational' and not self.judgment_reason.strip():
             raise ValueError('An explicit research judgment requires a nonblank reason')
+        if self.delivery_kind!='evidence_gap' and not self.observations:
+            raise ValueError('A research report requires at least one observation')
+        if self.delivery_kind=='evidence_gap':
+            from .minimal_delivery import NOTICE_TITLE,NOTICE_SUMMARY,NOTICE_REASON,NOTICE_LIMIT
+            if (self.title!=NOTICE_TITLE or self.summary!=NOTICE_SUMMARY or self.judgment_reason!=NOTICE_REASON
+                or self.limitations!=[NOTICE_LIMIT] or self.judgment!='insufficient_evidence'
+                or any((self.observations,self.key_changes,self.interpretations,self.forecasts,self.questions_to_watch,
+                    self.charts,self.documents,self.narrative_evidence_ids,self.explanations,self.advice,self.purchase_decision))):
+                raise ValueError('Evidence-gap delivery accepts only literal host notice text and no external facts')
         return self
 
 
@@ -83,10 +103,18 @@ def report_claims(draft: ReportDraft) -> list[Claim]:
     return [*draft.observations,*draft.key_changes,*draft.interpretations]
 
 
-def validate_report(draft: ReportDraft, lookup, as_of=None):
+def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None):
     if draft.judgment!='informational' and not draft.judgment_reason.strip():
         raise ValueError('An explicit research judgment requires a nonblank reason')
-    checked,numeric=validate_claims(report_claims(draft),lookup)
+    claim_paths=[f'/{field}/{index}' for field in ('observations','key_changes','interpretations')
+                 for index, _ in enumerate(getattr(draft,field))]
+    checked,numeric=validate_claims(report_claims(draft),lookup,claim_paths=claim_paths)
+    for rid in draft.narrative_evidence_ids:lookup(rid);checked.add(rid)
+    media=resolve_report_media(draft,lookup,evidence_as_of=as_of,raw_reader=raw_reader)
+    doc_checked,doc_numeric=validate_claims([item.relevance for item in draft.documents],lookup,
+        claim_paths=[f'/documents/{index}/relevance' for index, _ in enumerate(draft.documents)])
+    checked.update(doc_checked);numeric+=doc_numeric
+    checked.update(presentation_evidence_ids(draft))
     explanation_check=validate_explanations(draft.explanations,lookup,as_of)
     checked.update(explanation_check['evidence_ids']);numeric+=explanation_check['numeric_claims_checked']
     advice_check=validate_advice(draft.advice,lookup,as_of)
@@ -99,9 +127,14 @@ def validate_report(draft: ReportDraft, lookup, as_of=None):
         for rid in draft.purchase_decision.simulation_evidence_ids:lookup(rid);checked.add(rid)
     if draft.judgment not in ("informational","insufficient_evidence") and not (draft.interpretations or draft.explanations):
         raise ValueError("An investment judgment requires at least one cited interpretation.")
-    return {"status":"passed","unique_evidence_records":len(checked),"numeric_claims_checked":numeric,
+    result={"status":"passed","unique_evidence_records":len(checked),"numeric_claims_checked":numeric,
             "explanations_checked":explanation_check['explanations_checked'],
             "scope":"Citation eligibility and structured numeric fields; does not prove the prose, causation or forecasts."}
+    if draft.scope is not None:
+        result.update(charts_checked=len(media["charts"]),
+                      chart_points_checked=sum(len(chart["points"]) for chart in media["charts"]),
+                      featured_documents_checked=len(media["documents"]))
+    return result
 
 
 def _numeric_note(claim):
@@ -120,7 +153,7 @@ def _numeric_note(claim):
     return lines
 
 
-def render_report(draft: ReportDraft, cutoff, validation, sources, online_through=None, review=None):
+def render_report(draft: ReportDraft, cutoff, validation, sources, online_through=None, review=None, presentation=None):
     labels={"informational":"Research context","consider":"Conditions worth investigating","wait":"Wait and monitor","avoid":"Caution under current conditions","insufficient_evidence":"Insufficient evidence"}
     ids=[]
     def include(references):
@@ -133,9 +166,39 @@ def render_report(draft: ReportDraft, cutoff, validation, sources, online_throug
         for condition in [*draft.purchase_decision.conditions_to_consider,*draft.purchase_decision.reasons_to_wait]:include(condition.evidence_ids)
         include(draft.purchase_decision.simulation_evidence_ids)
     include(advice_evidence_ids(draft.advice))
+    include(presentation_evidence_ids(draft))
     numbers={rid:n+1 for n,rid in enumerate(ids)}
     def cite(references):return " ".join(f"[{numbers[rid]}](../records/{rid}.json)" for rid in references)
     lines=["# "+draft.title,"",draft.summary]
+    if presentation:
+        overview=presentation["overview"]
+        lines += ["", "## Report overview", "",
+                  "- Generated at " + overview["created_at"],
+                  "- Assets " + ", ".join(overview["assets"]),
+                  "- Research window " + overview["start"] + " to " + overview["end"] + " (exclusive end)",
+                  "- Evidence cutoff " + overview["evidence_as_of"]]
+        if overview["document_ids"]:
+            lines += ["", "Key documents " + cite(overview["document_ids"])]
+        if presentation["charts"]:
+            lines += ["", "## Key data charts", ""]
+        for chart in presentation["charts"]:
+            first,last=chart["points"][0],chart["points"][-1]
+            lines += ["", "### " + escape(chart["asset"] + " " + chart["title"]), "",
+                      f'{chart["provider"]} · {chart["frequency"]} · {chart["unit"]} · '
+                      f'{len(chart["points"])} saved observations. ' + cite([chart["evidence_id"]]),
+                      f'First point {first["value"]} at {first["at"]}. Last point {last["value"]} at {last["at"]}.']
+            coverage=chart["coverage"]
+            if coverage.get("starts_after_window") or coverage.get("ends_before_window") or coverage["internal_gap_count"]:
+                lines.append("Saved observations do not span the full window continuously.")
+        if presentation["documents"]:
+            lines += ["", "## Important documents", ""]
+        for item in presentation["documents"]:
+            role={'primary':'main in-window evidence'}.get(item['role'],item['role'].replace('_',' '))
+            lines += ["", "### " + escape(item["title"]), "",
+                      f'{escape(item["publisher"])} · {item["published_at"]} · {role}. '
+                      f'[Captured publication](<{item["url"]}>) ' + cite([item["evidence_id"]]),
+                      "", "<blockquote>" + escape(item["quote"]) + "</blockquote>", "",
+                      escape(item["relevance"])]
     if online_through:lines += ['', 'Source captures through: '+online_through+'. Publication and event dates remain separate.']
     def section(title,claims):
         if not claims:return
@@ -173,12 +236,16 @@ def render_report(draft: ReportDraft, cutoff, validation, sources, online_throug
     lines += ["","## Sources",""]
     for src in distinct_sources(sources):lines.append("- ["+src['name']+"]("+src['url']+") — retrieved "+src['retrieved_at'])
     lines += ['','Numbered citations open saved evidence in the downloadable bundle. Publisher/API links may show later content.',
-        '', '<details>', '<summary>Source checks and technical provenance</summary>', '', '### Evidence review', '']
+        '', '<details>', '<summary>Source checks and technical provenance</summary>']
+    if presentation:
+        lines += ['', '### Original task question', '', '<pre>'+escape(presentation['overview']['user_prompt'])+'</pre>']
+    lines += ['', '### Evidence review', '']
     if review and review.get('status')=='reviewed':
         lines.append(f"{review['claims_checked']} statements reviewed in a separate context by {review['reviewer_model']}.")
         for v in review.get('verdicts',[]):lines.append(f"- {v['claim_id']} · {v['status']}: {v['reason']}")
     else:lines.append("No separate-context source review is attached to this rendering.")
     lines += ["","Source support is an inspectable AI assessment, not proof of source truth, causation, or future investment performance.",
+              "A captured media publication remains that publisher's account; main in-window evidence does not imply an issuer's first-hand statement.",
               "", "### Citation and numeric checks", "",
               "Status: "+str(validation.get('status','unknown'))+". Saved evidence records: "+str(validation.get('unique_evidence_records','not recorded'))+"; structured numeric fields checked: "+str(validation.get('numeric_claims_checked','not recorded'))+".",
               validation.get('scope','Checks cover citation eligibility and structured numeric fields, not prose truth or prediction quality.'),

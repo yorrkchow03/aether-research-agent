@@ -1,4 +1,4 @@
-"""Authorized personal local shell. This is host execution, not an OS sandbox."""
+"""Personal host shell or fail-closed confined OS sandbox, selected by the host."""
 import os
 import json
 import shlex
@@ -42,10 +42,14 @@ class ResearchShell(LocalShellBackend):
         """Check a self-contained recipe using only its supplied input snapshots.
 
         A fresh cwd catches accidental dependencies on exploratory notes or an
-        attached research SDK. This remains local host execution, not an OS
-        sandbox or proof that arbitrary code has no external dependencies.
+        attached research SDK. Confined workspaces keep their OS boundary; a
+        local-owner replay alone is not proof of method correctness.
         """
-        with tempfile.TemporaryDirectory(prefix='aether-declared-inputs-') as directory:
+        parent=None
+        if getattr(self.settings,'restricted_execution_root',None):
+            from .execution_safety import execution_temp_parent
+            parent=execution_temp_parent(self.settings)
+        with tempfile.TemporaryDirectory(prefix='aether-declared-inputs-',dir=parent) as directory:
             root=Path(directory);recipe=root/'recipe.py';recipe.write_bytes(body)
             inputs=[]
             for row in rows:
@@ -55,11 +59,28 @@ class ResearchShell(LocalShellBackend):
             return replay.execute(shlex.join(['python','-I',str(recipe),*inputs]),timeout=60)
 
     def execute(self, command, *, timeout=None):
+        """Run with Bash pipefail and the host-selected execution boundary.
+
+        File-tool /data/... paths are virtual. Python/terminal code uses ./data/...
+        or RESEARCH_WORKSPACE. Pipeline failures propagate; explicit shell error
+        handling remains under the caller's control. No command is rewritten.
+        """
         limit = min(timeout or 60, 120)
         if not isinstance(command, str) or not command.strip() or len(command) > 20000 or limit <= 0:
             return ExecuteResponse(output="Invalid command or timeout", exit_code=1, truncated=False)
-        with tempfile.TemporaryFile() as capture:
-            process = subprocess.Popen(command, shell=True, cwd=self.cwd, env=self._env,
+        if getattr(self.settings,'restricted_execution_root',None):
+            try:
+                from .execution_safety import execution_context
+                with execution_context(self.cwd,command,self.settings,self._env,
+                        sdk_socket=self._env.get('AETHER_RESEARCH_SOCKET')) as (argv,env,temporary):
+                    return self._run_command(command,argv,env,temporary,limit)
+            except (OSError,ValueError) as exc:
+                return ExecuteResponse(output='Restricted execution failed; host fallback is disabled: '+self.settings.redact(str(exc)),exit_code=126,truncated=False)
+        return self._run_command(command,['/bin/bash','-o','pipefail','-c',command],self._env,None,limit)
+
+    def _run_command(self,command,argv,env,capture_dir,limit):
+        with tempfile.TemporaryFile(dir=capture_dir) as capture:
+            process = subprocess.Popen(argv, cwd=self.cwd, env=env,
                                        stdin=subprocess.DEVNULL, stdout=capture, stderr=subprocess.STDOUT, start_new_session=True)
             start = time.monotonic(); reason = None
             while process.poll() is None:
@@ -80,10 +101,16 @@ class ResearchShell(LocalShellBackend):
             capture.seek(0); raw = capture.read(self._max_output_bytes + 1)
         output = self.settings.redact(raw[:self._max_output_bytes].decode("utf-8", errors="replace"))
         if reason:output += "\nExecution stopped: " + reason
+        if not output and process.returncode:
+            output=f'Command exited with status {process.returncode} without captured output. If diagnostics were redirected, rerun without that redirection to inspect the error. Pipeline failures propagate.'
         if process.returncode and 'FileNotFoundError' in output and any(p in output for p in ('/data/','/notes/','/reports/','/memory/','/skills/')):
             output += ('\nPath recovery hint: /data, /notes, /reports, /memory and /skills are virtual paths for file tools. '
                 'In this terminal use ./data/... (or the matching relative directory), or build a path from '
                 'os.environ["RESEARCH_WORKSPACE"]. Do not repeat the same absolute virtual path. '
                 'The command was not rewritten; inspect the existing source file before retrying.')
+        if process.returncode and 'TypeError' in output and 'str' in output and 'unsupported operand type' in output:
+            output+=('\nNumeric parsing hint: financial source values can be exact decimal strings. '
+                'Inspect data_contract and convert selected values with Decimal before arithmetic; '
+                'None/missing stays unknown. Reuse an applicable saved calculation instead of redoing all metrics.')
         return ExecuteResponse(output=output or "<no output>", exit_code=124 if reason else process.returncode,
                                truncated=len(raw) > self._max_output_bytes or reason == "output limit exceeded")

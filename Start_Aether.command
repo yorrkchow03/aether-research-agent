@@ -1,3 +1,3 @@
-#!/bin/zsh
+#!/bin/sh
 cd "$(dirname "$0")" || exit 1
-exec .venv/bin/python scripts/launch_product.py
+exec ./start.sh "$@"

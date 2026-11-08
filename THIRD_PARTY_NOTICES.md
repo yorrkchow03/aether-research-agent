@@ -6,6 +6,8 @@ Market data and news belong to their respective providers/publishers, including 
 
 Jev is an optional external TypeSafe service. Its name and model/API documentation are used to describe integration, not affiliation or endorsement. Model/search usage remains subject to the configured providers' terms.
 
+PDF downloads use ReportLab (BSD). The bundled Aether Sans SC font is a renamed, regular-weight static instance of Noto Sans SC, licensed under the SIL Open Font License. The original copyright notice, license and asset provenance are in `src/research_agent/fonts/`.
+
 No open-source license has been selected for this project's original code yet. Preparing a GitHub directory does not grant a new license; choose one deliberately before public release.
 
 

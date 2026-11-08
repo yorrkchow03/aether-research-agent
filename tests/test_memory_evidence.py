@@ -44,6 +44,21 @@ class EvidenceMemoryTests(unittest.TestCase):
         self.assertEqual(plain['source_ids'], broken['source_ids'])
         self.assertTrue(any(g['reason']=='semantic_judgment_unavailable' for g in broken['gaps']))
 
+    def test_missing_original_body_is_a_gap_not_a_high_rank_unknown_slot(self):
+        empty=source('d','   ')
+        good=self.rows[0]
+        for mode in ('off','apply'):
+            calls=[]
+            def judge(task,**arguments):
+                calls.append(arguments['evidence'][0]['record_id'])
+                return {'status':'ok','scores':{'relevant':.9}}
+            packet=EvidenceMemory(None,judge).pack('Ethereum upgrade',candidates=[empty,good],
+                policy='semantic_rerank' if mode=='apply' else 'hybrid_relevance',semantic_mode=mode,
+                retrieval_scores={empty['record_id']:1.,good['record_id']:.5},limit=1,max_pairs=0)
+            self.assertEqual(packet['source_ids'],[good['record_id']])
+            self.assertNotIn(empty['record_id'],calls)
+            self.assertIn('original_body_unavailable',[gap['reason'] for gap in packet['gaps']])
+
     def test_unresolved_conflict_is_both_or_neither_and_remains_inspectable(self):
         def judge(task, **kwargs):
             if task == 'relevance':return {'status': 'ok', 'label': 'relevant', 'scores': {'relevant': .9}}

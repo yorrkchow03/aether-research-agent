@@ -76,7 +76,6 @@ class PlanningTests(unittest.TestCase):
     def test_invalid_initial_plans_do_not_authorize_work(self):
         invalid = [[], PLAN[:1], [{"content": "", "status": "in_progress"}, PLAN[1]],
                    [PLAN[0], PLAN[0]], [{**p, "status": "completed"} for p in PLAN],
-                   [{**p, "status": "pending"} for p in PLAN],
                    [{**PLAN[0], "status": []}, PLAN[1]],
                    [{**PLAN[0], "status": "unknown"}, PLAN[1]]]
         for todos in invalid:
@@ -84,6 +83,20 @@ class PlanningTests(unittest.TestCase):
                 result = self.gate.wrap_tool_call(request("write_todos", {"todos": todos}), lambda _: self.fail("Invalid plan must not save"))
                 self.assertEqual(result.status, "error")
         self.assertFalse(any(kind == "plan_saved" for kind, _ in self.events))
+
+    def test_pending_plan_activates_first_pending_without_rejecting_or_marking_completed(self):
+        pending=[{**p,'status':'pending'} for p in PLAN]
+        result=self.gate.wrap_tool_call(request('write_todos',{'todos':pending}),save_plan)
+        self.assertEqual([p['status'] for p in result.update['todos']],['in_progress','pending'])
+        self.assertEqual([p['status'] for p in pending],['pending','pending'])
+
+    def test_report_saved_preparation_needs_no_plan_but_mutations_still_do(self):
+        gate=ResearchPlanningMiddleware('report',allow_saved_context=True)
+        marker=object()
+        self.assertIs(gate.wrap_tool_call(request('read_file',{'file_path':'/memory/acquired-research.json'}),lambda _:marker),marker)
+        self.assertIs(gate.wrap_tool_call(request('read_evidence',{'record_id':'page-saved'}),lambda _:marker),marker)
+        for name in ('execute','register_calculation','publish_report'):
+            self.assertEqual(gate.wrap_tool_call(request(name),lambda _:self.fail('Must plan')).status,'error')
 
     def test_only_successful_plan_command_authorizes_current_job(self):
         req = request("write_todos", {"todos": deepcopy(PLAN)})
@@ -105,6 +118,14 @@ class PlanningTests(unittest.TestCase):
         result = self.gate.wrap_tool_call(request("write_todos", {"todos": state["todos"]}, state), save_plan)
         self.assertEqual(result.update["research_plan_job_id"], "new-job")
 
+    def test_explicit_continuation_reuses_same_request_plan_only(self):
+        state={'research_plan_job_id':'prior-job','todos':deepcopy(PLAN)}
+        gate=ResearchPlanningMiddleware('continued-job',continued_from='prior-job')
+        marker=object()
+        self.assertIs(gate.wrap_tool_call(request('publish_saved_report',state=state),lambda _:marker),marker)
+        unrelated=ResearchPlanningMiddleware('new-request')
+        self.assertEqual(unrelated.wrap_tool_call(request('publish_saved_report',state=state),lambda _:self.fail()).status,'error')
+
     def test_async_wrapper_has_the_same_ordering(self):
         async def scenario():
             async def handler(req):
@@ -119,6 +140,9 @@ class PlanningTests(unittest.TestCase):
         meta = {"cutoff": "2026-01-01T00:00:00Z", "mode": "observed"}
         self.assertIn(PLANNING_INSTRUCTIONS, research_system_prompt(meta, True, True))
         self.assertNotIn(PLANNING_INSTRUCTIONS, research_system_prompt(meta, False, False))
+        chat=research_system_prompt(meta,True,True,conversation=True)
+        self.assertNotIn(PLANNING_INSTRUCTIONS,chat)
+        self.assertIn('respond directly in your final message',chat)
 
 
 class PlanningGraphTests(unittest.TestCase):

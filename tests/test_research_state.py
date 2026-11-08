@@ -67,6 +67,88 @@ class ResearchStateTests(unittest.TestCase):
             'records':[{'record_id':C,'values':{'close_usd':'1'}}]*1000})
         self.assertEqual([r['evidence_id'] for r in changes['sources']],[collection])
 
+    def test_saved_draft_publication_records_receipt_and_supersedes_old_failure(self):
+        failure=self.derive('publish_report',{'status':'error','error':'Fix chart metric'},status='error')
+        state=merge_observation(empty_state(),failure,{'observation_id':'failed'})
+        source_failure=self.derive('read_evidence',{'status':'error','error':'Missing source'},status='error')
+        state=merge_observation(state,source_failure,{'observation_id':'source-failed'})
+        saved=self.derive('publish_saved_report',{'status':'saved','report_path':'/reports/real.md',
+            'review':{'status':'reviewed','verdicts':[]}})
+        state=merge_observation(state,saved,{'observation_id':'saved'})
+        self.assertEqual(state['publications'][0]['path'],'/reports/real.md')
+        self.assertEqual([r['status'] for r in state['unknowns']],['superseded','unresolved'])
+
+    def test_later_supported_target_supersedes_only_same_family_issue(self):
+        failure=self.derive('publish_report',{'review':{'status':'needs_revision','verdicts':[
+            {'claim_id':'S1','status':'insufficient'}, {'claim_id':'S2','status':'contradicted'}]}})
+        state=merge_observation(empty_state(),failure,{'observation_id':'old-review'})
+        answer=self.derive('review_answer',{'status':'reviewed','verdicts':[{'claim_id':'S1','status':'supported'}]})
+        state=merge_observation(state,answer,{'observation_id':'answer-review'})
+        self.assertTrue(all(r['status']=='unresolved' for r in state['unknowns']))
+        success=self.derive('publish_saved_report',{'review':{'status':'reviewed','verdicts':[{'claim_id':'S1','status':'supported'}]}})
+        state=merge_observation(state,success,{'observation_id':'new-review'})
+        self.assertEqual([r['status'] for r in state['unknowns']],['superseded','unresolved'])
+        self.assertEqual(len(state['checks']),6)
+
+    def test_later_accepted_inference_or_condition_supersedes_old_issue(self):
+        for verdict in ('reasonable_inference','conditional'):
+            old=self.derive('publish_report',{'review':{'verdicts':[{'claim_id':'I1','status':'insufficient'}]}})
+            state=merge_observation(empty_state(),old,{'observation_id':'old'})
+            new=self.derive('publish_saved_report',{'review':{'verdicts':[{'claim_id':'I1','status':verdict}]}})
+            state=merge_observation(state,new,{'observation_id':'new'})
+            self.assertEqual(state['unknowns'][0]['status'],'superseded')
+
+    def test_repeated_negative_reviews_keep_one_current_issue_and_full_history(self):
+        state=empty_state()
+        for number in range(4):
+            changes=derive_observation('publish_saved_report',{'review':{
+                'review_id':'review-'+str(number),'status':'needs_revision','verdicts':[
+                    {'claim_id':'M4','status':'insufficient','correction':'Bind the saved dataset.'}]}},
+                artifact_id='artifact-'+str(number),observation_id='observation-'+str(number))
+            state=merge_observation(state,changes,{'observation_id':'observation-'+str(number)})
+        self.assertEqual(len(state['unknowns']),4)
+        self.assertEqual([r['status'] for r in state['unknowns']],['superseded']*3+['unresolved'])
+        self.assertEqual(state['unknowns'][-1]['review_id'],'review-3')
+
+    def test_structured_failed_publication_preserves_every_review_issue(self):
+        payload={'status':'error','error':'Report needs source corrections.', 'review':{
+            'review_id':'review-fixture','status':'needs_revision','verdicts':[
+                {'claim_id':cid,'status':'insufficient','reason':'Missing source binding.',
+                    'correction':'Read the named saved evidence and bind it.'}
+                for cid in ('O5','S1','M3','M4','L3','L4','L5','DOC3')]}}
+        changes=self.derive('publish_saved_report',payload,status='error')
+        issues=[r for r in changes['unknowns'] if r['kind']=='review_issue']
+        self.assertEqual([r['claim_id'] for r in issues],['O5','S1','M3','M4','L3','L4','L5','DOC3'])
+        self.assertEqual(changes['publications'],[])
+        self.assertEqual(self.derive('read_evidence',payload,status='error')['checks'],[])
+        self.assertEqual(self.derive('execute',payload,status='error')['checks'],[])
+
+    def test_later_host_blocked_review_replaces_old_issue_without_clearing_current(self):
+        old=derive_observation('publish_report',{'review':{'verdicts':[
+            {'claim_id':'S1','status':'insufficient'}]}},artifact_id='old',observation_id='old')
+        state=merge_observation(empty_state(),old,{'observation_id':'old'})
+        new=derive_observation('publish_saved_report',{'review':{
+            'verdicts':[{'claim_id':'S1','status':'supported'}],
+            'host_issues':[{'claim_id':'S1','issue_kind':'scope_issue','correction':'Qualify scope.'}]}},
+            artifact_id='new',observation_id='new')
+        state=merge_observation(state,new,{'observation_id':'new'})
+        self.assertEqual([r['status'] for r in state['unknowns']],['superseded','unresolved'])
+        self.assertEqual(state['unknowns'][-1]['issue_kind'],'scope_issue')
+
+    def test_new_failed_review_retires_old_attempt_summary_but_not_its_new_issue(self):
+        state=empty_state()
+        for number in range(3):
+            changes=derive_observation('publish_saved_report',{'status':'error',
+                'error':'Report needs source corrections.','review':{
+                    'review_id':'review-'+str(number),'status':'needs_revision','verdicts':[
+                        {'claim_id':'L4','status':'insufficient','correction':'Bind the meeting record.'}]}},
+                status='error',artifact_id='artifact-'+str(number),observation_id='observation-'+str(number))
+            state=merge_observation(state,changes,{'observation_id':'observation-'+str(number)})
+        current=[r for r in state['unknowns'] if r['status']=='unresolved']
+        self.assertEqual([r['kind'] for r in current],['tool_failure','review_issue'])
+        self.assertTrue(all(r['review_id']=='review-2' for r in current))
+        self.assertEqual(len(state['unknowns']),6)
+
     def test_merge_is_idempotent_and_keeps_opened_source_over_candidate(self):
         changes=self.derive('read_evidence',{'record':{'record_id':A,'published_at':'2026-01-01T00:00:00Z'}})
         observation={'observation_id':'observation-fixture','artifact_id':'artifact-fixture'}

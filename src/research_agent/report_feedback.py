@@ -12,7 +12,7 @@ import uuid
 
 from research_data.http import utcnow
 from .reports import ReportDraft, validate_report
-from .review import check_review, evidence_text, review_targets
+from .review import check_review, check_saved_scope_critic, evidence_text, saved_report_review_targets
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -105,7 +105,7 @@ class ReportFeedbackStore:
             raise ValueError('A real saved report with its creation time is required')
         _instant(body['created_at'])
         draft = ReportDraft.model_validate(body['report'])
-        targets = {target['claim_id']: target for target in review_targets(draft)}
+        targets = {target['claim_id']: target for target in saved_report_review_targets(draft,body.get('review') or {})}
         return body, draft, targets
 
     def _get(self, feedback_id, cutoff=None):
@@ -137,7 +137,13 @@ class ReportFeedbackStore:
         return result
 
     def submit(self, report_id, note, claim_id='S1', category='other', actor='user'):
-        body, _, targets = self._report(report_id)
+        body, draft, targets = self._report(report_id)
+        if claim_id=='S1' and claim_id not in targets:
+            children=[target for target in targets.values() if target.get('parent_claim_id')=='S1']
+            if children:
+                targets={**targets,'S1':{'claim_id':'S1','kind':'summary','statement':draft.summary,
+                    'evidence_ids':children[0]['evidence_ids'],'summary_children':[t['claim_id'] for t in children],
+                    'claim_path':'/summary','scope':'Parent feedback address only; not an extra review verdict or approval.'}}
         if claim_id not in targets:
             raise ValueError('Feedback target is not a claim in this report')
         if category not in CATEGORIES:
@@ -363,11 +369,15 @@ class ReportFeedbackStore:
         if not set(review['evidence_ids']).issubset(cited):
             raise ValueError('Replacement must cite every correction-review evidence record')
         validate_report(draft, self.evidence_lookup, as_of=replacement['created_at'])
-        texts = {rid: evidence_text(self.evidence_lookup(rid)) for rid in cited}
+        texts = {rid: evidence_text(self.evidence_lookup(rid),targets=[t for t in targets.values() if rid in t['evidence_ids']],
+            review_version=replacement['review'].get('review_version')) for rid in cited}
         saved_texts = replacement['review'].get('evidence_text')
         if saved_texts is not None and (not isinstance(saved_texts, dict) or any(saved_texts.get(rid) != text for rid, text in texts.items())):
             raise ValueError('Saved source review text differs from the current evidence snapshot')
-        checked = check_review({'verdicts': replacement['review'].get('verdicts', [])}, list(targets.values()), texts)
+        from .review import validate_saved_report_review
+        checked = validate_saved_report_review({**replacement['review'],'targets':list(targets.values()),'evidence_text':texts},draft)
+        critic_review={**replacement['review'],'targets':list(targets.values()),'evidence_text':texts}
+        check_saved_scope_critic(critic_review,draft)
         if checked['status'] != 'reviewed':
             raise ValueError('Replacement source review still requires revision')
         _, duplicate = self._append(feedback_id, 'resolve', {

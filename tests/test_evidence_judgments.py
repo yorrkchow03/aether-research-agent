@@ -75,6 +75,52 @@ class EvidenceJudgmentTests(unittest.TestCase):
             self.assertNotEqual(base['input_hash'], result['input_hash'])
         self.assertEqual(len(seen), 5)
 
+    def test_passage_task_and_subquestion_have_distinct_use_classes_and_bound_cache(self):
+        seen=[]
+        def handler(request):
+            body=json.loads(request.content);seen.append(body)
+            return httpx.Response(200,json=self.response(body,{'relevance':'direct_evidence',
+                'subquestion_relevance':'unrelated','instruction_risk':'absent'}))
+        service=self.service(handler)
+        passage={**self.source,'passage_id':'page-a:span:1200:2600:abc',
+            'source_slices':[{'start':1200,'end':2600,'sha256':'b'*64}],
+            'input_excerpt_sha256':'b'*64,'source_text_truncated':True}
+        task={'original_user_question':'Produce a weekly ETH report including institutional demand.',
+            'asset':'ETH','report_start_inclusive':'2026-10-17','report_end_exclusive':'2026-10-24',
+            'knowledge_cutoff':'2026-11-07'}
+        args={'question':task['original_user_question'],'evidence':[passage],
+            'research_task':task,'retrieval_subquestion':'Why was Hoodi delayed?',
+            'criterion_version':'passage-task-use-v2'}
+        base=service.assess('relevance',**args)
+        self.assertEqual(base['label'],'direct_evidence')
+        self.assertEqual(base['dimensions']['subquestion_relevance']['choice'],'unrelated')
+        self.assertTrue(service.assess('relevance',**args)['cache_hit'])
+        document=seen[0]['state']['documents'][0]
+        self.assertEqual(document['passage_id'],passage['passage_id'])
+        self.assertEqual(document['source_slices'],passage['source_slices'])
+        self.assertEqual(document['passage_sha256'],'b'*64)
+        self.assertEqual(document['source']['sha256'],'a'*64)
+        variants=[{'research_task':{**task,'knowledge_cutoff':'2026-11-08'}},
+            {'research_task':{**task,'original_user_question':'Explain Hoodi delay only.'}},
+            {'retrieval_subquestion':'What institutional demand occurred?'},
+            {'evidence':[{**passage,'passage_id':'page-a:span:0:1400:abc',
+                'source_slices':[{'start':0,'end':1400,'sha256':'b'*64}]}]},
+            {'criterion_version':'passage-task-use-next'}]
+        for variant in variants:
+            result=service.assess('relevance',**{**args,**variant})
+            self.assertNotEqual(result['cache_key'],base['cache_key'])
+        self.assertEqual(len(seen),6)
+
+    def test_new_rubric_low_confidence_keeps_class_as_soft_assessment(self):
+        service=self.service(lambda r:httpx.Response(200,json=self.response(json.loads(r.content),
+            {'relevance':'unrelated','subquestion_relevance':'needs_context'},.28)))
+        result=service.assess('relevance',question='Weekly ETH report',evidence=[self.source],
+            research_task={'original_user_question':'Weekly ETH report'},retrieval_subquestion='Hoodi?')
+        self.assertEqual(result['status'],'abstained')
+        self.assertIsNone(result['label'])
+        self.assertEqual(result['dimensions']['relevance']['choice'],'unrelated')
+        self.assertEqual(result['dimensions']['subquestion_relevance']['choice'],'needs_context')
+
     def test_uncertain_or_low_confidence_is_not_a_negative_verdict(self):
         service = self.service(lambda r: httpx.Response(200, json=self.response(json.loads(r.content), {'support': 'insufficient'}, .3)))
         result = service.assess('support', question='Activation occurred.', evidence=[self.source])
@@ -301,7 +347,7 @@ class EvidenceJudgmentTests(unittest.TestCase):
         self.assertIsNone(result['usage'])
 
     def test_document_sidecar_inventory_no_calls_and_resume_skips_completed(self):
-        namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/evaluation/classify_jev_documents.py'))
+        namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/data/classify_documents.py'))
         process=namespace['process'];calls=[]
         rows=[{'record_id':'page-a','url':'https://example.test/a'},{'record_id':'page-b','url':'https://example.test/b'}]
         class Library:
@@ -324,7 +370,7 @@ class EvidenceJudgmentTests(unittest.TestCase):
             self.assertEqual(calls,['page-a','page-b'])
 
     def test_fixed_document_sample_resumes_and_access_failure_stops_after_one_call(self):
-        namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/evaluation/classify_jev_documents.py'))
+        namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/data/classify_documents.py'))
         process=namespace['process'];calls=[]
         sample={'library':str((self.root/'library').resolve()),'library_original_documents_at_selection':42,
                 'selected':[{'record_id':rid,'text_sha256':hashlib.sha256(b'public').hexdigest(),'source_sha256':'abc'}

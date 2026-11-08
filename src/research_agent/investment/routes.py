@@ -1,5 +1,7 @@
 """Local investment API. All writes inherit the server's origin/CSRF gate."""
 from typing import Literal
+import secrets
+from fastapi import HTTPException,Request
 from fastapi.responses import Response
 from pydantic import BaseModel,ConfigDict,Field
 from .ledger import Transaction
@@ -20,6 +22,7 @@ class PreviewInput(BaseModel):
     max_asset_fraction:float=Field(default=.5,gt=0,le=1)
     stress_decline_fraction:float=Field(default=.3,gt=0,le=1)
     max_loss_usd:float|None=Field(default=None,gt=0,le=1e9)
+    refresh:bool=Field(default=False,strict=True)
 
 class AssessmentInput(BaseModel):
     task:Literal['source_support','relevance','event_status']='source_support'
@@ -32,7 +35,10 @@ def register_routes(app,runtime):
     @app.get('/api/investment/config')
     def config():return {'jev':service.jev.settings.public(),'assets':['ETH','BTC'],'ledger':'Private local FIFO ledger, USD fees; no exchange orders'}
     @app.get('/api/portfolio')
-    def portfolio():return service.portfolio()
+    def portfolio(request:Request,refresh:bool=False,as_of:str|None=None):
+        if refresh and not secrets.compare_digest(request.headers.get('x-local-token',''),app.state.csrf_token):
+            raise HTTPException(status_code=403,detail='Local session token required for a market refresh')
+        return service.portfolio(as_of,refresh=refresh)
     @app.get('/api/portfolio/transactions')
     def transactions():return {'items':service.ledger.list()}
     @app.post('/api/portfolio/transactions')

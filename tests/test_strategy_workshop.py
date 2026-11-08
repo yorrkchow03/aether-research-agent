@@ -48,7 +48,7 @@ class CodeTests(unittest.TestCase):
         with patch('subprocess.run',side_effect=TimeoutExpired('test',.01)),self.assertRaisesRegex(ValueError,'wall-clock'):execute_source(CODE,[{'series':[{}],'indices':[0]}],{'allocation_cap':.5})
     def test_declared_mean_diagnostic_detects_semantic_error_despite_valid_syntax(self):
         import importlib.util
-        path=Path(__file__).resolve().parents[1]/'scripts/evaluation/review_generated_strategy.py'
+        path=Path(__file__).resolve().parents[1]/'scripts/data/review_generated_strategy.py'
         spec=importlib.util.spec_from_file_location('strategy_review',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         bad='def strategy(bars, config):\n    total = 0.0\n    for i in range(42):\n        total = total + float(bars[i]["close_usd"])\n    slow_average = total / 63.0\n    return 0.0\n'
         self.assertFalse(module.constant_mean_check(bad,'slow_average',63)['passed'])

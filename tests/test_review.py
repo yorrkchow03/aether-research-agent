@@ -17,7 +17,7 @@ class ReviewTests(unittest.TestCase):
   self.draft=ReportDraft.model_validate({'title':'fixture','summary':'A sourced test summary','observations':[{'statement':'price','evidence_ids':['test-id']}],'judgment':'insufficient_evidence','judgment_reason':'limited coverage','limitations':['fixture']})
   self.targets=review_targets(self.draft);self.texts={'test-id':'saved price scope is one exchange'}
  def result(self,status='supported'):
-  return {'verdicts':[{'claim_id':t['claim_id'],'status':status,'reason':'fixture','quotes':[{'record_id':'test-id','text':'one exchange'}]} for t in self.targets]}
+  return {'verdicts':[{'claim_id':t['claim_id'],'status':status,'scope_alignment':'aligned','premise_assessment':'supported' if t.get('premise_check_required') else None,'reason':'fixture','quotes':[{'record_id':'test-id','text':'one exchange'}]} for t in self.targets]}
  def test_exact_source_quotes_and_eligible_ids_are_required(self):
   good=self.result();self.assertEqual(check_review(good,self.targets,self.texts)['status'],'reviewed')
   good['verdicts'][0]['quotes'][0]['text']='invented original excerpt'
@@ -30,11 +30,21 @@ class ReviewTests(unittest.TestCase):
   good=self.result();good['verdicts'][0]['claim_id']='S1'
   with self.assertRaises(ValueError):check_review(good,self.targets,self.texts)
   good=self.result();good['verdicts'][0]['status']='conditional'
-  with self.assertRaises(ValueError):check_review(good,self.targets,self.texts)
+  self.assertEqual(check_review(good,self.targets,self.texts)['host_issues'][0]['issue_kind'],'scope_issue')
  def test_unsupported_claim_is_retained_as_revision_not_passed(self):
   good=self.result();good['verdicts'][0].update(status='insufficient',quotes=[],correction='remove unsupported claim')
   result=check_review(good,self.targets,self.texts)
   self.assertEqual(result['status'],'needs_revision');self.assertEqual(result['unsupported'],1)
+ def test_informational_report_does_not_add_uncited_user_parameters(self):
+  draft=ReportDraft(title='Fixture',summary='Source observation',observations=[{'statement':'Source observation','evidence_ids':['page-source']}],limitations=['Fixture'])
+  reviewer=EvidenceReviewer(Settings(),user_context_id='context-user')
+  with patch.object(reviewer,'review_claims',return_value={}) as review:
+   reviewer.review(draft,lambda rid:{})
+   self.assertFalse(review.call_args.kwargs['include_user_context'])
+   self.assertTrue(all('context-user' not in target['evidence_ids'] for target in review.call_args.args[0]))
+   draft.judgment='wait';draft.judgment_reason='User conditions matter.'
+   reviewer.review(draft,lambda rid:{})
+   self.assertTrue(review.call_args.kwargs['include_user_context'])
  def test_publication_blocks_failed_semantic_review_and_saves_draft(self):
   with tempfile.TemporaryDirectory() as tmp:
    runtime=AgentRuntime(root=project_fixture(Path(tmp)/'project'),state_dir=Path(tmp)/'runtime');session=runtime.create_session(model_mode='current_conversation_no_api')
@@ -75,7 +85,7 @@ class ReviewTests(unittest.TestCase):
  def test_reviewer_repairs_its_own_format_without_author_edit_or_false_pass(self):
   row={'record_id':'test-id','values':{'price_usd':'42'},'units':{'price_usd':'USD'}}
   idx=quote_index({'R1':evidence_text(row)});qid=next(k for k,v in idx['R1'].items() if 'price_usd' in v and '42' in v)
-  base={'verdicts':[{'claim_id':t['claim_id'],'status':'supported','reason':'fixture','quotes':[{'source_id':'R1','excerpt_id':qid}]} for t in self.targets]}
+  base={'verdicts':[{'claim_id':t['claim_id'],'status':'supported','scope_alignment':'aligned','premise_assessment':'supported' if t.get('premise_check_required') else None,'reason':'fixture','quotes':[{'source_id':'R1','excerpt_id':qid}]} for t in self.targets]}
   bad=json.loads(json.dumps(base));bad['verdicts'][0]['quotes'][0]['source_id']='mistyped-long-hash'
   requests=[];closed=[]
   class Fake:
@@ -85,7 +95,7 @@ class ReviewTests(unittest.TestCase):
     return SimpleNamespace(content=json.dumps(content),response_metadata={'model_name':'fixture-pro'},usage_metadata={'total_tokens':10})
   with tempfile.TemporaryDirectory() as tmp,patch('research_agent.review.create_ark_model',return_value=Fake()):
    reviewer=EvidenceReviewer(Settings(),diagnostic_dir=tmp)
-   result=reviewer.review(self.draft,lambda rid:row)
+   result=reviewer.review_claims(self.targets,lambda rid:row,self.draft.model_dump())
    self.assertEqual(result['status'],'reviewed');self.assertEqual(result['format_repairs'],1);self.assertEqual(reviewer.calls,2)
    self.assertEqual(len(list(Path(tmp).glob('*.json'))),2);self.assertTrue(closed)
    self.assertTrue(any('source_id' in str(m.content) for m in requests[0]))

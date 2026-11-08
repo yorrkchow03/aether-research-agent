@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager, closing
 from datetime import datetime,timezone
 from pathlib import Path
@@ -37,6 +38,80 @@ def instant_us(value):
     except (ValueError,TypeError,OverflowError):return None
 
 
+def capture_us(body):
+    """Conservative saved-version acquisition clock, before ranking statistics."""
+    try:
+        row=json.loads(body)
+        values=[row.get(k) for k in ('first_seen_at','available_at','retrieved_at','acquired_at')]
+        values.append((row.get('source') or {}).get('retrieved_at'))
+        clocks=[instant_us(value) for value in values if value]
+        return max(clocks) if clocks and all(value is not None for value in clocks) else None
+    except (ValueError,TypeError,AttributeError):return None
+
+
+def source_content_fingerprint(row):
+    """Exact complete-source identity; excerpt hashes must never identify a revision.
+
+    Acquisition clocks intentionally do not enter this fingerprint. A publication
+    date or content change does, so later corrections remain separate evidence.
+    Callers must supply a freshly reopened saved source, not a generated summary.
+    """
+    if not isinstance(row.get('text'),str):return None
+    published=row.get('published_at')
+    try:published=iso(timestamp(published)) if published else None
+    except (ValueError,TypeError,OverflowError):return None
+    return hashlib.sha256(dumps({'title':row.get('title') or '', 'text':row['text'],
+                                'published_at':published},sort_keys=True).encode()).hexdigest()
+
+
+def news_coverage(rows,*,start=None,end=None,pool_truncated=False):
+    """Bounded inventory of captured material, never a claim of complete news coverage."""
+    start_time=timestamp(start) if start else None;end_time=timestamp(end) if end else None
+    counts=Counter();days=Counter();hosts=set();origins=set();events=set();unassigned=0
+    for row in rows:
+        raw=row.get('url') or row.get('source',{}).get('url')
+        if raw:
+            try:
+                url=canonical_url(raw);origins.add(url);hosts.add(urlsplit(url).hostname)
+            except (ValueError,TypeError):pass
+        event=row.get('event_id')
+        if event:events.add(str(event))
+        else:unassigned+=1
+        value=row.get('published_at')
+        try:date=timestamp(value) if value else None
+        except (ValueError,TypeError,OverflowError):date=None
+        role=('unknown_time' if date is None else 'background' if start_time and date<start_time
+              else 'later_update' if end_time and date>=end_time else 'in_window' if start_time or end_time else 'unscoped')
+        counts[role]+=1
+        if role=='in_window':days[iso(date)[:10]]+=1
+    issues=[]
+    if (start or end) and not counts['in_window']:issues.append('no_captured_in_window_documents')
+    if counts['unknown_time']:issues.append('publication_time_unknown')
+    if pool_truncated:issues.append('candidate_pool_truncated_not_complete_window_coverage')
+    return {'start':start,'end_exclusive':end,'document_count':len(rows),
+        'time_roles':{key:counts[key] for key in ('in_window','background','later_update','unknown_time','unscoped')},
+        'unique_origin_urls':len(origins),'publisher_host_count':len(hosts),'publisher_host_preview':sorted(hosts)[:12],
+        'explicit_event_count':len(events),'documents_without_explicit_event':unassigned,
+        'publication_day_counts':dict(sorted(days.items())[:31]),'publication_days_omitted':max(0,len(days)-31),
+        'gaps':issues,'scope':'Captured candidate/selected inventory only. URLs/hosts are not proof of independent reporting; absent dates do not mean no real events. Publication timestamps remain publisher metadata.'}
+
+
+def _diverse_news(rows,limit):
+    """Breadth-first date/source navigation; no guessed topics or financial ranking."""
+    selected=[];remaining=list(rows);days=Counter();hosts=Counter()
+    while remaining and len(selected)<limit:
+        def key(index):
+            row=remaining[index];day=(row.get('published_at') or '')[:10]
+            try:host=urlsplit(row.get('url') or '').hostname or ''
+            except ValueError:host=''
+            return days[day],hosts[host],index
+        index=min(range(len(remaining)),key=key);row=remaining.pop(index);selected.append(row)
+        days[(row.get('published_at') or '')[:10]]+=1
+        try:hosts[urlsplit(row.get('url') or '').hostname or '']+=1
+        except ValueError:hosts['']+=1
+    return selected
+
+
 class KnowledgeStore:
     def __init__(self,root):
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True)
@@ -45,6 +120,8 @@ class KnowledgeStore:
             c.executescript('''
                 CREATE TABLE IF NOT EXISTS evidence(record_id TEXT PRIMARY KEY, body TEXT NOT NULL, digest TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL, kind TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS evidence_market_dataset ON evidence(json_extract(body,'$.dataset_id'))
+                    WHERE kind='data';
                 CREATE TABLE IF NOT EXISTS documents(doc_id TEXT PRIMARY KEY,url TEXT NOT NULL,kind TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS versions(version_id TEXT PRIMARY KEY,doc_id TEXT NOT NULL,record_id TEXT NOT NULL,
                     title TEXT NOT NULL,text TEXT NOT NULL,published_at TEXT,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,
@@ -63,12 +140,13 @@ class KnowledgeStore:
     def connect(self):
         c=sqlite3.connect(self.path,timeout=15);c.row_factory=sqlite3.Row
         c.create_function('instant_us',1,instant_us,deterministic=True)
+        c.create_function('capture_us',1,capture_us,deterministic=True)
         c.execute('PRAGMA journal_mode=WAL')
         try:
             with c:yield c
         finally:c.close()
 
-    def register(self,row,raw_path=None):
+    def register(self,row,raw_path=None,*,deduplicate_feed=False):
         """A stable ID cannot later be rebound to different normalized facts."""
         row=json.loads(dumps(row));rid=row['record_id']
         if not re.fullmatch(r'(live|page|web|context)-[a-f0-9]{24}',rid):raise ValueError('Unknown persistent evidence ID')
@@ -91,6 +169,14 @@ class KnowledgeStore:
         seen=iso(timestamp(row.get('retrieved_at') or utcnow()))
         kind='page' if rid.startswith('page-') else ('feed_item' if row.get('source_kind')=='feed_item' else 'search_excerpt') if rid.startswith('web-') else 'data'
         with self.connect() as c:
+            if deduplicate_feed:
+                if kind!='feed_item':raise ValueError('Feed deduplication requires a feed item')
+                c.execute('BEGIN IMMEDIATE')
+                _,_,version=self._news_identity(row,kind)
+                current=c.execute('SELECT record_id FROM versions WHERE version_id=?',(version,)).fetchone()
+                if current:
+                    self._index_news(c,row,seen,kind)
+                    return current['record_id']
             existing=c.execute('SELECT digest FROM evidence WHERE record_id=?',(rid,)).fetchone()
             if existing and existing['digest']!=digest:raise ValueError('Evidence receipt mismatch: normalized record was modified')
             c.execute('INSERT OR IGNORE INTO evidence VALUES(?,?,?,?,?)',(rid,body,digest,seen,kind))
@@ -103,10 +189,7 @@ class KnowledgeStore:
         return rid
 
     def _index_news(self,c,row,seen,kind):
-        url=canonical_url(row.get('url') or row['source']['url'])
-        did=hashlib.sha256((kind+'|'+url).encode()).hexdigest()[:24]
-        content=dumps({k:row.get(k) for k in ('title','text','published_at')},sort_keys=True)
-        vid=hashlib.sha256((did+content).encode()).hexdigest()[:24]
+        url,did,vid=self._news_identity(row,kind)
         c.execute('INSERT OR IGNORE INTO documents VALUES(?,?,?)',(did,url,kind))
         published=None
         if row.get('published_at'):
@@ -117,6 +200,17 @@ class KnowledgeStore:
         c.execute('UPDATE versions SET last_seen_at=CASE WHEN instant_us(last_seen_at)<instant_us(?) THEN ? ELSE last_seen_at END WHERE version_id=?',(seen,seen,vid))
         if not c.execute('SELECT 1 FROM news_fts WHERE version_id=?',(vid,)).fetchone():
             c.execute('INSERT INTO news_fts VALUES(?,?,?)',(vid,row.get('title') or url,row.get('text') or ''))
+
+    @staticmethod
+    def _news_identity(row,kind):
+        url=canonical_url(row.get('url') or row['source']['url'])
+        did=hashlib.sha256((kind+'|'+url).encode()).hexdigest()[:24]
+        content=dumps({k:row.get(k) for k in ('title','text','published_at')},sort_keys=True)
+        return url,did,hashlib.sha256((did+content).encode()).hexdigest()[:24]
+
+    def observe_feed_item(self,row):
+        """Keep the first receipt for identical publisher text and track resightings."""
+        return self.register(row,deduplicate_feed=True)
 
     def get(self,rid):
         with self.connect() as c:r=c.execute('SELECT * FROM evidence WHERE record_id=?',(rid,)).fetchone()
@@ -173,6 +267,21 @@ class KnowledgeStore:
                 return self.get(row['record_id'])
         return None
 
+    def market_captures(self, dataset_id, *, as_of, limit):
+        """Read immutable captures by actual observation and acquisition clocks."""
+        with self.connect() as c:
+            rows = c.execute("""
+                SELECT record_id FROM evidence
+                WHERE kind='data' AND json_extract(body,'$.dataset_id')=?
+                  AND instant_us(first_seen_at)<=instant_us(?)
+                  AND instant_us(json_extract(body,'$.observed_at'))<=instant_us(?)
+                  AND instant_us(json_extract(body,'$.available_at'))<=instant_us(?)
+                ORDER BY instant_us(json_extract(body,'$.observed_at')) DESC,
+                         instant_us(first_seen_at) DESC, record_id
+                LIMIT ?
+            """, (dataset_id, as_of, as_of, as_of, limit)).fetchall()
+        return self.get_many([row['record_id'] for row in rows])
+
     def verify_local(self,row):
         with self.connect() as c:r=c.execute('SELECT digest FROM evidence WHERE record_id=?',(row['record_id'],)).fetchone()
         if r and hashlib.sha256(dumps(row,sort_keys=True).encode()).hexdigest()!=r['digest']:
@@ -181,21 +290,27 @@ class KnowledgeStore:
     def search_news(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False):
         return self._news_candidates(query,asset,cutoff,limit,original_only,material_only)
 
-    def _news_candidates(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False,ceiling=30,availability_mode='strict'):
+    def _news_candidates(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False,ceiling=30,availability_mode='strict',start=None,end=None,diversify=False,acquisition_cutoff=None):
         if asset not in ('ETH','BTC','ALL'):raise ValueError('Supported assets are ETH, BTC, ALL')
         if not 1<=limit<=ceiling:raise ValueError('Limit must be 1..'+str(ceiling))
         if availability_mode not in ('observed','strict'):raise ValueError('Unknown memory availability mode')
         cutoff=iso(timestamp(cutoff or utcnow()))
         known_by=cutoff if availability_mode=='strict' else utcnow()
+        if acquisition_cutoff:known_by=iso(min(timestamp(known_by),timestamp(acquisition_cutoff)))
         terms=re.findall(r'[\w]+',query,flags=re.UNICODE)[:20]
         match=' OR '.join('"'+t.replace('"','""')+'"' for t in terms)
-        params=[];where=['instant_us(v.first_seen_at)<=instant_us(?)','(v.published_at IS NULL OR instant_us(v.published_at)<=instant_us(?))'];params.extend([known_by,cutoff])
+        params=[];where=['instant_us(v.first_seen_at)<=instant_us(?)','(v.published_at IS NULL OR instant_us(v.published_at)<=instant_us(?))',
+            'capture_us(e.body)<=instant_us(?)'];params.extend([known_by,cutoff,known_by])
+        if start:
+            where.append('instant_us(v.published_at)>=instant_us(?)');params.append(start)
+        if end:
+            where.append('instant_us(v.published_at)<instant_us(?)');params.append(end)
         if asset!='ALL':where.append('v.assets LIKE ?');params.append('%"'+asset+'"%')
         if original_only:where.append("d.kind='page'")
         if material_only:where.append("d.kind IN ('page','feed_item')")
         # Select the newest eligible version per URL/source kind, not its future revision.
-        where.append('NOT EXISTS (SELECT 1 FROM versions later WHERE later.doc_id=v.doc_id AND (instant_us(later.first_seen_at)>instant_us(v.first_seen_at) OR (instant_us(later.first_seen_at)=instant_us(v.first_seen_at) AND later.rowid>v.rowid)) AND instant_us(later.first_seen_at)<=instant_us(?) AND (later.published_at IS NULL OR instant_us(later.published_at)<=instant_us(?)))');params.extend([known_by,cutoff])
-        sql='SELECT v.*,d.url,d.kind FROM versions v JOIN documents d ON d.doc_id=v.doc_id WHERE '+ ' AND '.join(where)+' ORDER BY instant_us(coalesce(v.published_at,v.first_seen_at)) DESC,v.version_id'
+        where.append('NOT EXISTS (SELECT 1 FROM versions later JOIN evidence le ON le.record_id=later.record_id WHERE later.doc_id=v.doc_id AND (instant_us(later.first_seen_at)>instant_us(v.first_seen_at) OR (instant_us(later.first_seen_at)=instant_us(v.first_seen_at) AND later.rowid>v.rowid)) AND instant_us(later.first_seen_at)<=instant_us(?) AND (later.published_at IS NULL OR instant_us(later.published_at)<=instant_us(?)) AND capture_us(le.body)<=instant_us(?))');params.extend([known_by,cutoff,known_by])
+        sql='SELECT v.*,d.url,d.kind FROM versions v JOIN documents d ON d.doc_id=v.doc_id JOIN evidence e ON e.record_id=v.record_id WHERE '+ ' AND '.join(where)+' ORDER BY instant_us(coalesce(v.published_at,v.first_seen_at)) DESC,v.version_id'
         with self.connect() as c:rows=list(c.execute(sql,params).fetchall())
         if match and rows:
             # Rank BEFORE the candidate cap, using only eligible latest versions.
@@ -207,11 +322,14 @@ class KnowledgeStore:
                 scores=dict(ranking.execute('SELECT record_id,bm25(eligible,0,4,1) FROM eligible WHERE eligible MATCH ?',(match,)))
             rows=[r for r in rows if r['record_id'] in scores]
             rows.sort(key=lambda r:scores[r['record_id']])
-        rows=rows[:limit]
-        return [{'record_id':r['record_id'],'version_id':r['version_id'],'title':r['title'],'url':r['url'],
+        results=[{'record_id':r['record_id'],'version_id':r['version_id'],'title':r['title'],'url':r['url'],
                  'excerpt':r['text'][:1800],'published_at':r['published_at'],'first_seen_at':r['first_seen_at'],
                  'last_seen_at':r['last_seen_at'],'source_kind':r['kind'],'assets':json.loads(r['assets']),
                  'publication_time_verified':False} for r in rows]
+        selected=_diverse_news(results,limit) if diversify else results[:limit]
+        originals={r['record_id']:r for r in rows}
+        for row in selected:row['source_content_sha256']=source_content_fingerprint(dict(originals[row['record_id']]))
+        return selected
 
     def event_history(self,asset='ETH',cutoff=None,limit=120):
         if asset not in ('ETH','BTC','ALL'):raise ValueError('Supported assets are ETH, BTC, ALL')
@@ -245,27 +363,67 @@ class KnowledgeStore:
         return [json.loads(row['body']) for row in rows]
 
     def candidate_news(self,query='',asset='ETH',cutoff=None,original_only=False,
-                       material_only=False,include_updates=True,mode='strict'):
+                       material_only=False,include_updates=True,mode='strict',start=None,end=None,acquisition_cutoff=None):
         """Bounded recall with explicit update dependencies, before context selection."""
         if mode not in ('observed','strict'):raise ValueError('Unknown memory availability mode')
         cutoff=iso(timestamp(cutoff or utcnow()))
+        if start and timestamp(start)>=timestamp(end or cutoff):
+            raise ValueError('News start must precede the exclusive end')
+        if end and timestamp(end)>timestamp(cutoff):
+            raise ValueError('News end cannot exceed the research cutoff')
         candidates=self._news_candidates(query,asset,cutoff,limit=60,
                                          original_only=original_only,material_only=material_only,
-                                         ceiling=120,availability_mode=mode)
+                                         ceiling=120,availability_mode=mode,start=start,end=end,acquisition_cutoff=acquisition_cutoff)
+        # A scoped weekly/monthly study must not silently equate a narrow lexical
+        # query with coverage of its entire window. Keep independent breadth
+        # candidates alongside lexical matches, under the same eligibility rules.
+        window_breadth=bool(start and end)
+        broad=self._news_candidates('',asset,cutoff,limit=60,original_only=original_only,
+            material_only=material_only,ceiling=120,availability_mode=mode,start=start,end=end,
+            diversify=True,acquisition_cutoff=acquisition_cutoff) if window_breadth else []
+        breadth_truncated=len(broad)>=60
         library=getattr(self,'library',None)
+        library_known_by=min((cutoff,acquisition_cutoff),key=timestamp) if mode=='strict' and acquisition_cutoff else cutoff if mode=='strict' else acquisition_cutoff
+        library_mode='strict' if library_known_by else mode
         if library:
-            start=library.window_start;end=library.window_end
-            if timestamp(cutoff)>timestamp(start):
+            library_start=max(timestamp(start or library.window_start),timestamp(library.window_start))
+            library_end=min(timestamp(end or cutoff),timestamp(cutoff),timestamp(library.window_end))
+            if library_start<library_end:
                 monthly=library.search_documents(query,asset=None if asset=='ALL' else asset,
-                    start=start,end=min(timestamp(cutoff),timestamp(end)),
-                    mode=mode,known_by=cutoff if mode=='strict' else None,limit=60)['results']
+                    start=library_start,end=library_end,
+                    mode=library_mode,known_by=library_known_by,limit=60)['results']
                 if original_only:monthly=[row for row in monthly if row['record_id'].startswith('page-')]
+                if material_only:monthly=[row for row in monthly if row.get('source_kind')!='search_excerpt']
                 existing={r['record_id'] for r in candidates}
                 candidates.extend(r for r in monthly if r['record_id'] not in existing)
+                if window_breadth:
+                    # Up to eight disjoint time strata prevent a busy final day
+                    # from displacing the start of a month before reranking.
+                    strata=min(8,max(1,(library_end-library_start).days+1))
+                    span=library_end-library_start
+                    for index in range(strata):
+                        packet=library.search_documents('',asset=None if asset=='ALL' else asset,
+                            start=library_start+span*index/strata,end=library_start+span*(index+1)/strata,
+                            mode=library_mode,known_by=library_known_by,limit=8)
+                        extra=packet['results']
+                        if original_only:extra=[row for row in extra if row['record_id'].startswith('page-')]
+                        if material_only:extra=[row for row in extra if row.get('source_kind')!='search_excerpt']
+                        broad.extend(extra)
+                        breadth_truncated=breadth_truncated or bool(packet.get('next_offset'))
+        raw_count=len({row['record_id'] for row in [*candidates,*broad]})
+        if window_breadth:
+            diverse=_diverse_news(list({row['record_id']:row for row in broad}.values()),60)
+            mixed=[];seen=set()
+            for index in range(max(len(candidates),len(diverse))):
+                for group in (candidates,diverse):
+                    if index<len(group) and group[index]['record_id'] not in seen:
+                        mixed.append(group[index]);seen.add(group[index]['record_id'])
+            candidates=mixed[:120]
         by_id={row['record_id']:row for row in candidates}
         dependencies={}
         if include_updates:
             update_cutoff=cutoff if mode=='strict' else utcnow()
+            if acquisition_cutoff:update_cutoff=iso(min(timestamp(update_cutoff),timestamp(acquisition_cutoff)))
             for latest in self._related_updates(list(by_id),asset,update_cutoff):
                 latest_ids=latest.get('evidence_ids',[])
                 with self.connect() as c:
@@ -287,28 +445,36 @@ class KnowledgeStore:
                     by_id[rid]={'record_id':rid,'title':record.get('title') or record.get('url') or rid,
                                 'url':record.get('url') or record.get('source',{}).get('url'),
                                 'excerpt':(record.get('text') or '')[:1800],
+                                'source_content_sha256':source_content_fingerprint(record),
                                 'published_at':record.get('published_at'),'first_seen_at':known,
+                                'related_update_context':True,
                                 'source_kind':'page' if rid.startswith('page-') else 'search_excerpt',
                                 'publication_time_verified':False}
         for row in by_id.values():
             if row.get('url'):row['origin_key']=canonical_url(row['url'])
+        truncated=(raw_count>120 or breadth_truncated) if window_breadth else len(candidates)>=(120 if library else 60)
         return {'candidates':list(by_id.values()),'dependencies':dependencies,
-                'candidate_pool_limit':120 if library else 60,
-                'candidate_pool_at_limit':len(candidates)>=(120 if library else 60),
+                'candidate_pool_limit':120 if library or window_breadth else 60,
+                'candidate_pool_at_limit':truncated,
                 'expanded_pool_limit':120,'as_of':cutoff,'mode':mode,
-                'retrieval':'BM25 over source/time-filtered latest versions; eligibility before ranking statistics'}
+                'coverage':news_coverage(list(by_id.values()),start=start,end=end,pool_truncated=truncated),
+                'breadth_recall':{'enabled':window_breadth,'bounded_unique_candidates_seen':raw_count,
+                    'scope':'Explicit-window lexical candidates interleaved with date/source breadth; candidates are navigation, not assessed relevance or complete news coverage.'},
+                'retrieval':'BM25 over source/time-filtered latest versions; eligibility before ranking statistics; explicit windows also include bounded date/source breadth'}
 
     def select_news(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,
-                    budget=2400,policy=None,include_updates=True,*,material_only=False,mode='strict'):
+                    budget=2400,policy=None,include_updates=True,*,material_only=False,mode='strict',start=None,end=None):
         from .memory_selection import select_evidence
         policy=policy or ('relevance' if query.strip() else 'coverage')
         pool=self.candidate_news(query,asset,cutoff,original_only=original_only,
-            material_only=material_only,include_updates=include_updates,mode=mode)
+            material_only=material_only,include_updates=include_updates,mode=mode,start=start,end=end)
         cutoff=pool['as_of']
         candidates=pool['candidates'];dependencies=pool['dependencies']
         result=select_evidence(candidates,query,budget=budget,limit=limit,
                                policy=policy,as_of=cutoff if mode=='strict' else None,dependencies=dependencies)
         result['selection'].update({k:pool[k] for k in ('candidate_pool_limit','candidate_pool_at_limit','expanded_pool_limit','retrieval')})
+        result['coverage']={'candidates':pool['coverage'],
+            'selected':news_coverage(result['results'],start=start,end=end)}
         result.update(as_of=cutoff,mode=mode,scope='Locally captured evidence; observed mode permits retrospective acquired material and strict mode requires acquisition by cutoff. Correction links follow explicit reviewed event revisions. No proof of historical public availability or publisher truth.')
         return result
 
@@ -372,9 +538,9 @@ class KnowledgeStore:
             body=json.loads(r['body']);draft=body.get('report',{})
             receipt=self._output_receipt(r['report_id'],body)
             if mode=='strict' and (not receipt or timestamp(receipt['known_at'])>before):continue
-            if terms and not any(t in dumps(draft).lower() for t in terms):continue
-            row={'report_id':r['report_id'],'session_id':r['session_id'],'title':draft.get('title'),
-                'summary':draft.get('summary'),'created_at':r['created_at'],'review_status':body.get('review',{}).get('status'),
+            if terms and not any(t in (dumps(draft)+' '+str(body.get('initial_report_label',''))).lower() for t in terms):continue
+            row={'report_id':r['report_id'],'session_id':r['session_id'],'title':body.get('initial_report_label') or draft.get('title'),
+                'summary':draft.get('summary'),'created_at':r['created_at'],'review_status':body.get('review',{}).get('status'),'delivery_kind':draft.get('delivery_kind','full'),
                 'acquired_at':receipt['known_at'] if receipt else None,'availability_mode':mode,
                 'scope':'Earlier saved AI research, not a new factual source or current personal context; inspect original evidence and review notices.'}
             result.append(self._research_notice(row,body,cutoff))

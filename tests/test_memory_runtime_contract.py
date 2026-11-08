@@ -108,7 +108,8 @@ class MemoryRuntimeContractTests(unittest.TestCase):
         service = self.service(memory=False)
         packet = service.news_pack(query='Ethereum', cutoff=self.cutoff, material_only=True)
         self.assertEqual(packet['mode'], 'observed')
-        self.assertEqual([r['record_id'] for r in packet['results']], [row['record_id']])
+        self.assertEqual(packet['results'], [])
+        self.assertEqual(packet['selection']['time_policy']['acquisition_cutoff_source'], 'explicit_as_of')
         service.mode = 'strict'
         packet = service.news_pack(query='Ethereum', cutoff='2027-01-01T00:00:00Z', material_only=True)
         self.assertEqual(packet['as_of'], self.cutoff)
@@ -161,11 +162,12 @@ class MemoryRuntimeContractTests(unittest.TestCase):
                 backend=backend, middleware=[summary], checkpointer=SqliteSaver(connection))
         summaries = [m for m in create.call_args.kwargs['middleware'] if m.name == summary.name]
         self.assertEqual(summaries, [summary])
-        messages = [HumanMessage(content=f'MARKER-{i} '+('synthetic evidence text '*50)) for i in range(25)]
+        messages = [HumanMessage(content=f'MARKER-{i} '+('synthetic evidence text '*350)) for i in range(25)]
         config = {'configurable': {'thread_id': 'synthetic-summary-contract'}}
         result = graph.invoke({'messages': messages}, config=config)
         self.assertEqual(len(model.calls), 2)  # one summary and one ordinary model
         self.assertIn('Extract a compact working-memory summary', str(model.calls[0]))
+        self.assertIn('MARKER-0 ',str(model.calls[0]))  # all selected old history, not only its last 8K
         self.assertNotIn('{messages}', str(model.calls[0]))
         self.assertNotIn('MARKER-0 ', str(model.calls[-1]))
         state = graph.get_state(config)
@@ -175,7 +177,7 @@ class MemoryRuntimeContractTests(unittest.TestCase):
         histories = list((self.root/'conversation_history').glob('*.md'))
         self.assertEqual(len(histories), 1)
         self.assertIn('MARKER-0 ', histories[0].read_text())
-        self.assertEqual([kind for kind, _ in events], ['context_summary_started', 'context_summary_finished'])
+        self.assertEqual([kind for kind, _ in events], ['context_policy_configured','context_summary_started', 'context_summary_finished'])
         self.assertEqual(events[-1][1]['usage']['total_tokens'], 20)
         self.assertEqual(events[-1][1]['actual_model'], 'synthetic-contract')
         # Rebuild the graph/model/saver as after a host restart; do not rely on

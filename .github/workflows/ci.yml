@@ -1,9 +1,9 @@
-name: Offline verification
+name: Product verification
 on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  test:
+  offline:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -23,8 +23,4 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node --check src/research_agent/web/dashboard.js
-      - run: node --check src/research_agent/web/investment.js
-      - run: node --check src/research_agent/web/desk.js
-      - run: node --check src/research_agent/web/research-lab.js
-      - run: python scripts/dev/export_source.py
+      - run: for file in src/research_agent/web/*.js; do node --check "$file"; done

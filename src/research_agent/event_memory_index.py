@@ -65,7 +65,7 @@ def _source_snapshot(row):
     text = row.get('text') or row.get('excerpt')
     if not isinstance(text, str) or not text.strip() or len(text) > 5_000_000:
         raise ValueError('Event memory needs bounded saved original text')
-    known = [row.get(k) for k in ('available_at', 'first_seen_at', 'retrieved_at')]
+    known = [row.get(k) for k in ('available_at', 'first_seen_at', 'retrieved_at', 'acquired_at')]
     known.append((row.get('source') or {}).get('retrieved_at'))
     known = [_time(v) for v in known if v]
     acquired = max(known, key=timestamp) if known else None
@@ -299,10 +299,11 @@ class EventMemoryIndex:
                 'projected_at':projected_at,'new_invalidations':created}
 
     @staticmethod
-    def _eligible(source, cutoff, mode):
+    def _eligible(source, cutoff, mode, acquisition_cutoff=None):
         before=timestamp(cutoff)
         if source.get('published_at') and timestamp(source['published_at'])>before:return False
         if mode=='strict' and (not source.get('acquired_at') or timestamp(source['acquired_at'])>before):return False
+        if acquisition_cutoff and (not source.get('acquired_at') or timestamp(source['acquired_at'])>timestamp(acquisition_cutoff)):return False
         return True
 
     def read_card(self, card_id, *, cutoff=None, mode='observed'):
@@ -348,16 +349,23 @@ class EventMemoryIndex:
                 'claimed_validity_at_cutoff':('outside_claimed_interval' if (card.get('valid_from') and timestamp(card['valid_from'])>timestamp(as_of)) or (card.get('valid_to') and timestamp(card['valid_to'])<=timestamp(as_of)) else 'within_claimed_interval') if card.get('valid_from') or card.get('valid_to') else 'unknown',
                 'event_time_relation':'future_claim_or_schedule_not_occurrence' if card.get('event_time') and timestamp(card['event_time'])>timestamp(as_of) else 'past_or_current_claim_not_occurrence' if card.get('event_time') else 'unknown'}
 
-    def eligible_sources(self, *, cutoff=None, mode='observed', asset='ALL', source_limit=10000):
+    def eligible_sources(self, *, cutoff=None, mode='observed', asset='ALL', source_limit=10000, start=None, end=None, acquisition_cutoff=None):
         """Independently enumerate the indexed corpus, not a keyword shortlist."""
         if mode not in ('observed','strict') or asset not in ('ETH','BTC','ALL') or not 1<=source_limit<=10000:
             raise ValueError('Invalid indexed-corpus query bounds')
         as_of=_time(cutoff or utcnow());rows=[];gaps=[]
+        lower=timestamp(start) if start else None
+        upper=timestamp(end) if end else None
         with self.connect() as db:stored=db.execute('SELECT * FROM sources ORDER BY record_id').fetchall()
         eligible=[];snapshots={}
         for record in stored:
             source=self._read(record)
-            if not self._eligible(source,as_of,mode):continue
+            if not self._eligible(source,as_of,mode,acquisition_cutoff):continue
+            if lower or upper:
+                published=source.get('published_at')
+                if not published:continue
+                clock=timestamp(published)
+                if (lower and clock<lower) or (upper and clock>=upper):continue
             assets=source.get('assets') or ([source['asset']] if source.get('asset') else [])
             if asset!='ALL' and asset not in assets:continue
             eligible.append(source['record_id'])

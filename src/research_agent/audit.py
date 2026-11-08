@@ -21,6 +21,8 @@ def sha(data):return hashlib.sha256(data).hexdigest()
 
 def report_evidence_ids(report):
     ids={i for c in [*report.get('observations',[]),*report.get('key_changes',[]),*report.get('interpretations',[])] for i in c['evidence_ids']}
+    ids.update(report.get('narrative_evidence_ids',[]))
+    ids.update(row['evidence_id'] for field in ('charts','documents') for row in report.get(field,[]))
     ids.update(i for f in report.get('forecasts',[]) for i in [*f.get('supporting_evidence_ids',[]),*f.get('counter_evidence_ids',[])])
     ids.update(advice_evidence_ids(report.get('advice')))
     ids.update(explanation_evidence_ids(report.get('explanations')))
@@ -94,6 +96,9 @@ class BundleBuilder:
             review=bundle.get('review',{})
             ids=report_evidence_ids(bundle['report'])
             ids.update(q['record_id'] for v in review.get('verdicts',[]) for q in v.get('quotes',[]))
+            if bundle.get('presentation') and review.get('review_id'):
+                reviewed=json.loads((workspace/'reviews'/(review['review_id']+'.json')).read_text())
+                ids.update(rid for target in reviewed['targets'] for rid in target['evidence_ids'])
             for rid in sorted(ids):add_record(rid)
             if review.get('review_id'):add_file('review/'+review['review_id']+'.json',workspace/'reviews'/(review['review_id']+'.json'),'evidence_review')
             add_bytes('config.json',config_bytes,'configuration')

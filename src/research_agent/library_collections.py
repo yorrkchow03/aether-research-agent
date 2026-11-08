@@ -36,6 +36,7 @@ def save_collection(workspace, packet, cutoff, mode, *, offset=0):
             scope='Exact saved source-preserving query page. Underlying raw records remain individually verifiable; not a prediction or complete-coverage assertion.')
         atomic(path,row)
     return {'collection_record_id':rid,'data_file':'/data/collections/'+path.name,
+            'terminal_data_file':'./data/collections/'+path.name,
             'collection_sha256':sha,'page_observations':len(rows),'query_result_fully_materialized':query['query_result_fully_materialized']}
 
 

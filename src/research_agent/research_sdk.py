@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import socket
+from pathlib import Path
 
 
 # Names here are Python/CLI operations, not schemas registered with the LLM.
@@ -20,6 +21,8 @@ SDK_OPERATIONS = {
     'library-evidence':'library_evidence',
     'sources': 'list_data_sources',
     'fetch': 'get_live_data',
+    'local-market': 'local_market',
+    'collection-status': 'collection_status',
     'public-api': 'request_public_api',
     'archive-market': 'get_historical_market_data',
     'archive-chain': 'get_chain_data',
@@ -68,6 +71,34 @@ class ResearchClient:
 
     def fetch(self, metric: str, asset: str = 'ETH'):
         return self.call('fetch', metric=metric, asset=asset)
+
+    def read_json(self, artifact, *, max_bytes=64*1024*1024):
+        """Read a returned task artifact locally; no API request or value coercion.
+
+        Accept the SDK packet or a virtual/relative/workspace-absolute filename.
+        Financial decimal strings remain strings: parse chosen values with
+        Decimal before arithmetic. This helper never reads outside the job root.
+        """
+        root=os.environ.get('RESEARCH_WORKSPACE')
+        if not root:raise ValueError('RESEARCH_WORKSPACE is required for local artifacts')
+        root=Path(root).resolve()
+        if isinstance(artifact,dict):
+            artifact=(artifact.get('terminal_data_file') or artifact.get('data_file') or artifact.get('path')
+                or (artifact.get('series_file') or {}).get('path'))
+        if not isinstance(artifact,(str,Path)):raise ValueError('Supply an artifact packet or file path')
+        value=str(artifact);path=Path(value)
+        if path.is_absolute() and path.parts[1:2] in [('data',),('notes',),('reports',),('memory',)]:
+            path=root/value.lstrip('/')
+        elif not path.is_absolute():path=root/path
+        path=path.resolve()
+        if not path.is_relative_to(root):raise ValueError('Artifact path escapes the current task workspace')
+        if not isinstance(max_bytes,int) or isinstance(max_bytes,bool) or not 1024<=max_bytes<=512*1024*1024:
+            raise ValueError('Use an explicit local JSON size bound between 1 KiB and 512 MiB')
+        if path.stat().st_size>max_bytes:raise ValueError('Artifact exceeds local JSON size bound; select a smaller query/page')
+        return json.loads(path.read_text())
+
+    def local_market(self, metric: str, asset: str = 'ETH', **filters):
+        return self.call('local-market', metric=metric, asset=asset, **filters)
 
     def archive_market(self, asset: str = 'ETH', days: int = 30):
         return self.call('archive-market', asset=asset, days=days)

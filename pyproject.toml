@@ -17,10 +17,11 @@ dependencies = [
     "numpy==2.5.4",
     "scikit-learn==1.9.1",
     "pypdf==6.21.2",
+    "reportlab==4.4.9",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-research_agent = ["web/*.html", "web/*.css", "web/*.js", "skills/*/SKILL.md", "skills/*/references/*.md", "skills/*/scripts/*.py"]
+research_agent = ["web/*.html", "web/*.css", "web/*.js", "fonts/*.ttf", "fonts/*.txt", "fonts/*.md", "skills/*/SKILL.md", "skills/*/references/*.md", "skills/*/scripts/*.py"]

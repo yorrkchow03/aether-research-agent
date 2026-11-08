@@ -106,7 +106,7 @@ class ProductTests(unittest.TestCase):
   from types import SimpleNamespace
   def failed_export(*args):raise ValueError('fixture exporter unavailable')
   service=ResearchTools(Path(meta['data_run']),w,meta['cutoff'],allow_live=True,live_data=self.live,audit_builder=SimpleNamespace(build=failed_export))
-  rid='live-'+'d'*24;atomic(w/'data/live'/(rid+'.json'),{'record_id':rid,'values':{'price_usd':'42'},'units':{'price_usd':'USD'},'observed_at':meta['cutoff']})
+  rid='live-'+'d'*24;atomic(w/'data/live'/(rid+'.json'),{'record_id':rid,'values':{'price_usd':'42'},'units':{'price_usd':'USD'},'observed_at':meta['cutoff'],'retrieved_at':meta['cutoff']})
   draft={'title':'fixture','summary':'Price42','observations':[{'statement':'Saved price42','evidence_ids':[rid],'metric':'price_usd','value':'42','unit':'USD'}],'judgment':'insufficient_evidence','judgment_reason':'fixture','limitations':['fixture']}
   with self.assertRaises(ValueError):service.publish(draft)
   self.assertFalse(list((w/'reports').glob('research-*.json')));self.assertFalse(service.published_reports)

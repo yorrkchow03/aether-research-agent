@@ -14,7 +14,7 @@ from research_agent.knowledge import KnowledgeStore
 from research_agent.experience_memory import ExperienceMemory
 from research_agent.report_feedback import ReportFeedbackStore
 from research_agent.reports import ReportDraft
-from research_agent.review import check_review, evidence_text, review_targets
+from research_agent.review import REVIEW_VERSION,check_review, evidence_text, review_targets
 
 
 class FeedbackTests(unittest.TestCase):
@@ -52,10 +52,13 @@ class FeedbackTests(unittest.TestCase):
             limitations=['Public information may be incomplete.'])
         targets = review_targets(draft)
         response = {'verdicts': [{'claim_id': target['claim_id'], 'status': 'supported',
+            'scope_alignment':'aligned','premise_assessment':'supported' if target.get('premise_check_required') else None,
             'reason': 'The saved announcement supplies this statement.',
             'quotes': [{'record_id': evidence_ids[0], 'text': text}]} for target in targets]}
         review = check_review(response, targets, {rid: evidence_text(self.records[rid]) for rid in evidence_ids})
-        review.update(reviewed_at='2026-01-01T00:10:00Z', reviewer_model='fixture-only')
+        # Frozen pre-critic receipts remain valid; these fixtures do not pretend
+        # their synthetic positive outcomes include a new scope-critic pass.
+        review.update(review_version='support-v11-exact-summary-spans',reviewed_at='2026-01-01T00:10:00Z', reviewer_model='fixture-only')
         if not reviewed:
             review['status'] = 'needs_revision'
         body = {'report': draft.model_dump(), 'created_at': '2026-01-01T01:00:00Z', 'review': review,
@@ -86,6 +89,17 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(len(item['target_sha256']), 64)
         self.assertEqual(self.knowledge.report('report-original'), self.original)
         self.assertEqual(item['reviews'], [])
+
+    def test_unversioned_legacy_report_accepts_feedback_without_certification(self):
+        from research_agent.review import check_saved_scope_critic
+        legacy=copy.deepcopy(self.original)
+        legacy['review'].pop('review_version')
+        self.knowledge.retain_report('report-unversioned','fixture',legacy)
+        feedback=self.store.submit('report-unversioned','The historical claim needs checking.',claim_id='O1')
+        self.assertEqual(feedback['status'],'unverified')
+        self.assertEqual(self.knowledge.report('report-unversioned'),legacy)
+        with self.assertRaisesRegex(ValueError,'review_version'):
+            check_saved_scope_critic(legacy['review'])
 
     def test_bad_reports_targets_categories_and_empty_comments_are_rejected(self):
         for values in ({'report_id': 'missing'}, {'report_id': '../report-original'},
@@ -222,7 +236,7 @@ class FeedbackTests(unittest.TestCase):
                 target['evidence_ids'] = [*target['evidence_ids'], 'context-user']
         reviewed = copy.deepcopy(self.replacement['review'])
         reviewed['targets'] = targets
-        reviewed['evidence_text'] = {rid: evidence_text(self.records[rid]) for rid in ('page-correction', 'context-user')}
+        reviewed['evidence_text'] = {rid: evidence_text(self.records[rid],review_version=reviewed['review_version']) for rid in ('page-correction', 'context-user')}
         for verdict in reviewed['verdicts']:
             if verdict['claim_id'] == 'S1':
                 verdict['quotes'].append({'record_id': 'context-user', 'text': 'Fixture user research parameters.'})
@@ -233,6 +247,47 @@ class FeedbackTests(unittest.TestCase):
             item = self.store.submit('report-original', 'Check task context for ' + report_id)
             self.review(item)
             self.assertEqual(self.store.resolve(item['feedback_id'], report_id)['status'], 'resolved')
+
+    def test_new_critic_receipt_resolves_long_source_after_host_limit_append(self):
+        from types import SimpleNamespace
+        from research_agent.review import EvidenceReviewer
+        from research_agent.settings import Settings
+        source='page-correction';fact=self.records[source]['text']
+        self.records[source]['text']='Opening scope.\n'+('Unrelated context. '*2400)+'\n'+fact+'\n'+('Closing context. '*900)
+        draft=ReportDraft.model_validate(self.replacement['report']);requests=[]
+        class Transport:
+            http_client=SimpleNamespace(close=lambda:None)
+            def invoke(inner,messages,**options):
+                payload=json.loads(messages[1].content);requests.append(payload)
+                if payload.get('stage')=='scope_critic':result={'findings':[]}
+                else:
+                    qid=next(q for q,text in payload['quote_index']['R1'].items() if fact in text)
+                    result={'verdicts':[{'claim_id':t['claim_id'],'status':'supported','scope_alignment':'aligned',
+                        'premise_assessment':'supported' if t.get('premise_check_required') else None,
+                        'reason':'Synthetic receipt replay only.','quotes':[{'source_id':'R1','excerpt_id':qid}]} for t in payload['targets']]}
+                if payload.get('stage')=='full_review':result['critic_assessments']=[]
+                return SimpleNamespace(content=json.dumps(result),response_metadata={},usage_metadata={})
+        with patch('research_agent.review.create_ark_model',return_value=Transport()),patch('research_agent.review.utcnow',return_value='2026-01-01T00:10:00Z'):
+            reviewed=EvidenceReviewer(Settings()).review(draft,self.records.__getitem__)
+        self.assertEqual(reviewed['status'],'reviewed');self.assertEqual(len(requests),2)
+        self.assertTrue(json.loads(reviewed['evidence_text'][source])['text_context']['source_text_truncated'])
+        draft.limitations.append('Host-added observation-time availability notice.')
+        # New receipts certify all delivered prose; an appended unreviewed
+        # limitation must fail before exercising the historical prefix rule.
+        from research_agent.review import check_saved_scope_critic
+        self.assertTrue(reviewed['final_prose_bound'])
+        with self.assertRaisesRegex(ValueError,'Final delivered prose differs'):
+            check_saved_scope_critic(reviewed,draft)
+        reviewed.pop('final_prose_bound')  # Explicit pre-disclosure-binding v14 fixture.
+        for exported in (False,True):
+            record=copy.deepcopy(reviewed)
+            if exported:record.pop('targets');record.pop('evidence_text')
+            report_id='report-long-export' if exported else 'report-long'
+            body={'report':draft.model_dump(),'created_at':'2026-01-01T01:00:00Z','review':record,'sources':[]}
+            self.knowledge.retain_report(report_id,'fixture',body)
+            item=self.store.submit('report-original','Check long context '+report_id)
+            self.review(item)
+            self.assertEqual(self.store.resolve(item['feedback_id'],report_id)['status'],'resolved')
 
     def test_saved_targets_cannot_change_claim_content_or_add_context_to_facts(self):
         self.records['context-user'] = {'record_id': 'context-user',

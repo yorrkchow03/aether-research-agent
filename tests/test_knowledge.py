@@ -43,6 +43,20 @@ class KnowledgeTests(unittest.TestCase):
         Path(saved['raw_path']).write_text('changed')
         with self.assertRaises(ValueError):self.store.get(row['record_id'])
 
+    def test_retrospective_latest_version_is_selected_by_independent_capture_cutoff(self):
+        a=self.page();b=self.page('b','2026-01-15T00:00:00Z','Ethereum upgrade was cancelled.')
+        for row in (a,b):self.store.register(row)
+        args={'query':'upgrade','asset':'ETH','cutoff':'2026-01-10T00:00:00Z','mode':'observed',
+            'start':'2026-01-01T00:00:00Z','end':'2026-01-02T00:00:00Z'}
+        early=self.store.candidate_news(**args,acquisition_cutoff='2026-01-11T00:00:00Z')
+        late=self.store.candidate_news(**args,acquisition_cutoff='2026-01-20T00:00:00Z')
+        self.assertEqual([r['record_id'] for r in early['candidates']],[a['record_id']])
+        self.assertEqual([r['record_id'] for r in late['candidates']],[b['record_id']])
+        c=self.page('c','2026-01-18T00:00:00Z','Ethereum upgrade revised again.')
+        c['available_at']='2026-01-25T00:00:00Z';self.store.register(c)
+        still_b=self.store.candidate_news(**args,acquisition_cutoff='2026-01-20T00:00:00Z')
+        self.assertEqual([r['record_id'] for r in still_b['candidates']],[b['record_id']])
+
     def test_other_session_can_read_source_after_original_file_is_removed(self):
         row=self.page();self.store.register(row);Path(row['raw_path']).unlink()
         run=fixture_run(self.root/'project')

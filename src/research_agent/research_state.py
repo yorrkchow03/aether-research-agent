@@ -10,10 +10,10 @@ import hashlib
 import json
 import re
 
-VERSION = 'working-research-state-v2'
+VERSION = 'working-research-state-v4'
 ID = re.compile(r'^(?:live|page|web|series|calc|context)-[a-f0-9]{12,64}$')
 SOURCE_KEYS = ('record_id', 'collection_record_id')
-PUBLICATION_TOOLS = frozenset({'publish_report', 'submit_research_answer'})
+PUBLICATION_TOOLS = frozenset({'publish_report', 'publish_saved_report', 'submit_research_answer'})
 REVIEW_TOOLS = frozenset({'review_report', 'review_answer'})
 SOURCE_TOOLS = frozenset({'read_evidence', 'register_calculation', 'request_public_api',
     'fetch_webpage', 'search_web', 'recall_memory', 'record_news_event'})
@@ -116,11 +116,21 @@ def derive_observation(tool_name, payload, *, status='success', artifact_id,
         'publications': []}
     failed = status == 'error' or obj.get('status') in ('error', 'failed', 'unavailable')
     if failed:
+        # Only an actual host publication/review tool may supply attributed
+        # review metadata with its failure. Source text and console envelopes
+        # cannot impersonate a review. Keep all individual issues below.
+        failed_review = (tool_name in PUBLICATION_TOOLS | REVIEW_TOOLS
+            and isinstance(obj.get('review'), dict))
+        failure_text = obj.get('error') or obj.get('reason') or (
+            'Source review needs revision; inspect its current per-target issues.' if failed_review else payload)
         result['unknowns'].append(_item('tool_failure', {
             'tool': tool_name, 'status': 'unresolved',
-            'error': _text(obj.get('error') or obj.get('reason') or payload, 1600),
+            'error': _text(failure_text,
+                240 if failed_review else 1600),
+            **({'review_id': _text(obj['review'].get('review_id'), 100)} if failed_review else {}),
             'meaning': 'Failure/unavailable data; not a zero value or disproved event.'}, artifact_id, observation_id))
-        return result
+        if not failed_review:
+            return result
     sdk_name = tool_name.removeprefix('sdk:') if tool_name.startswith('sdk:') else None
     source_role = tool_name in SOURCE_TOOLS or sdk_name in SOURCE_SDK
     if source_role:
@@ -190,12 +200,17 @@ def derive_observation(tool_name, payload, *, status='success', artifact_id,
                 'review_id': _text(review.get('review_id')),
                 'status': _text(review.get('status') or 'unknown'),
                 'scope': 'Attributed source-support review; not independent source truth.'}, artifact_id, observation_id))
+            host_issues=review.get('host_issues',[]) if isinstance(review.get('host_issues'),list) else []
+            host_blocked={row.get('claim_id') for row in host_issues if isinstance(row,dict)}
             verdicts = review.get('verdicts', [])
             for verdict in verdicts[:90] if isinstance(verdicts, list) else []:
                 if not isinstance(verdict, dict):
                     continue
                 check = {'claim_id': _text(verdict.get('claim_id'), 80),
+                    'review_id': _text(review.get('review_id'), 100),
+                    'review_family': 'answer' if tool_name in ('review_answer', 'submit_research_answer') else 'report',
                     'status': _text(verdict.get('status') or 'unknown', 80),
+                    'host_blocked':verdict.get('claim_id') in host_blocked,
                     'reason': _text(verdict.get('reason'), 1000),
                     'evidence_ids': _ids([q.get('record_id') for q in verdict.get('quotes', []) if isinstance(q, dict)]) if isinstance(verdict.get('quotes'), list) else [],
                     'scope': 'Attributed review target; no conversion to verified market fact.'}
@@ -205,9 +220,21 @@ def derive_observation(tool_name, payload, *, status='success', artifact_id,
                     result['unknowns'].append(_item('review_issue', {
                         **check, 'review_status': check['status'], 'status': 'unresolved',
                         'correction': _text(verdict.get('correction'), 1000)}, artifact_id, observation_id))
+            for issue in host_issues:
+                if not isinstance(issue,dict):continue
+                result['unknowns'].append(_item('review_issue',{
+                    'claim_id':_text(issue.get('claim_id'),80),
+                    'review_id':_text(review.get('review_id'),100),
+                    'review_family':'answer' if tool_name in ('review_answer','submit_research_answer') else 'report',
+                    'status':'unresolved','origin':'host_review_contract','issue_kind':_text(issue.get('issue_kind'),80),
+                    'reason':_text(issue.get('reason'),1000),'correction':_text(issue.get('correction'),1000),
+                    'claim_path':_text(issue.get('claim_path'),180),
+                    'evidence_ids':_ids(issue.get('missing_evidence_ids',[])),
+                    'scope':'Host citation/scope-contract issue; original model verdict remains attributed, not verified fact.'},artifact_id,observation_id))
         if tool_name in PUBLICATION_TOOLS and obj.get('status') == 'saved':
             path = obj.get('report_path') or obj.get('answer_path')
             result['publications'].append(_item('saved_publication', {
+                'publication_family': 'answer' if tool_name == 'submit_research_answer' else 'report',
                 'path': _text(path, 800), 'status': 'saved',
                 'source_review_status': review.get('status', 'not_supplied'),
                 'scope': 'Saved publication receipt; not proof that every claim is true.'}, artifact_id, observation_id))
@@ -232,6 +259,43 @@ def merge_observation(state, changes, observation):
         for row in changes[key]:
             if row['entry_id'] not in seen:
                 current[key].append(row);seen.add(row['entry_id'])
+    # Keep every attributed verdict, but present only the latest issue for a
+    # target. A repeated negative review replaces its older negative issue;
+    # it does not multiply the current correction queue on every attempt.
+    revisited = {(row.get('review_family'), row.get('claim_id')): row
+        for row in [*changes['checks'], *changes['unknowns']]
+        if row.get('kind') in ('review_target', 'review_issue')}
+    new_issue_ids = {row['entry_id'] for row in changes['unknowns']}
+    latest_reviews = {row.get('review_family'): row for row in changes['checks']
+        if row.get('kind') == 'review_target' and row.get('review_id')}
+    accepted = {(row.get('review_family'), row.get('claim_id')): row
+        for row in changes['checks']
+        if row.get('kind') == 'review_target' and row.get('status') in ('supported', 'reasonable_inference', 'conditional') and not row.get('host_blocked')}
+    saved_families = {row.get('publication_family'): row for row in changes['publications']
+        if row.get('status') == 'saved'}
+    for issue in current['unknowns']:
+        if issue.get('status') != 'unresolved':
+            continue
+        later = accepted.get((issue.get('review_family'), issue.get('claim_id')))
+        if issue.get('kind') == 'review_issue' and later:
+            issue.update(status='superseded', superseded_by=later['entry_id'],
+                resolution_scope='Later attributed review accepts the current target; prior verdict preserved, not a truth certificate.')
+        elif (issue.get('kind') == 'review_issue' and issue['entry_id'] not in new_issue_ids
+                and (newer := revisited.get((issue.get('review_family'), issue.get('claim_id'))))
+                and newer.get('observation_id') != issue.get('observation_id')):
+            issue.update(status='superseded', superseded_by=newer['entry_id'],
+                resolution_scope='Later attributed review revisits this target; see its current issue. The earlier verdict remains in the audit trail.')
+        elif issue.get('kind') == 'tool_failure' and issue.get('tool') in PUBLICATION_TOOLS:
+            family = 'answer' if issue['tool'] == 'submit_research_answer' else 'report'
+            newer=latest_reviews.get(family)
+            if issue.get('review_id') and newer and issue['review_id'] != newer['review_id']:
+                issue.update(status='superseded',superseded_by=newer['entry_id'],
+                    resolution_scope='A newer attributed review replaces this failed review attempt; its current target issues remain unresolved.')
+                continue
+            if family not in saved_families:
+                continue
+            issue.update(status='superseded', superseded_by=saved_families[family]['entry_id'],
+                resolution_scope='A later publication succeeded in this task; prior failure preserved.')
     # Keep actual opened source metadata over a candidate preview. Conflicting
     # metadata remains traceable in its original observation/artifact history.
     rank = {'candidate': 0, 'opened': 1, 'registered_derived': 1}

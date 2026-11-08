@@ -3,9 +3,11 @@ import json
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from langchain_core.tools import tool
 
 from research_agent.bridge import write_reply
 from research_agent.reports import ReportDraft
@@ -82,6 +84,77 @@ class AgentTests(unittest.TestCase):
         job=self.wait_state("waiting_for_conversation")
         with self.assertRaises(ValueError):write_reply(Path(job["pending_request"]),{"tool_calls":[{"name":"execute","args":{}}]})
         self.runtime.stop(self.sid);self.wait_state("cancelled")
+
+    def test_browser_market_refresh_cannot_publish_but_chat_can(self):
+        app=create_app(self.runtime)
+        client=TestClient(app,base_url='http://127.0.0.1:8765')
+        headers={'X-Local-Token':app.state.csrf_token}
+        route=f'/api/sessions/{self.sid}/messages'
+        response=client.post(route,headers=headers,json={'prompt':'Refresh ETH','purpose':'market_refresh','deliverable':'report'})
+        self.assertEqual(response.status_code,400)
+        response=client.post(route,headers=headers,json={'prompt':'Refresh ETH','purpose':'market_refresh'})
+        self.assertEqual(response.status_code,200)
+        job=self.wait_state('waiting_for_conversation')
+        tools=json.loads(Path(job['pending_request']).read_text())['tools']
+        self.assertNotIn('publish_report',{tool['function']['name'] for tool in tools})
+        self.runtime.stop(self.sid)
+        self.wait_state('cancelled')
+
+        calc=self.tools.analyze("ETH",30)
+        draft={"title":"ETH weekly report","summary":"Fixture report","observations":[
+            {"statement":"Saved return","evidence_ids":[calc["record_id"]],"metric":"return_fraction",
+             "value":calc["values"]["return_fraction"],"unit":"fraction"}],
+            "judgment":"insufficient_evidence","judgment_reason":"Fixture","limitations":["Fixture"]}
+        request='生成这一周的报告'
+        response=client.post(route,headers=headers,json={'prompt':request})
+        self.assertEqual(response.status_code,200)
+        self.assertEqual(response.json()['deliverable'],'report')
+        self.reply(calls=[{'name':'publish_report','args':{'draft':draft,'user_request':'fabricated authorization'}}])
+        self.assertFalse(self.runtime.snapshot(self.sid)['reports'])
+        self.reply(calls=[{'name':'publish_report','args':{'draft':draft,'user_request':request}}])
+        # Successful publication completes in the host without another author turn.
+        self.assertEqual(len(self.wait_state('completed')['published_reports']),1)
+
+    def test_continue_preserves_the_original_report_request(self):
+        app=create_app(self.runtime)
+        client=TestClient(app,base_url='http://127.0.0.1:8765')
+        self.addCleanup(client.close)
+        headers={'X-Local-Token':app.state.csrf_token}
+        route=f'/api/sessions/{self.sid}'
+        request='Give me report about ETH in a recent week.'
+        with patch('research_agent.runtime.threading.Thread'):
+            first=client.post(route+'/messages',headers=headers,json={'prompt':request}).raise_for_status().json()
+            self.assertEqual(first['deliverable'],'report')
+            path=self.runtime._session_dir(self.sid)/'jobs'/first['job_id']/'status.json'
+            first.update(state='failed',error='Synthetic interruption')
+            path.write_text(json.dumps(first))
+            self.runtime.active.pop(self.sid)
+            resumed=client.post(route+'/jobs/'+first['job_id']+'/continue',headers=headers).raise_for_status().json()
+            self.assertEqual(resumed['prompt'],request)
+            self.assertEqual(resumed['deliverable'],'report')
+            self.assertEqual(resumed['continued_from_job_id'],first['job_id'])
+            self.assertEqual(client.post(route+'/jobs/'+first['job_id']+'/continue',headers=headers).status_code,400)
+
+    def test_report_task_excludes_the_chat_answer_submission_tool(self):
+        @tool
+        def submit_research_answer():
+            """Synthetic alternative output for the tool-selection regression."""
+            return 'Fixture answer'
+        build=self.runtime.build_research_tools
+        def with_answer_tool(*args,**kwargs):
+            service=build(*args,**kwargs)
+            original=service.as_tools
+            service.as_tools=lambda:[*original(),submit_research_answer]
+            return service
+        with patch.object(self.runtime,'build_research_tools',side_effect=with_answer_tool):
+            self.runtime.start(self.sid,'Generate an ETH report',request_purpose='chat')
+            job=self.wait_state('waiting_for_conversation')
+            packet=json.loads(Path(job['pending_request']).read_text())
+            names={t['function']['name'] for t in packet['tools']}
+            self.assertIn('publish_report',names)
+            self.assertNotIn('submit_research_answer',names)
+            self.runtime.stop(self.sid)
+            self.wait_state('cancelled')
 
     def test_report_numeric_and_unit_checks(self):
         calc=self.tools.analyze("ETH",30)

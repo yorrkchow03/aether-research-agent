@@ -4,14 +4,17 @@ import secrets
 import re
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path,PurePosixPath
+import stat
 from typing import Literal
 
-from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .bridge import ModelReply, write_reply
+from .chat_reply import research_job
+from .job_progress import research_progress
 from .runtime import AgentRuntime
 from .public_web import PageText
 from .simulation import DecisionProfile,compare_strategies,market_statistics,loss_scenarios
@@ -32,6 +35,9 @@ class SessionInput(BaseModel):
 class Question(BaseModel):
     prompt:str=Field(min_length=1,max_length=20000)
     deliverable:Literal['answer','report']='answer'
+    purpose:Literal['chat','market_refresh']='chat'
+    jev_assistance:bool|None=Field(default=None,strict=True)
+    report_review_provider:Literal['generation_model','jev']='generation_model'
 
 
 class SimulationRequest(BaseModel):
@@ -55,6 +61,34 @@ class ConcernReview(BaseModel):
 
 class ConcernResolution(BaseModel):
     replacement_report_id:str=Field(min_length=1,max_length=160)
+
+
+def workspace_file_bytes(workspace,path,*,maximum=64*1024*1024):
+    """Read a stable regular file without following user-made workspace links."""
+    relative=PurePosixPath(str(path).lstrip('/'))
+    if not relative.parts or any(part in ('.','..') for part in relative.parts):
+        raise ValueError('Select a regular file inside this workspace')
+    root=Path(workspace).resolve(strict=True)
+    directory=None
+    try:
+        flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+        directory=os.open('/',flags)
+        for part in (*root.parts[1:],*relative.parts[:-1]):
+            next_directory=os.open(part,flags,dir_fd=directory)
+            os.close(directory);directory=next_directory
+        descriptor=os.open(relative.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+        with os.fdopen(descriptor,'rb') as stream:
+            info=os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size>maximum:
+                raise ValueError('Saved file must be a bounded regular file')
+            body=stream.read(maximum+1)
+        if len(body)>maximum:raise ValueError('Saved file exceeds its size limit')
+        return body
+    except FileNotFoundError:raise
+    except OSError:
+        raise ValueError('Saved workspace files cannot follow symbolic links') from None
+    finally:
+        if directory is not None:os.close(directory)
 
 
 def create_app(runtime=None, port=8765):
@@ -109,7 +143,9 @@ def create_app(runtime=None, port=8765):
 
     @app.get("/assets/{name}")
     def assets(name:str):
-        if name not in ("dashboard.js","dashboard.css","investment.js","investment.css","desk.js","desk.css","research-lab.js"):raise FileNotFoundError()
+        if name not in ("dashboard.js","dashboard.css","investment.js","investment.css","desk.js","desk.css","research-lab.js","home-ui.js","library-ui.js",
+                        "portfolio-workspace.js","portfolio-workspace.css","strategy-workspace.js","strategy-workspace.css",
+                        "workspace-resources.js","workspace-resources.css"):raise FileNotFoundError()
         return FileResponse(Path(__file__).parent/"web"/name,media_type="text/javascript" if name.endswith("js") else "text/css")
 
     @app.get("/api/sessions")
@@ -162,12 +198,6 @@ def create_app(runtime=None, port=8765):
             'semantic_index':vectors,
             'encoder':getattr(runtime,'memory_index_status',{}),'startup_issues':getattr(runtime,'memory_startup_issues',[]),
             'scope':'Partial derived source index, not full corpus coverage. Model availability is not semantic accuracy.'}
-
-    @app.get('/api/semantic-validation')
-    def semantic_validation():
-        from .semantic_validation_view import load_semantic_validation
-        return load_semantic_validation(runtime.state_dir, mode=runtime.settings.judgment_mode,
-                                        provider=runtime.settings.judgment_provider)
 
     @app.get('/api/memory/cards')
     def memory_cards(query:str='',cutoff:str|None=None,mode:str='observed',limit:int=8):
@@ -244,6 +274,17 @@ def create_app(runtime=None, port=8765):
         if timestamp(before['created_at'])>timestamp(after['created_at']):raise ValueError('Select an earlier report as the comparison')
         return report_changes(before,after)
 
+    @app.get('/api/reports/{report_id}/pdf')
+    def export_report_pdf(report_id:str):
+        if not re.fullmatch(r'research-[a-f0-9]{12}',report_id):raise HTTPException(status_code=404)
+        try:packet=runtime.knowledge.report(report_id)
+        except ValueError:raise HTTPException(status_code=404,detail='Saved report unavailable') from None
+        from .report_pdf import render_report_pdf
+        pdf=render_report_pdf(packet,report_id,evidence_lookup=runtime.knowledge.get,
+                              notices=feedback.list_for_report(report_id))
+        return Response(pdf,media_type='application/pdf',
+                        headers={'Content-Disposition':f'attachment; filename="aether-{report_id}.pdf"'})
+
     @app.get('/api/reports/{report_id}/feedback')
     def report_feedback(report_id:str,cutoff:str|None=None):
         runtime.knowledge.report(report_id)
@@ -285,7 +326,7 @@ def create_app(runtime=None, port=8765):
             runtime.knowledge.register(runtime.live_data.lookup(rid));row=runtime.knowledge.get(rid)
         elif re.fullmatch(r'(calc|series|context)-[a-f0-9]{24}',rid):
             folder='calculations' if rid.startswith('calc-') else 'collections' if rid.startswith('series-') else 'context'
-            row=json.loads((directory/'workspace/data'/folder/(rid+'.json')).read_text());legacy=True
+            row=json.loads(workspace_file_bytes(directory/'workspace','data/'+folder+'/'+rid+'.json'));legacy=True
         else:
             from research_data.sdk import ResearchData
             meta=json.loads((directory/'session.json').read_text());sdk=ResearchData(Path(meta['data_run']),cutoff=meta['cutoff'],mode=meta['mode'])
@@ -378,12 +419,32 @@ def create_app(runtime=None, port=8765):
     def sources(sid:str):
         workspace=runtime._session_dir(sid)/"workspace"
         rows=[]
+        restricted=bool(getattr(runtime.settings,'restricted_execution_root',None))
         for pattern in ("data/web/web-*.json","data/live/*.json"):
             for path in workspace.glob(pattern):
-                row=json.loads(path.read_text());source=row.get("source",{})
+                rid=path.stem
+                if not re.fullmatch(r'(live|page|web)-[a-f0-9]{24}',rid):continue
+                # A workspace JSON/raw_path is writable model output, not a
+                # capability to read arbitrary host files. Remote source views
+                # only reopen a host-retained canonical receipt by identity.
+                if runtime.knowledge.contains(rid):row=runtime.knowledge.get(rid)
+                elif getattr(runtime,'library',None) and runtime.library.contains(rid):row=runtime.library.evidence(rid)
+                elif restricted:continue
+                else:row=json.loads(workspace_file_bytes(workspace,path.relative_to(workspace)))
+                source=row.get("source",{})
                 title=row.get("title") or source.get("name") or row["dataset_id"]
                 excerpt=(row.get("text") or row.get("method") or row.get("scope") or "")[:1000]
-                if row["record_id"].startswith("page-") and row.get("raw_path") and not row.get('text') and row.get('content_type')!='application/pdf':
+                # Legacy registration can retain a raw_path without a source
+                # hash. Only canonical raw storage is a remote read capability.
+                raw_ok=not restricted
+                digest=source.get('sha256');raw=Path(row['raw_path']).resolve() if row.get('raw_path') else None
+                if raw and isinstance(digest,str) and re.fullmatch(r'[a-f0-9]{64}',digest):
+                    allowed=[runtime.knowledge.root/'raw'/(digest+'.bin')]
+                    library=getattr(runtime,'library',None)
+                    for item in ([getattr(library,'primary',library),*getattr(library,'fallbacks',())] if library else []):
+                        allowed.append(item.root/'objects'/digest[:2]/(digest+'.bin'))
+                    raw_ok=raw_ok or raw in [path.resolve() for path in allowed]
+                if raw_ok and row["record_id"].startswith("page-") and raw and not row.get('text') and row.get('content_type')!='application/pdf':
                     parser=PageText();parser.feed(Path(row["raw_path"]).read_text(errors="replace"))
                     title=parser.title() or title;excerpt=parser.text()[:1000]
                 rows.append({"record_id":row["record_id"],"title":title,
@@ -395,7 +456,7 @@ def create_app(runtime=None, port=8765):
     @app.get("/api/sessions/{sid}/packages")
     def packages(sid:str):
         workspace=runtime._session_dir(sid)/'workspace'
-        return [json.loads(p.read_text()) for p in workspace.glob('reports/*.audit.json')]
+        return [json.loads(workspace_file_bytes(workspace,p.relative_to(workspace))) for p in workspace.glob('reports/*.audit.json')]
 
     def audit_path(package_id):
         if not re.fullmatch(r'research-[a-f0-9]{12}-[a-f0-9]{10}',package_id):raise ValueError('Invalid audit package ID')
@@ -425,31 +486,36 @@ def create_app(runtime=None, port=8765):
         (destination/(package_id+'.json')).write_text(json.dumps({**result,'verified_at':utcnow()},ensure_ascii=False,indent=2))
         return result
 
-    @app.get('/api/evaluations/latest')
-    def latest_evaluation():
-        runs=sorted((runtime.root/'data/evaluations').glob('*/config.json'),key=lambda p:p.stat().st_mtime,reverse=True)
-        if not runs:return {'state':'not_run','scope':'Historical evaluation has not run'}
-        directory=runs[0].parent;status=json.loads((directory/'status.json').read_text())
-        summary=directory/'summary.json'
-        return {'run_id':directory.name,'status':{k:v for k,v in status.items() if k!='results'},
-                'summary':json.loads(summary.read_text()) if summary.exists() else None}
-
     @app.post("/api/sessions")
     def create_session(body:SessionInput):return runtime.create_session(**body.model_dump())
 
     @app.get("/api/sessions/{sid}")
-    def snapshot(sid:str):return runtime.snapshot(sid)
+    def snapshot(sid:str):
+        snap=runtime.snapshot(sid)
+        job=research_job(snap['jobs'], snap['active_job_id'])
+        if job:
+            log=runtime._session_dir(sid)/'jobs'/job['job_id']/'events.jsonl'
+            snap['research_progress']=research_progress(job,log)
+        return snap
 
     @app.post("/api/sessions/{sid}/messages")
-    def ask(sid:str, body:Question):return runtime.start(sid,body.prompt,body.deliverable)
+    def ask(sid:str, body:Question):
+        if body.purpose=='market_refresh' and body.deliverable!='answer':
+            raise ValueError('Market refresh cannot publish reports')
+        return runtime.start(sid,body.prompt,body.deliverable,request_purpose=body.purpose,
+                             jev_assistance=body.jev_assistance,report_review_provider=body.report_review_provider)
 
     @app.post("/api/sessions/{sid}/stop")
-    def stop(sid:str):return runtime.stop(sid)
+    def stop(sid:str, job_id:str|None=None):return runtime.stop(sid, job_id)
+
+    @app.post('/api/sessions/{sid}/jobs/{job_id}/continue')
+    def continue_research(sid:str, job_id:str):return runtime.continue_job(sid, job_id)
 
     def pending(sid):
         snap=runtime.snapshot(sid)
-        if not snap["jobs"] or snap["jobs"][-1]["state"]!="waiting_for_conversation":raise ValueError("会话当前没有等待中的模型请求")
-        return Path(snap["jobs"][-1]["pending_request"])
+        job=research_job(snap['jobs'], snap['active_job_id'])
+        if not job or job['state']!='waiting_for_conversation':raise ValueError("会话当前没有等待中的模型请求")
+        return Path(job['pending_request'])
 
     @app.get("/api/sessions/{sid}/pending")
     def read_pending(sid:str):return json.loads(pending(sid).read_text())
@@ -460,18 +526,27 @@ def create_app(runtime=None, port=8765):
     @app.get("/api/sessions/{sid}/events")
     def events(sid:str):
         snap=runtime.snapshot(sid)
-        if not snap["jobs"]:return []
-        path=runtime._session_dir(sid)/"jobs"/snap["jobs"][-1]["job_id"]/"events.jsonl"
+        job=research_job(snap['jobs'], snap['active_job_id'])
+        if not job:return []
+        path=runtime._session_dir(sid)/"jobs"/job['job_id']/"events.jsonl"
         if not path.exists():return []
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
     @app.get("/api/sessions/{sid}/artifact")
     def artifact(sid:str,path:str):
-        workspace=runtime._session_dir(sid)/"workspace"
-        file=(workspace/path.lstrip("/")).resolve()
-        if not file.is_relative_to(workspace.resolve()) or file.suffix not in (".md",".json",".py") or file.parts[len(workspace.parts)] not in ("reports","data","notes","reviews","drafts","answers"):
+        directory=runtime._session_dir(sid);workspace=directory/'workspace'
+        relative=PurePosixPath(path.lstrip('/'))
+        if (not relative.parts or '..' in relative.parts or relative.suffix not in ('.md','.json','.py')
+            or relative.parts[0] not in ('reports','data','notes','reviews','drafts','answers')):
             raise ValueError("只能读取本会话的报告和数据材料")
-        if not file.is_file():raise FileNotFoundError()
-        return FileResponse(file,media_type="text/plain; charset=utf-8",filename=file.name,content_disposition_type="inline")
+        meta=json.loads((directory/'session.json').read_text())
+        if meta.get('hidden_seed') and str(relative) not in {
+            'reports/'+str(meta.get('initial_report_id'))+'.json',
+            'reports/'+str(meta.get('initial_report_id'))+'.md'}:
+            raise ValueError('Only the approved initial report is exposed from this provenance session')
+        body=workspace_file_bytes(workspace,relative)
+        from urllib.parse import quote
+        return Response(body,media_type='text/plain; charset=utf-8',
+                        headers={'Content-Disposition':"inline; filename*=UTF-8''"+quote(relative.name)})
 
     return app

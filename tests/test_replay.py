@@ -1,4 +1,5 @@
-import hashlib,json,tempfile,unittest,shutil
+import hashlib,json,tempfile,unittest,shutil,sys
+from dataclasses import replace
 from pathlib import Path
 from research_agent.audit import BundleBuilder,canonical
 from research_agent.replay import replay_bundle
@@ -25,6 +26,34 @@ class ReplayTests(unittest.TestCase):
  def test_saved_code_is_not_silently_executed(self):
   result=replay_bundle(self.package['path'],Settings(),self.package,False)
   self.assertEqual(result['status'],'partial');self.assertEqual(result['calculation_checks'][0]['status'],'not_run')
+ @unittest.skipUnless(sys.platform=='darwin' and Path('/usr/bin/sandbox-exec').is_file(),'macOS Seatbelt required')
+ def test_remote_cold_replay_runs_in_tenant_and_still_denies_external_reads(self):
+  settings=replace(Settings(),restricted_execution_root=str(self.root.resolve()))
+  result=replay_bundle(self.package['path'],settings,self.package,True)
+  self.assertEqual(result['status'],'passed',result)
+  self.assertEqual(result['calculations_recomputed'],1)
+  self.assertEqual(result['calculation_checks'][0]['recomputed_values'],{'value':42})
+  self.assertTrue((self.root/'execution-temp').is_dir())
+  self.assertFalse(list((self.root/'execution-temp').glob('aether-cold-replay-*')))
+  # A separately constructed, internally consistent fixture recipe attempts a
+  # real external read. Hash verification must pass so only the OS boundary
+  # can prevent it; no execution method or sandbox permission is mocked.
+  with tempfile.TemporaryDirectory(prefix='aether-replay-other-tenant-') as outside:
+   secret=Path(outside)/'secret.txt';secret.write_text('OTHER_TENANT_REPLAY_FIXTURE')
+   directory=Path(self.package['path']);recipe=directory/'recipes/live-derived.py'
+   recipe.write_text('import json\nfrom pathlib import Path\nsecret=Path('+repr(str(secret.resolve()))+').read_text()\nprint(json.dumps({"values":{"value":42},"units":{"value":"count"},"probe":secret}))\n')
+   p=directory/'records/live-derived.json';row=json.loads(p.read_text())
+   row['recipe_sha256']=hashlib.sha256(recipe.read_bytes()).hexdigest();p.write_bytes(canonical(row))
+   p=directory/'manifest.json';manifest=json.loads(p.read_text())
+   for entry in manifest['files']:
+    body=(directory/entry['path']).read_bytes();entry.update(sha256=hashlib.sha256(body).hexdigest(),bytes=len(body))
+   p.write_bytes(canonical(manifest))
+   denied=replay_bundle(directory,settings,execute_recipes=True)
+  self.assertEqual(denied['integrity']['status'],'passed')
+  self.assertEqual(denied['status'],'failed')
+  self.assertIn('Operation not permitted',denied['calculation_checks'][0]['error'])
+  self.assertNotIn('OTHER_TENANT_REPLAY_FIXTURE',json.dumps(denied))
+  self.assertFalse(list((self.root/'execution-temp').glob('aether-cold-replay-*')))
  def test_numeric_mismatch_is_detected_even_with_consistent_new_manifest(self):
   # Simulates internally consistent but numerically incorrect unanchored evidence.
   directory=Path(self.package['path']);p=directory/'records/live-derived.json';row=json.loads(p.read_text());row['values']['value']='43';p.write_bytes(canonical(row))

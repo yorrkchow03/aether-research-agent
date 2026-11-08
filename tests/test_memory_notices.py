@@ -8,7 +8,7 @@ from unittest.mock import patch
 from research_agent.knowledge import KnowledgeStore
 from research_agent.report_feedback import ReportFeedbackStore
 from research_agent.reports import ReportDraft
-from research_agent.review import review_targets,check_review,evidence_text
+from research_agent.review import REVIEW_VERSION,review_targets,check_review,evidence_text
 from research_agent.memory_notices import attach_report_notices,original_evidence_ids
 
 
@@ -31,8 +31,9 @@ class MemoryNoticeTests(unittest.TestCase):
             observations=[{'statement':text,'evidence_ids':[eid]}],limitations=['Synthetic only'])
         targets=review_targets(d)
         review=check_review({'verdicts':[{'claim_id':t['claim_id'],'status':'supported','reason':'Fixture',
+            'scope_alignment':'aligned','premise_assessment':'supported' if t.get('premise_check_required') else None,
             'quotes':[{'record_id':eid,'text':text}]} for t in targets]},targets,{eid:evidence_text(self.records[eid])})
-        review.update(reviewed_at='2026-01-01T00:10:00Z')
+        review.update(review_version='support-v11-exact-summary-spans',reviewed_at='2026-01-01T00:10:00Z')
         body={'report':d.model_dump(),'created_at':when,'review':review}
         self.knowledge.retain_report(rid,'fixture',body)
         return body

@@ -14,13 +14,28 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from research_data.http import dumps
 from research_data.library.time import timestamp
+from .knowledge import canonical_url, source_content_fingerprint
 
 
-POLICIES = ('coverage', 'relevance', 'mmr', 'recent', 'semantic_coverage','hybrid_relevance')
+POLICIES = ('coverage', 'relevance', 'mmr', 'recent', 'semantic_coverage','hybrid_relevance','semantic_rerank')
 
 
 def context_cost(record):
     return max(1, math.ceil(len(dumps(record, sort_keys=True).encode('utf-8')) / 3))
+
+
+def _exact_duplicate_key(row):
+    """Only complete-source fingerprints suppress records, never similar excerpts."""
+    origin=row.get('url') or row.get('origin_key')
+    if not origin:return None
+    try:origin=canonical_url(origin)
+    except (ValueError,TypeError):return None
+    fingerprint=source_content_fingerprint(row) if isinstance(row.get('text'),str) else row.get('source_content_sha256')
+    if not isinstance(fingerprint,str) or len(fingerprint)!=64 or any(c not in '0123456789abcdef' for c in fingerprint):return None
+    # Saved full pages may be called 'page' locally and 'article' in the library.
+    # Feed/search excerpts remain a different material class from full pages.
+    kind='page' if row['record_id'].startswith('page-') else row.get('source_kind','unknown')
+    return origin,kind,fingerprint
 
 
 def select_evidence(candidates, query='', *, budget=2400, limit=8,
@@ -54,8 +69,32 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
             excluded.append({'record_id': rid, 'reason': 'not_known_by_cutoff'})
             continue
         rows.append(dict(row))
+    eligible_count=len(rows);aliases={};duplicate_groups=[]
+    if group_duplicates:
+        groups={}
+        for row in rows:
+            key=_exact_duplicate_key(row)
+            if key is not None:groups.setdefault(key,[]).append(row['record_id'])
+        protected=set(required_ids or [])
+        for ids in groups.values():
+            if len(ids)<2:continue
+            representative=next((rid for rid in ids if rid in protected),ids[0])
+            aliases.update({rid:representative for rid in ids if rid!=representative})
+            duplicate_groups.append({'retained_id':representative,'alias_ids':[rid for rid in ids if rid!=representative]})
+        rows=[row for row in rows if row['record_id'] not in aliases]
+    # Aliases are navigation only: original saved IDs and source versions remain
+    # readable. Required correction bundles are remapped, never silently dropped.
+    alias=lambda rid:aliases.get(rid,rid)
+    mapped_dependencies={}
+    for rid,targets in (dependencies or {}).items():
+        key=alias(rid)
+        mapped_dependencies.setdefault(key,[])
+        mapped_dependencies[key]=list(dict.fromkeys([*mapped_dependencies[key],*(alias(target) for target in targets)]))
+    mapped_required=list(dict.fromkeys(alias(rid) for rid in (required_ids or [])))
     meta = {'policy': policy, 'algorithm': 'semantic-facility-coverage-greedy-v1' if policy == 'semantic_coverage' else 'facility-coverage-greedy-v1' if policy == 'coverage' else policy,
             'candidate_count': len(candidates), 'eligible_count': len(rows),
+            'eligible_before_exact_dedup':eligible_count,'exact_duplicate_groups':duplicate_groups,
+            'exact_duplicate_count':len(aliases),
             'budget': budget, 'cost_estimate': 0, 'cost_unit': 'ceil(UTF8 serialized evidence bytes / 3); not provider tokens',
             'excluded': excluded, 'trace': [],
             'scope': 'Evidence selection only; similarity and repeated coverage do not prove truth or source independence.'}
@@ -74,7 +113,7 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
         relevance = np.zeros(len(rows)) if query.strip() else np.ones(len(rows))
     similarity = np.clip(similarity, 0, 1)
     relevance = np.clip(relevance, 0, 1)
-    if policy=='hybrid_relevance':
+    if policy=='hybrid_relevance' or (policy=='semantic_rerank' and retrieval_scores):
         scores=retrieval_scores or {}
         for row in rows:
             score=scores.get(row['record_id'],0)
@@ -86,11 +125,13 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
     for rid,score in semantic_scores.items():
         if not isinstance(score,(int,float)) or not math.isfinite(score) or not 0<=score<=1:
             raise ValueError('Semantic relevance scores must be finite values in [0,1]')
-    if policy=='semantic_coverage':
+    if policy in ('semantic_coverage','semantic_rerank'):
         relevance=np.array([.5*float(relevance[i])+.5*semantic_scores[row['record_id']]
                             if row['record_id'] in semantic_scores else float(relevance[i])
                             for i,row in enumerate(rows)])
-    meta['semantic_scores_used']=len([r for r in rows if r['record_id'] in semantic_scores]) if policy=='semantic_coverage' else 0
+    meta['semantic_scores_used']=len([r for r in rows if r['record_id'] in semantic_scores]) if policy in ('semantic_coverage','semantic_rerank') else 0
+    if policy=='semantic_rerank':
+        meta['semantic_rerank_scope']='Scored evidence blends 0.5 host/lexical relevance and 0.5 accepted semantic relevance. Unjudged evidence retains its base score; no confidence or truth guarantee.'
     if query.strip() and not np.any(relevance > 1e-12) and not required_ids:
         meta['reason'] = 'no_lexical_evidence_match'
         return {'results': [], 'selection': meta}
@@ -118,7 +159,7 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
     meta['duplicate_demand_weighting']=group_duplicates
     index = {row['record_id']: i for i, row in enumerate(rows)}
     costs = np.array([context_cost(row) for row in rows])
-    links = dependencies or {}
+    links = mapped_dependencies
 
     def closure(i):
         pending = [i]
@@ -139,7 +180,7 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
     order = []
     coverage = np.zeros(len(rows))
     spent = 0
-    protected=list(dict.fromkeys(required_ids or []))
+    protected=mapped_required
     if protected:
         missing=[rid for rid in protected if rid not in index or bundles[index[rid]] is None]
         required=set().union(*(bundles[index[rid]] for rid in protected if rid in index and bundles[index[rid]] is not None))
@@ -166,7 +207,7 @@ def select_evidence(candidates, query='', *, budget=2400, limit=8,
             gain = float(weights @ (covered - coverage))
             if policy in ('coverage','semantic_coverage'):
                 score = gain / max(cost, 1)
-            elif policy in ('relevance','hybrid_relevance'):
+            elif policy in ('relevance','hybrid_relevance','semantic_rerank'):
                 score = float(relevance[i])
             elif policy == 'mmr':
                 redundancy = max((similarity[i, j] for j in selected), default=0)

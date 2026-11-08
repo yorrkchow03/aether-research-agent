@@ -5,6 +5,8 @@ import re
 
 from langchain_core.callbacks import BaseCallbackHandler
 from deepagents.middleware.summarization import SummarizationMiddleware
+from .model_context import context_policy
+from .model_usage import response_usage
 
 
 SUMMARY_PROMPT = '''Extract a compact working-memory summary for continuing this
@@ -60,7 +62,7 @@ class SummaryUsageRecorder(BaseCallbackHandler):
         generations = getattr(response, 'generations', [])
         message = getattr(generations[0][0], 'message', None) if generations and generations[0] else None
         metadata = getattr(message, 'response_metadata', {}) or {}
-        usage = getattr(message, 'usage_metadata', None)
+        usage = response_usage(message)
         self.emit('context_summary_finished', {'summary_request_id': str(run_id),
             'usage': usage, 'actual_model': metadata.get('model_name'),
             'finish_reason': metadata.get('finish_reason'),
@@ -74,16 +76,19 @@ class SummaryUsageRecorder(BaseCallbackHandler):
             'error_type': type(error).__name__, 'usage': None})
 
 
-def make_context_middleware(model, backend, emit, *, trigger_tokens=48000,token_counter=None):
+def make_context_middleware(model, backend, emit, *, trigger_tokens=None,token_counter=None):
     # A shallow copy shares the job's authorized client, not a second credential.
     summary_model = model.model_copy(update={'max_tokens': 4096,
                                              'callbacks': [SummaryUsageRecorder(emit)]})
     options={'token_counter':token_counter} if token_counter else {}
+    policy=context_policy(model,trigger_tokens=trigger_tokens)
+    emit('context_policy_configured',policy)
     return SummarizationMiddleware(summary_model, backend=backend,**options,
-        trigger=('tokens', trigger_tokens), keep=('messages', 12),
-        trim_tokens_to_summarize=8000, summary_prompt=SUMMARY_PROMPT,
-        truncate_args_settings={'trigger': ('tokens', 16000), 'keep': ('messages', 12),
-                                'max_length': 3000, 'truncation_text': ' … [older argument offloaded; inspect saved task artifacts]'} )
+        trigger=('tokens', policy['trigger_tokens']), keep=('tokens', policy['keep_tokens']),
+        trim_tokens_to_summarize=None, summary_prompt=SUMMARY_PROMPT,
+        # Filesystem tools already persist their writes. Keep old arguments
+        # intact until actual compaction rather than clipping them at 16K.
+        truncate_args_settings=None)
 
 
 class BoundedJudgmentSidecar:

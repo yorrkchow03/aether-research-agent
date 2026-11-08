@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from .audit import verify_bundle
 from .reports import ReportDraft,validate_report
-from .review import check_review
+from .review import check_review,check_saved_scope_critic
 from .simulation import market_statistics,compare_strategies
 from .terminal import ResearchShell
 
@@ -33,17 +33,50 @@ def replay_bundle(directory,settings,expected=None,execute_recipes=False):
     index=json.loads((directory/'replay_index.json').read_text())
     records={rid:json.loads((directory/path).read_text()) for rid,path in index['records'].items()}
     report=json.loads((directory/'report/report.json').read_text())
-    try:result['numeric_validation']=validate_report(ReportDraft.model_validate(report['report']),records.__getitem__)
-    except (ValueError,KeyError) as exc:return {**result,'status':'failed','error':str(exc)}
+    try:
+        draft=ReportDraft.model_validate(report['report'])
+        if getattr(draft,'scope',None):
+            from .report_presentation import build_report_presentation
+            saved=report['presentation']
+            overview=saved['overview']
+            def raw_reader(row):
+                return (directory/'raw'/(row['source']['sha256']+'.bin')).read_bytes()
+            evidence_as_of=overview['evidence_as_of']
+            result['numeric_validation']=validate_report(draft,records.__getitem__,as_of=evidence_as_of,raw_reader=raw_reader)
+            rebuilt=build_report_presentation(draft,records.__getitem__,user_prompt=overview['user_prompt'],
+                created_at=report['created_at'],evidence_as_of=evidence_as_of,raw_reader=raw_reader)
+            if rebuilt!=saved:
+                raise ValueError('Stored report presentation differs from the replayed source projection')
+            result['presentation_validation']='passed'
+        else:
+            result['numeric_validation']=validate_report(draft,records.__getitem__)
+    except (ValueError,KeyError,OSError) as exc:return {**result,'status':'failed','error':str(exc)}
     review=report.get('review',{})
     if review.get('review_id'):
         saved=json.loads((directory/'review'/(review['review_id']+'.json')).read_text())
         try:
-            check=check_review({'verdicts':saved['verdicts']},saved['targets'],saved['evidence_text'])
+            if getattr(draft,'scope',None) and getattr(draft,'delivery_kind','full')!='evidence_gap':
+                from .review import saved_report_review_targets
+                expected_targets=saved_report_review_targets(draft,saved)
+                saved_targets=[]
+                for target, expected_target in zip(saved['targets'],expected_targets):
+                    ids=target['evidence_ids']
+                    if target['kind'] in ('summary','judgment'):
+                        ids=[rid for rid in ids if rid in expected_target['evidence_ids'] or
+                             not rid.startswith('context-') or records.get(rid,{}).get('dataset_id')!='local.user_research_parameters']
+                    saved_targets.append({**target,'evidence_ids':ids})
+                if len(saved['targets'])!=len(expected_targets) or saved_targets!=expected_targets:
+                    raise ValueError('Saved review does not cover the report and featured-document targets')
+            from .review import validate_saved_report_review
+            check=validate_saved_report_review(saved,draft)
             result['review_quote_validation']={'status':'passed','claims_checked':check['claims_checked'],'semantic_status':check['status']}
         except (ValueError,KeyError) as exc:return {**result,'status':'failed','error':str(exc)}
     else:result['review_quote_validation']={'status':'not_available'}
-    with tempfile.TemporaryDirectory(prefix='aether-cold-replay-') as work:
+    parent=None
+    if getattr(settings,'restricted_execution_root',None):
+        from .execution_safety import execution_temp_parent
+        parent=execution_temp_parent(settings)
+    with tempfile.TemporaryDirectory(prefix='aether-cold-replay-',dir=parent) as work:
         work=Path(work);inputs=work/'inputs';inputs.mkdir()
         # Absolute paths in archived records are provenance only. Re-map to this bundle.
         for rid,row in records.items():

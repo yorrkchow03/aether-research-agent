@@ -1,0 +1,77 @@
+/* Only the owner Strategy Lab workspace is styled here. */
+#strategy-workspace {min-width:0}
+#strategy-workspace [hidden] {display:none!important}
+#strategy-workspace .sw-intro h2 {font-size:25px;letter-spacing:-.5px;margin:7px 0}
+#strategy-workspace .sw-intro .card-heading {margin-bottom:10px}
+#strategy-workspace .sw-layout {display:grid;grid-template-columns:minmax(210px,.68fr) minmax(0,2fr);gap:22px;align-items:start}
+#strategy-workspace .sw-library {padding:20px}
+#strategy-workspace .sw-library h3 {margin:0 0 15px;font-size:18px}
+#strategy-workspace .sw-library-note {border-top:1px solid #eceaf1;padding-top:15px;margin-top:17px}
+#strategy-workspace .sw-filters {display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 18px}
+#strategy-workspace label {display:block;font-size:13px;font-weight:600;color:#5a6170;line-height:1.6}
+#strategy-workspace input,#strategy-workspace select {display:block;width:100%;min-width:0;box-sizing:border-box;margin-top:6px;padding:10px 11px;border:1px solid #dcdde5;border-radius:8px;color:#293346;background:#fff;font:inherit;font-size:14px;font-weight:400}
+#strategy-workspace input:focus,#strategy-workspace select:focus,#strategy-workspace button:focus-visible {outline:2px solid #b8a7e3;outline-offset:2px}
+#strategy-workspace .sw-run {display:block;width:100%;border:1px solid #e7e5ed;border-radius:11px;padding:13px;margin:10px 0;text-align:left;background:#fff;color:inherit;cursor:pointer}
+#strategy-workspace .sw-run:hover,#strategy-workspace .sw-run.selected {border-color:#ab9acd;background:#f7f5fc}
+#strategy-workspace .sw-run>span {display:flex;align-items:flex-start;gap:9px;justify-content:space-between}
+#strategy-workspace .sw-run strong {font-size:14px;line-height:1.55;font-weight:600}
+#strategy-workspace .sw-run small {display:block;font-size:12px;color:#798294;margin-top:6px;line-height:1.5}
+#strategy-workspace .sw-badge {font-size:10px;white-space:normal;line-height:1.4;padding:4px 7px}
+#strategy-workspace .sw-detail {min-width:0}
+#strategy-workspace .sw-detail .card {min-width:0;padding:23px}
+#strategy-workspace .sw-detail h2 {font-size:24px;letter-spacing:-.5px;margin:7px 0}
+#strategy-workspace .sw-detail h3 {font-size:17px;margin:25px 0 13px;line-height:1.5}
+#strategy-workspace .sw-detail h4 {font-size:14px;margin:18px 0 8px}
+#strategy-workspace .sw-result-heading {align-items:flex-start;gap:14px;margin-bottom:15px}
+#strategy-workspace .sw-result-heading p {font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+#strategy-workspace .sw-exports {display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 20px}
+#strategy-workspace .sw-exports .button {font-size:12px;padding:8px 11px}
+#strategy-workspace .sw-window {font-size:13px;color:#6d7385;line-height:1.6;margin-bottom:8px}
+#strategy-workspace .sw-metrics {display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin:23px 0}
+#strategy-workspace .sw-three {grid-template-columns:repeat(3,minmax(0,1fr))}
+#strategy-workspace .sw-metric {min-width:0}
+#strategy-workspace .sw-metric small {font-size:12px;color:#727b8c;line-height:1.6;display:block}
+#strategy-workspace .sw-metric strong {display:block;font-size:24px;font-weight:600;color:#293447;line-height:1.5;margin-top:7px;overflow-wrap:anywhere}
+#strategy-workspace .sw-metric span {display:block;font-size:11px;color:#858c9b;line-height:1.6;margin-top:4px}
+#strategy-workspace .sw-assessment {border-radius:9px;background:#eff6f3;color:#3c7060;padding:13px 15px;font-size:13px;line-height:1.7;margin:17px 0}
+#strategy-workspace .sw-assessment.caution {background:#faf5e9;color:#846631}
+#strategy-workspace .sw-review-block {border:1px solid #e7d2b4;border-radius:10px;padding:16px;background:#fff9ef;margin:17px 0 22px}
+#strategy-workspace .sw-review-block strong {display:block;color:#785722;font-size:14px;line-height:1.6}
+#strategy-workspace .sw-review-block p {font-size:13px;line-height:1.75;color:#785e38;margin:10px 0}
+#strategy-workspace .sw-table {max-width:100%;overflow:auto;margin:17px 0;border:1px solid #e7e8ee;border-radius:9px}
+#strategy-workspace .sw-table table {min-width:560px;width:100%;border-collapse:collapse;font-size:12px;line-height:1.6}
+#strategy-workspace .sw-table th,#strategy-workspace .sw-table td {padding:11px 12px;border-bottom:1px solid #ececf1;text-align:right;vertical-align:middle;white-space:normal}
+#strategy-workspace .sw-table thead th {background:#f7f7fa;color:#677082;font-size:11px;font-weight:600}
+#strategy-workspace .sw-table th:first-child,#strategy-workspace .sw-table td:first-child {text-align:left}
+#strategy-workspace .sw-table tbody th {font-weight:500;color:#404a5e}
+#strategy-workspace .sw-table tbody tr:last-child>* {border-bottom:0}
+#strategy-workspace .sw-chart {display:block;width:100%;height:auto;margin:18px 0 8px;overflow:visible}
+#strategy-workspace .sw-chart text {fill:#778194;font-family:inherit;font-size:12px}
+#strategy-workspace .sw-legend {display:flex;flex-wrap:wrap;gap:10px 16px;margin:7px 0 20px;font-size:11px;color:#747e90}
+#strategy-workspace .sw-legend span {display:inline-flex;align-items:center;gap:6px}
+#strategy-workspace .sw-legend i {width:9px;height:9px;border-radius:2px;display:inline-block}
+#strategy-workspace .sw-calibration {margin:18px 0}
+#strategy-workspace .sw-calibration-chart {max-width:560px}
+#strategy-workspace .sw-calibration .sw-table table {min-width:440px}
+#strategy-workspace .sw-disclosure {border-top:1px solid #eceaf1;padding-top:15px;margin:22px 0 15px;font-size:13px;line-height:1.8}
+#strategy-workspace summary {cursor:pointer;font-size:14px;line-height:1.65;font-weight:600;color:#50586a}
+#strategy-workspace .sw-disclosure p {margin:12px 0;overflow-wrap:anywhere}
+#strategy-workspace .card-note {font-size:12px;line-height:1.8;color:#7c8494;overflow-wrap:anywhere}
+#strategy-workspace .sw-error {color:#aa534d!important}
+#strategy-workspace pre {padding:14px;border-radius:8px;background:#f7f7fa;max-height:340px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.7}
+#strategy-workspace code {overflow-wrap:anywhere;font-size:11px}
+#strategy-workspace .sw-empty h3 {margin:0 0 9px}
+#strategy-workspace .sw-empty p,#strategy-workspace .sw-job-state {font-size:14px;color:#7b8394;line-height:1.8}
+#strategy-workspace .sw-case-picker {margin:24px 0 14px}
+#strategy-workspace .sw-cost-picker {max-width:260px;margin:20px 0}
+#strategy-workspace .sw-create>summary {list-style-position:inside}
+#strategy-workspace .sw-create>summary span {display:block;font-size:12px;font-weight:400;color:#868d9b;margin:6px 0 0 18px}
+#strategy-workspace .sw-create-grid {display:grid;grid-template-columns:1fr 1fr;gap:28px;margin-top:24px}
+#strategy-workspace .sw-create-grid h3 {font-size:17px;margin:0 0 11px}
+#strategy-workspace .sw-create-grid form>label {margin:16px 0}
+#strategy-workspace .sw-create-grid .form-grid {display:grid;grid-template-columns:1fr 1fr;gap:13px;margin:18px 0}
+#strategy-workspace .sw-create-grid .button {margin-top:9px}
+#strategy-workspace .sw-catalog-item {margin:15px 0}
+@media(max-width:1200px){#strategy-workspace .sw-layout{grid-template-columns:1fr}#strategy-workspace [data-sw-list]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}#strategy-workspace .sw-run{margin:0}}
+@media(max-width:700px){#strategy-workspace .card-heading{flex-wrap:wrap}#strategy-workspace .sw-create-grid{grid-template-columns:1fr;gap:26px}#strategy-workspace .sw-metrics,#strategy-workspace .sw-three{grid-template-columns:repeat(2,minmax(0,1fr))}#strategy-workspace .sw-detail .card{padding:18px}#strategy-workspace .sw-result-heading h2{font-size:22px}}
+@media(max-width:480px){#strategy-workspace [data-sw-list],#strategy-workspace .sw-filters{grid-template-columns:1fr}#strategy-workspace .sw-chart text{font-size:15px}#strategy-workspace .sw-intro h2{font-size:22px}}

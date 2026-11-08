@@ -30,7 +30,8 @@ class ResponseLimitTests(unittest.TestCase):
         settings = Settings(api_key='fixture-key')
         with patch('research_agent.model.ArkPlanModel') as model:
             create_ark_model(settings)
-            self.assertEqual(model.call_args.kwargs['max_tokens'], 4096)
+            self.assertEqual(model.call_args.kwargs['max_tokens'], 8192)
+            self.assertEqual(model.call_args.kwargs['profile']['max_input_tokens'],1024000)
             model.call_args.kwargs['http_client'].close()
             create_ark_model(settings, max_output_tokens=8192)
             self.assertEqual(model.call_args.kwargs['max_tokens'], 8192)

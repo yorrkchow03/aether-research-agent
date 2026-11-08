@@ -37,13 +37,7 @@ SOURCE_MANIFEST.json
 .ssh/
 credentials.json
 .venv-*/
-# Local execution diaries and historical acceptance contain personal paths/run IDs.
-docs/EXECUTION_STATE.md
-docs/AUTOMATION_RUNBOOK.md
-docs/IMPLEMENTATION_PLAN.md
-docs/CORE_ACCEPTANCE.md
-docs/PRODUCT_ROADMAP.md
-docs/FUTURE_EXTENSIONS.md
-docs/INVESTMENT_COMPONENTS_PLAN.md
-docs/development/PRODUCT_EVOLUTION_PLAN.md
-docs/MSBD5015_PROPOSAL_DRAFT.md
+# Local scratch work and internal documentation are never publication artifacts.
++/work/
++docs/development/
++

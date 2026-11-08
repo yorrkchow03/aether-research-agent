@@ -42,13 +42,13 @@ class HarnessSDKTests(unittest.TestCase):
         self.shell.attach_research_sdk(server.start())
         return server
 
-    def test_current_model_has_only_twelve_business_tools(self):
+    def test_current_model_exposes_thirteen_business_tools(self):
         self.service.web_search = SimpleNamespace()
         self.service.reviewer = SimpleNamespace()
         names = {item.name for item in self.service.as_tools()}
         self.assertEqual(names, {'list_data_sources', 'request_public_api', 'search_web',
             'fetch_webpage', 'read_evidence', 'register_calculation', 'get_private_portfolio',
-            'record_news_event', 'submit_research_answer', 'publish_report',
+            'record_news_event', 'submit_research_answer', 'publish_report', 'publish_saved_report',
             'get_research_context', 'recall_memory'})
 
     def test_terminal_sdk_capture_custom_calculation_and_source_gate(self):

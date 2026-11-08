@@ -1,4 +1,4 @@
-"""Offline teammate onboarding check; fresh temporary state, no API or user .env.
+"""Offline local installation check; fresh temporary state, no API or user .env.
 
 Run after installing the project: python scripts/dev/check_framework.py
 This checks wiring and local API contracts, not investment or live-provider quality.
@@ -51,7 +51,7 @@ def check_framework():
             names = sorted(t.name for t in service.as_tools())
             expected = {'list_data_sources', 'request_public_api', 'search_web', 'fetch_webpage',
                 'read_evidence', 'register_calculation', 'get_private_portfolio',
-                'record_news_event', 'submit_research_answer', 'publish_report',
+                'record_news_event', 'submit_research_answer', 'publish_report', 'publish_saved_report',
                 'get_research_context', 'recall_memory'}
             assert set(names) == expected
     return {'status': 'passed', 'python': platform.python_version(), 'demo': demo,

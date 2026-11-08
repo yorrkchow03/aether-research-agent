@@ -45,6 +45,16 @@ class SourceExportTests(unittest.TestCase):
         self.assertEqual(set(json.loads((self.output / 'SOURCE_MANIFEST.json').read_text())['files']),
                          {'README.md', '.env.example'})
 
+    def test_pdf_font_and_license_are_carried_into_clean_source(self):
+        font='src/research_agent/fonts/AetherSansSC-Regular.ttf'
+        self.write(font,b'synthetic portable font fixture')
+        self.write('src/research_agent/fonts/OFL.txt',b'Synthetic license fixture')
+        self.write('src/research_agent/fonts/private-font.ttf',b'not curated')
+        export_source(self.root,self.output)
+        self.assertEqual((self.output/font).read_bytes(),b'synthetic portable font fixture')
+        self.assertTrue((self.output/'src/research_agent/fonts/OFL.txt').is_file())
+        self.assertFalse((self.output/'src/research_agent/fonts/private-font.ttf').exists())
+
     def test_asset_secret_detection_is_atomic(self):
         secret = 'synthetic-' + 'private-credential-for-export-test'
         (self.root / '.env').write_text('ARK_API_KEY=' + secret + '\n')

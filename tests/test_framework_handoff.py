@@ -21,7 +21,7 @@ class FrameworkHandoffTests(unittest.TestCase):
             self.assertTrue(receipt['demo']['checkpoint_saved'])
             self.assertEqual(receipt['external_model_calls'], 0)
             self.assertFalse(receipt['user_credentials_loaded'])
-            self.assertEqual(len(receipt['current_business_tools']), 12)
+            self.assertEqual(len(receipt['current_business_tools']), 13)
 
 
 if __name__ == '__main__':

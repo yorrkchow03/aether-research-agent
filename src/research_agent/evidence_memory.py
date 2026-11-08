@@ -91,10 +91,12 @@ class EvidenceMemory:
         slices = exact_excerpts(text, query, snippet_chars, hints=passage_hints)
         body = {k: original[k] for k in ('record_id', 'title', 'url', 'published_at', 'retrieved_at',
                 'available_at', 'first_seen_at', 'source_kind', 'assets', 'asset', 'event_id', 'scope',
-                'quality_flags', 'origin_key', 'source') if k in original}
+                'quality_flags', 'origin_key', 'source', 'related_update_context') if k in original}
         body['first_seen_at'] = (original.get('first_seen_at') or original.get('available_at') or
                                  original.get('retrieved_at') or original.get('source', {}).get('retrieved_at'))
         body['excerpt'] = '\n[…]\n'.join(s['text'] for s in slices)
+        from .knowledge import source_content_fingerprint
+        body['source_content_sha256'] = source_content_fingerprint(original)
         body['source_slices'] = [{k:s[k] for k in ('start','end')} | {'sha256':hashlib.sha256(s['text'].encode()).hexdigest()} for s in slices]
         body['input_excerpt_sha256'] = hashlib.sha256(body['excerpt'].encode()).hexdigest()
         body['source_text_truncated'] = sum(s['end']-s['start'] for s in slices) < len(text)
@@ -104,7 +106,7 @@ class EvidenceMemory:
     def pack(self, query='', asset='ETH', cutoff=None, mode='observed', budget=2400, limit=8,
              policy=None, candidates=None, original_only=False, material_only=False,
              include_updates=True, dependencies=None, relations=None, semantic_mode='shadow',
-             max_judgments=8, max_pairs=2, snippet_chars=1600,retrieval_scores=None,passage_hints=None):
+             max_judgments=8, max_pairs=2, snippet_chars=1600,retrieval_scores=None,passage_hints=None,start=None,end=None):
         if mode not in ('observed', 'strict') or semantic_mode not in ('shadow', 'apply', 'off'):
             raise ValueError('Unknown evidence memory mode')
         if not 0 <= max_judgments <= 24 or not 0 <= max_pairs <= 8 or not 400 <= snippet_chars <= 5000:
@@ -114,7 +116,8 @@ class EvidenceMemory:
             if not self.knowledge:
                 raise ValueError('A source store or explicit frozen candidate pool is required')
             pool = self.knowledge.candidate_news(query, asset, cutoff, original_only=original_only,
-                material_only=material_only, include_updates=include_updates, mode=mode)
+                material_only=material_only, include_updates=include_updates, mode=mode,
+                **{k:v for k,v in {'start':start,'end':end}.items() if v is not None})
             candidates = pool['candidates']
             dependencies = dependencies or pool['dependencies']
         else:
@@ -140,6 +143,10 @@ class EvidenceMemory:
                 item = self._record(row, query, snippet_chars,(passage_hints or {}).get(rid))
             except (KeyError, ValueError, FileNotFoundError, OSError):
                 gaps.append({'record_id': rid, 'reason': 'saved_source_unavailable_or_integrity_failed'}); continue
+            if not item['excerpt'].strip():
+                gaps.append({'record_id':rid,'reason':'original_body_unavailable',
+                    'scope':'Metadata remains discoverable in the source archive; no empty body is ranked as contextual evidence.'})
+                continue
             try:
                 known = item.get('first_seen_at')
                 if item.get('published_at') and timestamp(item['published_at']) > timestamp(cutoff):
@@ -181,12 +188,17 @@ class EvidenceMemory:
             elif kind in ('supersedes', 'corrects'):
                 links.setdefault(right, []).append(left)
         ranking = select_evidence(rows, query, budget=64000, limit=min(30, max(1, len(rows))),
-                                  policy='relevance', as_of=cutoff if mode == 'strict' else None)
+                                  policy='hybrid_relevance' if retrieval_scores else 'relevance',
+                                  retrieval_scores=retrieval_scores,
+                                  as_of=cutoff if mode == 'strict' else None)
         shortlist = ranking['results']
         if self.judge and semantic_mode != 'off':
             def assess(task, evidence):
                 try:
-                    result = self.judge(task, question=query, evidence=evidence, criterion_version='memory-v1')
+                    question=query
+                    if start or end:
+                        question+='\nRequested publication window: '+str(start or 'unspecified')+' inclusive to '+str(end or cutoff)+' exclusive. Important counterevidence and corrections remain relevant; label background separately.'
+                    result = self.judge(task, question=question, evidence=evidence, criterion_version='memory-window-v2')
                     if not isinstance(result, dict):
                         raise ValueError('Invalid semantic judgment envelope')
                 except Exception as exc:
@@ -231,6 +243,8 @@ class EvidenceMemory:
                     links.setdefault(pair[0], []).append(pair[1]); links.setdefault(pair[1], []).append(pair[0])
         base_policy = policy or ('coverage' if semantic_scores and semantic_mode == 'apply' else 'relevance' if query.strip() else 'coverage')
         actual_policy = 'semantic_coverage' if base_policy == 'coverage' and semantic_scores and semantic_mode == 'apply' else base_policy
+        if actual_policy=='semantic_rerank' and (semantic_mode!='apply' or not semantic_scores):
+            actual_policy='hybrid_relevance' if retrieval_scores else 'relevance'
         result = select_evidence(rows, query, budget=budget, limit=limit, policy=actual_policy,
             as_of=cutoff if mode == 'strict' else None, dependencies=links,
             semantic_scores=semantic_scores if semantic_mode == 'apply' else None,

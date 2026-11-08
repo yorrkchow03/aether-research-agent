@@ -64,9 +64,33 @@ client = ResearchClient()
 data = client.fetch("candles", "ETH")
 print(json.dumps(data))
 # Returned data_file uses virtual /data/...; in the shell use ./data/...
-record = json.loads(Path("." + data["data_file"]).read_text())
+record = client.read_json(data)
 print(record.keys())
 ```
+
+`client.read_json(packet)` resolves the packet's terminal/virtual file path within
+`RESEARCH_WORKSPACE`; it makes no provider request and preserves stored types.
+The terminal starts in that workspace. `/data/...` belongs to file tools;
+ordinary Python uses `./data/...`, `terminal_data_file`, or the SDK loader.
+Shell pipelines propagate failures. Avoid suppressing errors while exploring.
+
+Financial numbers are often exact decimal strings, including `values` fields and
+fields such as `series[].close_usd`. Inspect `data_contract` and parse only the
+chosen fields before calculating:
+
+```python
+from decimal import Decimal
+close = Decimal(record["series"][-1]["close_usd"])
+# Check missing/None first. Never replace unknown observations with zero.
+```
+
+An existing `live.calculation` record contains `values`, `units`, `method`, input
+IDs and a recipe hash. Reuse it when asset, venue, source versions, period and
+baseline match the question. The publication gate checks its declared inputs;
+do not write a second full verification script merely because it is a prior
+calculation. New metrics, suspected errors or a different baseline justify new
+code. State the baseline explicitly: Oct 29→Nov 5 and Oct 30→Nov 5 are different
+measurements, and TVL stock change is not an inflow/outflow measurement.
 
 Inspect returned structures before assuming fields. Source SDK calls provide IDs,
 observation/retrieval times, units and archived response files. Raw public API
@@ -86,6 +110,8 @@ Available operations and arguments:
 |---|---|
 | sources | Discover adapter names and provider bases; same as list_data_sources |
 | fetch | metric, asset="ETH"; normalized live adapter, choose names from sources |
+| local-market | metric, asset="ETH", as_of=null, limit=1; local capture IDs, coverage clocks and files, no provider request |
+| collection-status | Daily run status, per-source timestamps and failures |
 | public-api | provider, path, params; generic credential-free public GET |
 | archive-market | asset="ETH", days=30; fixed-cutoff archived prices, never current |
 | archive-chain | metric, chain="Ethereum", days=30; bundle-only chain data |
@@ -94,7 +120,7 @@ Available operations and arguments:
 | eth-rpc | method, params; read-only Ethereum RPC, explicit bounded log ranges |
 | protocol-activity | blocks=1000, end_block=null; Aave V3 Core WETH only |
 | context | Supplied research parameters and clearly labelled scenario defaults |
-| memory-news | query="", asset="ETH", cutoff=null, budget=2400, limit=8, policy=null, original_only=false, related_queries=null (up to2 local entity queries), previous_report=null (saved ID); select saved sources with bounded event/version/update context |
+| memory-news | query="", asset="ETH", cutoff=null, start=null, end=null, budget_chars=null, limit=null, original_only=false, related_queries=null (up to2 local entity queries), previous_report=null (saved ID); independently ranked exact passages in a half-open publication window, with task-adaptive counts and separate cutoff |
 | memory-research | query="", limit=8; recall saved reports and source-reviewed answer summaries, with original evidence IDs |
 | simulate | price_record_id, profile=null, lookback_days=7; saved baseline comparison |
 | strategy-start | config; asynchronous persisted local model experiment |
@@ -105,14 +131,19 @@ For operations without a convenience method use client.call(operation, **argumen
 Historical archives may be absent on a clean install. Current captures cannot
 prove what was publicly available at a past cutoff. eth-rpc never sends orders.
 
-News recall uses local character TF-IDF and relevance selection for queries,
-coverage selection for broad empty-query scans, with explicit
-same-origin/repeated-text weighting and saved event revision dependencies. It is
-lexical evidence packing, not a neural semantic model or proof of corroboration.
-The budget measures an estimated serialized-text cost, not provider tokens.
-Inspect selection gaps and candidate_pool_at_limit; try other terms or query the
-original source when recall is incomplete. Policies relevance, mmr and recent
-are available for comparisons; they share the same cutoff and candidate pool.
+News recall ranks exact 1400-character source passages using BM25 keyword search
+and the existing local Potion embeddings, fused by reciprocal rank. No model is
+needed for keyword scoring. An optional report-level Jev reranks accepted-label
+slots; uncertain/failed judgments retain their baseline positions. Leave limit
+unset for initial counts of8 for unscoped questions,20 for week-length windows,
+and32 for month-length windows; explicit limits up to64 are supported. These are
+starting retrieval sizes, not a cap on an entire investigation. Read coverage,
+more_available and gaps, then request more or query missing topics/dates as needed.
+budget_chars counts source-passage bodies only; metadata does not consume it.
+The older budget parameter is accepted only as an explicit body-size override
+(budget*3 characters). The old EvidenceMemory selectors remain offline experiment
+baselines and do not control the active passage pipeline. Rankings are navigation,
+not corroboration or a calibrated truth score.
 Read selected original records before using them in an answer. A review receipt
 does not transform old plans into confirmed outcomes or establish price effects.
 Research recall also retains source-reviewed answer summaries across sessions.

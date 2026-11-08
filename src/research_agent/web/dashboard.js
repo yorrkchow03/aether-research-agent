@@ -1,7 +1,51 @@
 'use strict';
 const $=id=>document.getElementById(id);
+function workspaceStorageGet(key){try{return localStorage.getItem(key)}catch{return null}}
+function workspaceStorageSet(key,value){try{localStorage.setItem(key,String(value))}catch{}}
+function workspaceStorageRemove(key){try{localStorage.removeItem(key)}catch{}}
 const welcomeHTML=$('chat').innerHTML;
-const state={sid:null,sessions:[],dashboard:{items:{},indicators:{}},reports:[],news:[],subscriptions:[],period:30,line:false,busy:false,modelConfigured:false,profile:null,jobKey:'',view:'overview'};
+const state={sid:null,sessions:[],dashboard:{items:{},indicators:{}},reports:[],news:[],period:30,line:true,busy:false,modelConfigured:false,jobKey:'',view:'overview',jevAssistance:readJevPreference(),reportReviewProvider:readReportReviewPreference()};
+function readJevPreference(){
+ return workspaceStorageGet('aether-jev-assistance')==='true';
+}
+function configureJevControl(){
+ const control=$('jev-assistance');
+ const review=$('report-review-provider');
+ if(control){
+  control.checked=state.jevAssistance;
+  control.disabled=state.busy||!state.modelConfigured;
+ }
+ if(review){
+  review.value=state.reportReviewProvider;
+  review.disabled=state.busy||!state.modelConfigured;
+ }
+}
+function saveJevPreference(enabled){
+ state.jevAssistance=Boolean(enabled);
+ workspaceStorageSet('aether-jev-assistance',String(state.jevAssistance));
+ configureJevControl();
+}
+function jevOptionLabel(requested){
+ return typeof requested==='boolean'?`Jev sources: ${requested?'On':'Off'}`:'';
+}
+function readReportReviewPreference(){
+ return workspaceStorageGet('aether-report-review-provider')==='jev'?'jev':'generation_model';
+}
+function saveReportReviewPreference(provider){
+ state.reportReviewProvider=provider==='jev'?'jev':'generation_model';
+ workspaceStorageSet('aether-report-review-provider',state.reportReviewProvider);
+ configureJevControl();
+}
+function reportReviewLabel(provider,model){
+ if(provider==='jev'||/^jev-/.test(model||''))return 'Review: '+(model||'Jev');
+ if(model)return 'Review: '+model;
+ return provider==='generation_model'?'Review: same model':'';
+}
+function reportDeliveryBadge(kind,status){
+ if(kind==='evidence_gap')return {label:'Evidence gap',tone:'warn'};
+ if(kind==='minimal')return {label:'Limited report',tone:'neutral'};
+ return status==='reviewed'?{label:'Sources checked',tone:''}:{label:'Archived report',tone:'neutral'};
+}
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite=v=>v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));
 const usd=(v,d=2)=>finite(v)?new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',minimumFractionDigits:d,maximumFractionDigits:d}).format(Number(v)):'—';
@@ -12,21 +56,36 @@ const date=v=>v&&Number.isFinite(Date.parse(v))?new Intl.DateTimeFormat('en-US',
 const age=v=>{if(!v||!Number.isFinite(Date.parse(v)))return 'Unknown';const m=Math.max(0,(Date.now()-Date.parse(v))/60000);return m<1?'Just now':m<60?Math.floor(m)+'m ago':m<1440?Math.floor(m/60)+'h ago':Math.floor(m/1440)+'d ago'};
 const safeURL=v=>{try{const u=new URL(v,location.origin);return ['http:','https:'].includes(u.protocol)&&!u.username&&!u.password?u.href:''}catch{return ''}};
 function toast(text){$('toast').textContent=text;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').textContent='',5500)}
-async function api(path,method='GET',body){const r=await fetch(path,{method,headers:{'X-Local-Token':window.AETHER_TOKEN,...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body)});const text=await r.text();let data;try{data=JSON.parse(text)}catch{data={error:text.slice(0,200)}}if(!r.ok)throw Error(data.error||data.detail?.map?.(x=>x.msg).join('; ')||'Request failed ('+r.status+')');return data}
+async function api(path,method='GET',body){const response=await fetch(path,{method,cache:'no-store',headers:{'X-Local-Token':window.AETHER_TOKEN,...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body)});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={error:text.slice(0,200)}}if(!response.ok)throw Error(data.error||data.detail?.map?.(item=>item.msg).join('; ')||'Request failed ('+response.status+')');return data}
 function markdown(text,verified=null){
  const inline=line=>line.replace(/\[([^\]]+)\]\(([^)]+)\)/g,(_,label,url)=>{
   const safe=safeURL(url);if(!safe)return label;let attrs='';const parsed=new URL(safe),match=parsed.pathname.match(/^\/api\/sessions\/([a-f0-9]{32})\/evidence\/([a-z0-9-]+)$/);
   if(verified&&parsed.origin===location.origin&&match&&window.AetherDesk){const context=window.AetherDesk.answerContext(line,match[2],verified);if(context)attrs=`data-source="${esc(match[2])}" data-source-session="${esc(match[1])}" data-evidence-context="${window.AetherDesk.remember(context)}"`}
-  return `<a href="${esc(safe)}" ${url.includes('/evidence/')?'data-source-link':''} ${attrs} target="_blank" rel="noopener">${label}</a>`;
- }).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
+  return `<a href="${esc(safe)}" ${url.includes('/evidence/')?'data-source-link':''} ${/^\d+$/.test(label)?'class="inline-citation"':''} ${attrs} target="_blank" rel="noopener">${label}</a>`;
+ }).replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>').replace(/`([^`]+)`/g,'<code>$1</code>');
  let output='',paragraph=[],list='',code=null;
- const flush=()=>{if(paragraph.length){output+='<p>'+paragraph.join('<br>')+'</p>';paragraph=[]}if(list){output+='</'+list+'>';list=''}};
- for(const raw of esc(text).split('\n')){
+ const flush=()=>{if(paragraph.length){output+='<p>'+paragraph.join(' ')+'</p>';paragraph=[]}if(list){output+='</'+list+'>';list=''}};
+ const lines=esc(text).split('\n');
+ const cells=line=>line.trim().replace(/^\||\|$/g,'').split('|').map(cell=>cell.trim());
+ for(let index=0;index<lines.length;index++){
+  const raw=lines[index];
   if(raw.startsWith('```')){flush();if(code!==null){output+='<pre><code>'+code.join('\n')+'</code></pre>';code=null}else code=[];continue}
   if(code!==null){code.push(raw);continue}
+  if(raw.includes('|')&&/^\s*\|?\s*:?-{3,}/.test(lines[index+1]||'')&&cells(lines[index+1]).every(cell=>/^:?-{3,}:?$/.test(cell))){
+   flush();
+   output+='<div class="chat-table-wrap"><table><thead><tr>'+cells(raw).map(cell=>'<th>'+inline(cell)+'</th>').join('')+'</tr></thead><tbody>';
+   index++;
+   while(lines[index+1]?.trim()&&lines[index+1].includes('|')){
+    index++;
+    output+='<tr>'+cells(lines[index]).map(cell=>'<td>'+inline(cell)+'</td>').join('')+'</tr>';
+   }
+   output+='</tbody></table></div>';
+   continue;
+  }
   const line=inline(raw),heading=line.match(/^(#{1,4})\s+(.+)$/),bullet=line.match(/^\s*[-*]\s+(.+)$/),numbered=line.match(/^\s*\d+\.\s+(.+)$/);
   if(!line.trim()){flush();continue}
   if(heading){flush();const level=Math.min(heading[1].length+1,4);output+='<h'+level+'>'+heading[2]+'</h'+level+'>';continue}
+  if(/^&gt;\s?/.test(line)){flush();output+='<blockquote>'+line.replace(/^&gt;\s?/,'')+'</blockquote>';continue}
   if(bullet||numbered){const type=bullet?'ul':'ol';if(list!==type){flush();output+='<'+type+'>';list=type}output+='<li>'+(bullet||numbered)[1]+'</li>';continue}
   if(list)flush();paragraph.push(line);
  }
@@ -38,94 +97,655 @@ const indicator=key=>state.dashboard.indicators?.[key]||{};
 const val=(key,metric)=>item(key).record?.values?.[metric];
 const iv=(key,metric)=>indicator(key).record?.values?.[metric];
 function metricRow(label,value,note,rid,cls=''){return `<div class="metric-row"><div>${esc(label)}<small>${esc(note)}</small></div><div class="metric-value"><strong class="${cls}">${esc(value)}</strong><small>${sourceButton(rid,'Source ↗')}</small></div></div>`}
-function renderData(){const quote=item('eth_price'),btc=item('btc_price'),daily=indicator('eth_30d'),i=state.dashboard.items;
- const stats=[['Ethereum',usd(quote.record?.values.price_usd),'Coinbase · '+age(quote.record?.observed_at),quote.record?.record_id,''],['Bitcoin reference',usd(btc.record?.values.price_usd,0),'Coinbase · '+age(btc.record?.observed_at),btc.record?.record_id,''],['30D return',pct(daily.record?.values.return_fraction),'Completed daily closes',daily.record?.record_id,color(daily.record?.values.return_fraction)],['30D realized volatility',finite(daily.record?.values.annualized_volatility_fraction)?(Number(daily.record.values.annualized_volatility_fraction)*100).toFixed(2)+'%':'—','Annualized · 365-day convention',daily.record?.record_id,'']];
- $('stats-grid').innerHTML=stats.map(([label,value,note,rid,cls])=>`<div class="stat-card"><div class="stat-label"><span>${label}</span>${sourceButton(rid,'↗')}</div><div class="stat-number ${cls}">${value}</div><div class="stat-foot">${esc(note)}${[quote,btc].some(x=>x.record?.record_id===rid&&x.status!=='ok')?' · Last saved value':''}</div></div>`).join('');
- $('chart-price').textContent=usd(quote.record?.values.price_usd);
- const range=iv(state.period===1?'eth_24h':'eth_'+state.period+'d','return_fraction');$('chart-performance').textContent=finite(range)?pct(range)+' closed-window return':'';$('chart-performance').className=color(range);
- $('risk-metrics').innerHTML=[metricRow('Maximum drawdown',pct(iv('eth_30d','max_drawdown_fraction')),'30 completed periods',daily.record?.record_id),metricRow('ETH / BTC',pct(iv('eth_btc_7d','relative_return_fraction')),'7D price-ratio change',indicator('eth_btc_7d').record?.record_id,color(iv('eth_btc_7d','relative_return_fraction'))),metricRow('Bid–ask spread',finite(iv('execution','spread_bps'))?Number(iv('execution','spread_bps')).toFixed(2)+' bps':'—','Coinbase snapshot',indicator('execution').record?.record_id),metricRow('Open interest',compact(val('open_interest','open_interest_usd')),'OKX · USD exposure',item('open_interest').record?.record_id),metricRow('OI exposure change',pct(iv('oi_change','oi_change_fraction')),indicator('oi_change').record?'Saved interval: '+date(indicator('oi_change').record.calculation_meta.window_start)+' – '+date(indicator('oi_change').record.calculation_meta.window_end):'Comparable snapshot history unavailable',indicator('oi_change').record?.record_id),metricRow('Funding rate',finite(val('funding','funding_rate_fraction'))?(Number(val('funding','funding_rate_fraction'))*100).toFixed(4)+'%':'—','OKX · per settlement period',item('funding').record?.record_id)].join('');
- $('execution-metrics').innerHTML=[metricRow('Aggregate reference',usd(val('reference_price','reference_price_usd')),'CoinGecko · '+age(item('reference_price').record?.observed_at),item('reference_price').record?.record_id),metricRow('Visible ask depth',compact(val('orderbook','top25_ask_depth_usd')),'First 25 levels only',item('orderbook').record?.record_id),metricRow('Stablecoin supply',compact(val('stablecoins','circulating_value_usd')),'Ethereum · stock, not inflow',item('stablecoins').record?.record_id),metricRow('Ethereum TVL',compact(val('tvl','tvl_usd')),'Provider coverage · stock',item('tvl').record?.record_id)].join('');
- $('volume-funding-metrics').innerHTML=[metricRow('24H closed-price return',pct(iv('eth_24h','return_fraction')),'Completed hourly closes',indicator('eth_24h').record?.record_id),metricRow('7D completed return',pct(iv('eth_7d','return_fraction')),'Completed daily closes',indicator('eth_7d').record?.record_id),metricRow('30D ETH traded',finite(iv('eth_30d','period_volume_asset'))?new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(Number(iv('eth_30d','period_volume_asset')))+' ETH':'—','Coinbase · asset volume',daily.record?.record_id),metricRow('Latest daily volume change',pct(iv('eth_30d','latest_volume_vs_prior_average_fraction')),'Versus preceding 29-day average',daily.record?.record_id),metricRow('DEX volume',compact(val('dex_volume','volume_24h_usd')),'Ethereum covered protocols · rolling 24h',item('dex_volume').record?.record_id),metricRow('Settled funding median',finite(iv('funding_distribution','median_settled_rate_fraction'))?(Number(iv('funding_distribution','median_settled_rate_fraction'))*100).toFixed(4)+'%':'—',indicator('funding_distribution').record?'OKX · '+indicator('funding_distribution').record.calculation_meta.interval_hours+'h settlements':'Mixed intervals or insufficient history',indicator('funding_distribution').record?.record_id),metricRow('Funding empirical percentile',finite(iv('funding_distribution','empirical_percentile_fraction'))?(Number(iv('funding_distribution','empirical_percentile_fraction'))*100).toFixed(0)+'%':'—','Saved equal-interval sample only; not market-wide crowding',indicator('funding_distribution').record?.record_id)].join('');
- const ok=Object.values(i).filter(x=>x.status==='ok').length,total=Object.keys(i).length;
- $('coverage').textContent=ok+' / '+total+' sources available · saved inputs retained';$('freshness').textContent=state.dashboard.refreshing?'Refreshing…':'Updated '+age(state.dashboard.updated_at);
- $('data-connections').innerHTML=Object.entries(i).map(([key,r])=>metricRow(key.replaceAll('_',' '),r.status==='ok'?'Available':'Unavailable',r.record?'Observed '+date(r.record.observed_at):'No saved data',r.record?.record_id,r.status==='ok'?'positive':'negative')).join('');renderChart()}
-function renderChart(){const row=item(state.period===1?'eth_hourly':'eth_candles').record;let rows=row?.series?.slice(-(state.period===1?25:state.period+1))||[];rows=rows.filter(r=>['close_usd','open_usd','high_usd','low_usd'].every(k=>finite(r[k])));const box=$('market-chart');if(rows.length<2){box.innerHTML='<div class="empty">No completed candles available for this window.<br>Refresh data to check the source.</div>';return}
- const W=Math.max(280,box.clientWidth),H=Math.max(230,box.clientHeight),L=7,R=68,T=16,B=39,plotH=H-T-B-42,plotW=W-L-R;
- const max=Math.max(...rows.map(r=>Number(r.high_usd))),min=Math.min(...rows.map(r=>Number(r.low_usd))),pad=(max-min)*.09||max*.01,hi=max+pad,lo=min-pad;
- const x=n=>L+(n+.5)*plotW/rows.length,y=p=>T+(hi-Number(p))/(hi-lo)*plotH,volMax=Math.max(...rows.map(r=>Number(r.volume_asset)||0),1);let svg='';
- for(let k=0;k<5;k++){const yy=T+k*plotH/4,p=hi-k*(hi-lo)/4;svg+=`<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#eef0f6" stroke-dasharray="3 5"/><text x="${W-R+12}" y="${yy+4}" fill="#a0a6b6" font-size="10">${usd(p,0)}</text>`}
- const width=Math.max(2,plotW/rows.length*.52);
- rows.forEach((r,n)=>{const up=Number(r.close_usd)>=Number(r.open_usd),c=up?'#5ca292':'#cf8692',yy=Math.min(y(r.open_usd),y(r.close_usd)),hh=Math.max(1,Math.abs(y(r.close_usd)-y(r.open_usd)));if(!state.line)svg+=`<line x1="${x(n)}" y1="${y(r.high_usd)}" x2="${x(n)}" y2="${y(r.low_usd)}" stroke="${c}"/><rect x="${x(n)-width/2}" y="${yy}" width="${width}" height="${hh}" rx=".6" fill="${c}"/>`;const vh=(Number(r.volume_asset)||0)/volMax*29;svg+=`<rect x="${x(n)-width/2}" y="${H-B-vh}" width="${width}" height="${vh}" fill="${up?'#e3efeb':'#f2e5e9'}"/>`});
- if(state.line){const points=rows.map((r,n)=>`${x(n)},${y(r.close_usd)}`).join(' ');svg+=`<polyline points="${points}" fill="none" stroke="#8075ca" stroke-width="2.3" stroke-linejoin="round"/>`}
- for(let k=0;k<4;k++){const n=Math.round(k*(rows.length-1)/3),label=new Intl.DateTimeFormat('en-US',state.period===1?{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Shanghai'}:{month:'short',day:'numeric',timeZone:'Asia/Shanghai'}).format(new Date(rows[n].period_end||rows[n].observed_at));svg+=`<text x="${x(n)}" y="${H-12}" text-anchor="middle" fill="#a2a9b7" font-size="10">${label}</text>`}
- box.innerHTML=`<svg id="chart-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Ethereum completed ${state.period===1?'hourly':'daily'} price candles and volume">${svg}<line id="crosshair" y1="${T}" y2="${H-B}" stroke="#bcb6d8" stroke-dasharray="3 4" visibility="hidden"/></svg><div class="chart-tooltip" id="chart-tooltip" hidden></div>`;
- $('chart-scope').innerHTML='Coinbase · '+rows.length+' completed '+(state.period===1?'hourly':'daily')+' candles · volume in ETH '+sourceButton(row.record_id,'Source ↗');$('chart-date').textContent=date(rows.at(-1).period_end||rows.at(-1).observed_at);
- $('chart-svg').addEventListener('pointermove',e=>{const rect=e.currentTarget.getBoundingClientRect(),px=(e.clientX-rect.left)/rect.width*W,n=Math.max(0,Math.min(rows.length-1,Math.floor((px-L)/plotW*rows.length))),r=rows[n];$('crosshair').setAttribute('x1',x(n));$('crosshair').setAttribute('x2',x(n));$('crosshair').setAttribute('visibility','visible');$('chart-tooltip').hidden=false;$('chart-tooltip').textContent=date(r.observed_at)+' · O '+usd(r.open_usd)+'  H '+usd(r.high_usd)+'  L '+usd(r.low_usd)+'  C '+usd(r.close_usd)});
- $('chart-svg').addEventListener('pointerleave',()=>{$('crosshair').setAttribute('visibility','hidden');$('chart-tooltip').hidden=true})}
-async function loadData(refresh=false){if(refresh)await api('/api/dashboard/refresh','POST',{});state.dashboard=await api('/api/dashboard');renderData()}
-function newsRow(r,short=false){let host;try{host=new URL(r.url).hostname.replace(/^www\./,'')}catch{host='Saved source'}const label={page:'Original page',search_excerpt:'Search excerpt',feed_item:'Publisher feed'}[r.source_kind]||'Saved source';return `<article class="news-row"><div class="news-icon">◷</div><div><button data-source="${esc(r.record_id)}"><h3>${esc(r.title)}</h3></button><p>${esc(host)} · ${r.published_at?esc(date(r.published_at)):'Publication date unknown'} · <span class="pill neutral">${label}</span></p>${short?'':`<p class="excerpt">${esc(r.excerpt?.slice(0,360))}</p>${sourceButton(r.record_id)}`}</div></article>`}
-async function loadNews(){const q=$('news-query').value.trim();const data=await api('/api/news?query='+encodeURIComponent(q));state.news=data.items;$('news-count').textContent=data.items.length;const filtered=$('news-window').value==='week'?data.items.filter(r=>r.published_at&&Date.now()-Date.parse(r.published_at)>=0&&Date.now()-Date.parse(r.published_at)<=7*86400000):data.items;$('news-list').innerHTML=filtered.length?filtered.map(r=>newsRow(r)).join(''):'<div class="card empty">No saved publications match this window.<br>Ask the analyst to search live sources.</div>';$('overview-news').innerHTML=data.items.some(r=>r.source_kind!=='search_excerpt')?data.items.filter(r=>r.source_kind!=='search_excerpt').slice(0,3).map(r=>newsRow(r,true)).join(''):'<div class="empty">No saved sources yet. Search recent announcements with the analyst.</div>';const events=await api('/api/news/events');$('event-strip').innerHTML=events.items.slice(0,6).map(e=>`<article class="event-card"><span class="pill neutral">${esc(e.status)}</span><h3>${esc(e.title)}</h3><p>${esc(e.summary)}</p><p>Source-reviewed classification · version ${e.version} · ${sourceButton(e.evidence_ids[0])}</p></article>`).join('')}
-function reportRow(r){return `<article class="report-row"><div class="report-symbol">▤</div><div><button data-report="${esc(r.report_id)}"><h3>${esc(r.title)}</h3></button><p>${esc(date(r.created_at))} · <span class="pill ${r.review_status==='reviewed'?'':'neutral'}">${r.review_status==='reviewed'?'Sources checked':'Archived report'}</span></p></div></article>`}
-async function loadReports(){const d=await api('/api/reports?query='+encodeURIComponent($('report-query').value.trim()));state.reports=d.items;$('reports-list').innerHTML=d.items.length?d.items.map(reportRow).join(''):'<div class="card empty">Your research reports will appear here.<br>Start a research brief to build your evidence-backed history.</div>';$('overview-reports').innerHTML=d.items.length?d.items.slice(0,3).map(reportRow).join(''):'<div class="empty">No published reports yet.</div>'}
+function renderData(){
+ const market=state.dashboard;
+ const quote=item('eth_price').record, hourly=item('eth_hourly').record, daily=item('eth_candles').record;
+ const rate24=indicator('eth_24h').record, rate7=indicator('eth_7d').record, risk=indicator('eth_30d').record;
+ const close=quote?.values?.price_usd??daily?.values?.close_usd;
+ const priceSource=quote?.values?.price_usd!=null?quote:daily;
+ const volumeRows=hourly?.series?.slice(-24)||[];
+ const volume=volumeRows.length===24&&volumeRows.every((row,n)=>finite(row.volume_asset)&&
+  (n===0||Date.parse(row.period_end)-Date.parse(volumeRows[n-1].period_end)===3600000))?
+  volumeRows.reduce((sum,row)=>sum+Number(row.volume_asset),0):null;
+ const rows=[
+  ['ETH price',usd(close),(priceSource===daily?'Last completed candle':'Coinbase spot')+' · '+age(priceSource?.observed_at),priceSource?.record_id,''],
+  ['24h change',pct(rate24?.values?.return_fraction),'Completed hourly prices',rate24?.record_id,color(rate24?.values?.return_fraction)],
+  ['7d change',pct(rate7?.values?.return_fraction),'Completed daily prices',rate7?.record_id,color(rate7?.values?.return_fraction)],
+  ['24h trading volume',finite(volume)?new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(volume)+' ETH':'—','Coinbase · completed hours',hourly?.record_id,''],
+ ];
+ $('today-market').innerHTML=rows.map(([label,value,note,rid,cls])=>
+  `<div class="stat-card"><div class="stat-label"><span>${esc(label)}</span>${sourceButton(rid,'↗')}</div><div class="stat-number ${cls}">${esc(value)}</div><div class="stat-foot">${esc(note)}</div></div>`).join('');
+ $('chart-price').textContent=usd(close);
+ const range=iv(state.period===1?'eth_24h':'eth_'+state.period+'d','return_fraction');
+ $('chart-performance').textContent=finite(range)?pct(range)+' for this period':'';
+ $('chart-performance').className=color(range);
+
+ const volatility=iv('eth_30d','annualized_volatility_fraction'), spread=iv('execution','spread_bps'), funding=val('funding','funding_rate_fraction');
+ const advanced=[
+  metricRow('30d annualized volatility',finite(volatility)?(Number(volatility)*100).toFixed(2)+'%':'—','Completed daily prices',risk?.record_id),
+  metricRow('30d maximum drawdown',pct(iv('eth_30d','max_drawdown_fraction')),'Completed daily prices',risk?.record_id),
+  metricRow('Bid–ask spread',finite(spread)?Number(spread).toFixed(2)+' bps':'—','Coinbase snapshot',indicator('execution').record?.record_id),
+  metricRow('Perpetual funding rate',finite(funding)?(Number(funding)*100).toFixed(4)+'%':'—','OKX · per settlement',item('funding').record?.record_id),
+  metricRow('Perpetual open interest',compact(val('open_interest','open_interest_usd')),'OKX · USD exposure',item('open_interest').record?.record_id),
+  metricRow('Ethereum TVL',compact(val('tvl','tvl_usd')),'Saved chain observation',item('tvl').record?.record_id),
+  metricRow('Ethereum DEX volume',compact(val('dex_volume','volume_24h_usd')),'Covered protocols · rolling 24h',item('dex_volume').record?.record_id),
+ ];
+ $('risk-metrics').innerHTML=advanced.join('');
+ $('coverage').textContent='Times and sources are available with each metric.';
+ $('freshness').textContent=market.refreshing?'Updating prices…':market.updated_at?'Data updated '+age(market.updated_at):'Waiting for data';
+ const connectionLabels={eth_price:'ETH spot price',eth_candles:'ETH daily history',eth_hourly:'ETH hourly history',orderbook:'Order book',funding:'Funding rate',open_interest:'Open interest',tvl:'Ethereum TVL',dex_volume:'Ethereum DEX volume'};
+ $('data-connections').innerHTML=Object.entries(connectionLabels).map(([key,label])=>{
+  const source=item(key);
+  return metricRow(label,source.status==='ok'?'Available':'Unavailable',source.record?'Observed '+date(source.record.observed_at):'No saved observation',source.record?.record_id);
+ }).join('');
+ renderPriceChart();
+}
+async function loadData(refresh=false){
+ if(refresh)await api('/api/dashboard/refresh','POST',{});
+ state.dashboard=await api('/api/dashboard');
+ renderData();
+}
+function reportRow(r){const badge=reportDeliveryBadge(r.delivery_kind,r.review_status);return `<article class="report-row"><div class="report-symbol">▤</div><div><button data-report="${esc(r.report_id)}"><h3>${esc(r.title)}</h3></button><p>${esc(date(r.created_at))} · <span class="pill ${badge.tone}">${badge.label}</span></p></div></article>`}
+async function loadReports(){
+ const query=$('report-query').value.trim();
+ const data=await api('/api/reports?query='+encodeURIComponent(query));
+ if(query!==$('report-query').value.trim())return;
+ state.reports=data.items;
+ $('reports-list').innerHTML=data.items.length?data.items.map(reportRow).join(''):
+  `<div class="card empty">${query?'No reports match this search.':'Your research reports will appear here.'}</div>`;
+}
+function reportToolbar(id){
+ return `<div class="report-reader-toolbar"><button class="text-button" data-report-back>← All reports</button><a class="button primary" href="/api/reports/${encodeURIComponent(id)}/pdf" download="aether-${esc(id)}.pdf">Export PDF ↓</a></div>`;
+}
+
+function beginReport(id){
+ selectView('reports');
+ $('report-list-view').hidden=true;
+ const box=$('report-detail');
+ box.dataset.reportId=id;
+ box.hidden=false;
+ box.innerHTML=reportToolbar(id)+'<p class="empty" role="status">Opening report…</p>';
+ window.scrollTo({top:0,behavior:'instant'});
+ return box;
+}
+
+function reportSummaryHTML(summary){
+ const text=String(summary||'');
+ const sentences=text.match(/[\s\S]+?(?:[.!?](?=\s|$)|[。！？]|$)/g)||[text];
+ let lead=sentences[0]||text;
+ if(sentences[1]&&(lead+sentences[1]).length<=280)lead+=sentences[1];
+ const remaining=text.slice(lead.length).trim();
+ return `<p class="report-summary">${esc(lead.trim())}</p>${remaining?`<details class="report-summary-more"><summary>Read the rest of the summary</summary><p>${esc(remaining)}</p></details>`:''}`;
+}
 function adviceSourceIDs(a){if(!a)return [];return [...new Set([...(a.context_evidence_ids||[]),...['rationale','conditions','counterpoints','invalidation'].flatMap(k=>(a[k]||[]).flatMap(c=>c.evidence_ids)),...(a.historical_cases||[]).flatMap(c=>c.evidence_ids)])]}
 function adviceHTML(a,claims,sid){if(!a)return '';let body=`<section class="advice-section"><h2>Conditional research suggestion</h2><span class="pill neutral">${a.scope==='user_context'?'Supplied personal context':'General market research'}</span><p class="body-copy">${esc(a.summary)} ${adviceSourceIDs(a).map(rid=>sourceButton(rid,'View evidence ↗',sid)).join(' ')}</p>`;if(a.horizon_days)body+=`<p>Research horizon: ${esc(a.horizon_days)} days</p>`;for(const [label,key] of [['Evidence & reasoning','rationale'],['Conditions to investigate','conditions'],['Counterevidence','counterpoints'],['Revisit or invalidate when','invalidation']])if(a[key]?.length)body+=`<h3>${label}</h3>`+claims(a[key]);for(const c of a.historical_cases||[]){body+=`<h3>Historical comparison · ${esc(c.name)}</h3><p>${esc(date(c.case_end))} · ${c.evidence_ids.map(rid=>sourceButton(rid,'View case evidence ↗',sid)).join(' ')}</p><p class="card-note">${c.availability==='point_in_time'?'Saved availability receipts checked against case end.':'Retrospective observed history; historical public availability is not established.'}</p>`;for(const [label,key] of [['Similarities','similarities'],['Material differences','differences'],['Limits of transfer','limitations']])body+=`<strong>${label}</strong><ul>${(c[key]||[]).map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`}for(const [label,key] of [['Scenario assumptions','assumptions'],['Missing information','missing_information'],['What would prompt another review','review_triggers']])if(a[key]?.length)body+=`<h3>${label}</h3><ul>${a[key].map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`;return body+'</section>'}
-async function showReport(id){const meta=state.reports.find(r=>r.report_id===id);if(!meta)return;selectView('reports');const r=await api(`/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.json')}`),d=r.report;
- const all=[...d.observations,...(d.key_changes||[]),...d.interpretations],extra=(d.forecasts||[]).flatMap(f=>[...f.supporting_evidence_ids,...f.counter_evidence_ids]),purchase=d.purchase_decision?[...d.purchase_decision.conditions_to_consider,...d.purchase_decision.reasons_to_wait].flatMap(c=>c.evidence_ids):[],ids=[...new Set([...all.flatMap(c=>c.evidence_ids),...extra,...purchase,...adviceSourceIDs(d.advice)])],numbers=Object.fromEntries(ids.map((v,n)=>[v,n+1]));
- const claims=list=>(list||[]).map(c=>`<div class="statement">${esc(c.statement)} ${c.evidence_ids.map(rid=>sourceButton(rid,'['+(numbers[rid]||'Source')+']',meta.session_id,window.AetherDesk?.claimContext(c,d,r.review))).join(' ')}${c.metric?`<details class="numeric-detail"><summary>${c.unit==='fraction'&&Number.isFinite(Number(c.value))?'About '+(Number(c.value)*100).toLocaleString(undefined,{maximumFractionDigits:2})+'% · exact value':'Exact saved numeric field'}</summary><small>${esc(c.metric)} = ${esc(c.value)} ${esc(c.unit)}</small></details>`:''}</div>`).join('');
- let body=`<div class="card-heading"><span class="pill">${r.review?.status==='reviewed'?'Source-reviewed research':'Archived research'}</span><span class="muted">${esc(date(r.created_at))}</span></div><h1>${esc(d.title)}</h1><p class="body-copy">${esc(d.summary)}</p><p>${ids.map(rid=>sourceButton(rid,'['+numbers[rid]+']',meta.session_id)).join(' ')}</p>${d.key_changes?.length?'<h2>Recent key changes</h2>'+claims(d.key_changes):''}<h2>Main facts</h2>${claims(d.observations)}${d.interpretations?.length?'<h2>What this may mean</h2>'+claims(d.interpretations):''}${d.judgment_reason?'<h2>Research judgment</h2><p>'+esc(d.judgment_reason)+'</p>':''}`;
- if(d.questions_to_watch?.length)body+='<h2>Questions to follow up</h2><p class="card-note">Open questions and proposed checks, not confirmed developments.</p><ul>'+d.questions_to_watch.map(q=>'<li>'+esc(q)+'</li>').join('')+'</ul>';
- if(d.forecasts?.length)body+='<h2>Conditional outlook</h2>'+d.forecasts.map(f=>`<p>${esc(f.statement)} ${[...f.supporting_evidence_ids,...f.counter_evidence_ids].map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p><small>${esc(f.uncertainty)}</small>`).join('');
- if(d.purchase_decision){const p=d.purchase_decision;body+='<h2>Decision context</h2>';for(const [label,rows] of [['Conditions to investigate',p.conditions_to_consider],['Reasons to wait',p.reasons_to_wait]])body+=`<h3>${label}</h3>`+rows.map(x=>`<p>${esc(x.condition)} ${x.evidence_ids.map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p>`).join('');for(const [label,rows] of [['Invalidation conditions',p.invalidation_conditions],['Missing information',p.missing_information],['What to monitor',p.monitor],['Costs & execution assumptions',p.cost_and_execution_notes]])body+=`<h3>${label}</h3><ul>${rows.map(x=>'<li>'+esc(x)+'</li>').join('')}</ul>`}
- body+=adviceHTML(d.advice,claims,meta.session_id);
- body+='<h2>Limits & unknowns</h2><ul>'+d.limitations.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul><details class="section-gap"><summary>Claim-level source review</summary>';
- for(const v of r.review?.verdicts||[])body+=`<details class="review-item"><summary><span class="pill ${['contradicted','insufficient'].includes(v.status)?'warn':'neutral'}">${esc(v.status.replaceAll('_',' '))}</span> ${esc(v.claim_id)} · ${esc(v.reason)}</summary>${v.quotes.map(q=>`<blockquote>${esc(q.text)}</blockquote>${sourceButton(q.record_id,'View source ↗',meta.session_id)}`).join('')}</details>`;
- body+=`</details><div class="report-actions"><a class="button" href="/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.md')}" target="_blank">Open original report ↗</a></div><p class="card-note">Source support is an inspectable AI assessment. Attribution and repeatability do not establish source truth, causation, or future performance.</p>`;
- const box=$('report-detail');box.innerHTML=body;box.hidden=false;box.scrollIntoView({behavior:'smooth',block:'start'});
- const packages=await api('/api/sessions/'+meta.session_id+'/packages');const pack=packages.find(p=>p.package_id.startsWith(id+'-'));if(pack){const actions=box.querySelector('.report-actions');actions.insertAdjacentHTML('beforeend',`<a class="button primary" href="/api/audits/${pack.package_id}/download">Download evidence ZIP</a><button class="button" data-audit="${pack.package_id}" data-kind="verify">Check integrity</button><button class="button" data-audit="${pack.package_id}" data-kind="replay">Replay calculations</button>`)} }
-async function openSource(rid,sourceSession){const shared=/^(live|page|web)-/.test(rid);if(!shared&&!state.sid)await createSession();sourceSession=sourceSession||state.sid;const dialog=$('source-dialog');$('source-detail').innerHTML='<div class="empty">Loading saved evidence…</div>';if(!dialog.open)dialog.showModal();try{const d=await api(shared?`/api/evidence/${encodeURIComponent(rid)}`:`/api/sessions/${sourceSession}/evidence/${encodeURIComponent(rid)}`),r=d.record,src=r.source||{},kind=r.record_id.startsWith('page-')?'Original page':(r.recipe_sha256||r.quality_flags?.includes('derived'))?'Derived calculation':r.source_kind==='feed_item'?'Publisher feed excerpt':r.record_id.startsWith('web-')?'Search excerpt':'Saved data';$('source-detail').innerHTML=`<span class="pill neutral">${kind}</span><h3>${esc(r.title||src.name||r.dataset_id)}</h3><div class="metadata"><div><small>Observed / effective time</small>${esc(date(r.observed_at))}</div><div><small>Retrieved</small>${esc(date(r.retrieved_at))}</div><div><small>Published</small>${esc(date(r.published_at))}</div><div><small>Snapshot integrity</small>${d.raw_verified?'Raw response verified':r.recipe_sha256?'Saved calculation recipe':'Structured source record'}</div></div>${src.url?`<a href="${esc(safeURL(src.url))}" target="_blank" rel="noopener">Open publisher / API ↗</a>`:''}${r.scope?'<p class="body-copy">'+esc(r.scope)+'</p>':''}${r.text?'<h3>Saved source text</h3><pre>'+esc(r.text)+'</pre>':''}${Object.keys(r.values||{}).length?'<h3>Original numeric fields</h3><pre>'+esc(JSON.stringify({values:r.values,units:r.units},null,2))+'</pre>':''}${r.method?'<h3>Calculation method</h3><pre>'+esc(r.method)+'</pre>':''}${r.input_record_ids?'<h3>Inputs</h3>'+r.input_record_ids.map(i=>sourceButton(i)).join(' · '):''}<details class="section-gap"><summary>Provenance details</summary><pre>${esc(JSON.stringify(r,null,2))}</pre></details><p class="card-note">Publication metadata may be unverified. A valid source pointer and matching snapshot do not guarantee the publisher’s claims.</p>`}catch(e){$('source-detail').innerHTML='<p class="body-copy">'+esc(e.message)+'</p>'}}
-const viewTitles={portfolio:['Portfolio','Your recorded holdings, cost basis, and investment constraints.'],strategies:['Strategy Lab','Train, test, and inspect quantitative research on real market history.'],overview:['Market overview','Price action, market structure, and the evidence behind it.'],research:['Asset research','A clear view of your assumptions, costs, and open questions.'],news:['News & events','Saved publisher material, versions, and source-linked event classifications.'],reports:['Research reports','Your research history, with claims you can inspect.'],watchlist:['Watchlist & alerts','Stay informed without repeating the same research.'],settings:['Workspace settings','Your local engine, data coverage, and validation results.']};
-const workspaceRoutes={home:'today',overview:'today',today:'today','home/news':'news',news:'news',research:'research','research/reports':'reports',reports:'reports','research/updates':'watchlist',watchlist:'watchlist',portfolio:'portfolio','advanced/strategy-lab':'strategies',strategies:'strategies',settings:'settings'};
-const workspacePaths={today:'home',news:'home/news',research:'research',reports:'research/reports',watchlist:'research/updates',portfolio:'portfolio',strategies:'advanced/strategy-lab',settings:'settings'};
-function selectView(requested){
- const view=workspaceRoutes[requested]||'today';
- const group=['today','news'].includes(view)?'home':['research','reports','watchlist'].includes(view)?'research':view;
- window.scrollTo(0,0);state.view=view;document.body.dataset.workspace=group;
- document.querySelectorAll('.view').forEach(n=>n.hidden=n.id!=='view-'+view);
- document.querySelectorAll('.nav-item').forEach(n=>{const active=n.closest('[aria-label="Primary navigation"]')?(n.dataset.view==='today'?'home':n.dataset.view)===group:n.dataset.view===view;n.classList.toggle('active',active);if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current')});
- $('home-navigation').hidden=group!=='home';$('research-navigation').hidden=group!=='research';
- document.querySelectorAll('.section-nav button').forEach(n=>{const active=n.dataset.view===view;n.classList.toggle('selected',active);if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current')});
- $('page-title').textContent=group==='home'?'Home':group==='research'?'Research':viewTitles[view][0];
- $('page-subtitle').textContent=view==='today'?'Market moves, important news, and your latest research.':view==='research'?'Ask about the market. Follow the evidence.':viewTitles[view][1];
- $('breadcrumb').textContent={today:'Home',news:'Home / News',research:'Research',reports:'Research / Reports',watchlist:'Research / Updates',portfolio:'Portfolio',strategies:'Advanced / Strategy Lab',settings:'Settings'}[view];
- $('more-menu').open=false;
- if(view==='research'){loadPurchaseEstimate().catch(e=>toast(e.message));requestAnimationFrame(()=>{$('chat').scrollTop=$('chat').scrollHeight})}
- if(view==='today')renderChart();
- history.replaceState(null,'','#'+workspacePaths[view]);
+
+const reportClock = new Intl.DateTimeFormat('en-GB', {
+ day:'numeric', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit',
+ second:'2-digit', timeZone:'UTC', hourCycle:'h23',
+});
+const reportDay = new Intl.DateTimeFormat('en-GB', {day:'numeric', month:'short', timeZone:'UTC'});
+const reportHour = new Intl.DateTimeFormat('en-GB', {
+ hour:'2-digit', minute:'2-digit', timeZone:'UTC', hourCycle:'h23',
+});
+const reportDocumentRoles = {
+ primary:'Main in-window evidence', background:'Earlier background', correction:'Correction',
+ counterevidence:'Counterevidence', later_update:'Update after this window',
+};
+
+function reportTime(value){
+ const instant=Date.parse(value);
+ return Number.isFinite(instant)
+  ? `<time datetime="${esc(value)}" title="${esc(value)}">${esc(reportClock.format(instant))} UTC</time>`
+  : 'Unknown time';
 }
-async function sessions(){state.sessions=await api('/api/sessions');if(!state.sid){const saved=localStorage.getItem('aether-session');state.sid=state.sessions.some(s=>s.session_id===saved)?saved:state.sessions[0]?.session_id||null}const picker=$('session-picker');picker.innerHTML=state.sessions.length?state.sessions.map(s=>`<option value="${s.session_id}" ${s.session_id===state.sid?'selected':''}>${esc(/[\u3400-\u9fff]/.test(s.title)?'Saved research · '+date(s.created_at):s.title)}</option>`).join(''):'<option>No research session yet</option>'}
-async function createSession(){const s=await api('/api/sessions','POST',{title:'ETH research · '+new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric'}).format(new Date()),research_mode:'current'});state.sid=s.session_id;state.jobKey='';localStorage.setItem('aether-session',state.sid);await sessions();await refreshSession();return s}
+
+function reportOverviewHTML(presentation,sid){
+ const overview=presentation.overview;
+ return `<section class="report-overview" aria-label="Report overview">
+  <div class="report-lead"><h2>Summary</h2>${reportSummaryHTML(overview.summary)}</div>
+  <details class="report-scope-details"><summary>Question, time window and evidence cutoff</summary>
+   <div class="report-question"><h3>Original question</h3><p>${esc(overview.user_prompt)}</p></div>
+   <dl class="report-metadata">
+    <div><dt>Research window</dt><dd>${reportTime(overview.start)} to ${reportTime(overview.end)} <small>(end exclusive)</small></dd></div>
+    <div><dt>Evidence cutoff</dt><dd>${reportTime(overview.evidence_as_of)}</dd></div>
+    <div><dt>Generated</dt><dd>${reportTime(overview.created_at)}</dd></div>
+   </dl>
+  </details>
+ </section>`;
+}
+
+function reportChartSVG(chart,index,points){
+ const start=Date.parse(chart.start),end=Date.parse(chart.end);
+ if(points.length<2||!Number.isFinite(start)||!Number.isFinite(end)||end<=start)return '';
+ const left=59,right=349,top=11,bottom=143;
+ const values=points.map(point=>point.number);
+ const maximum=Math.max(...values),minimum=Math.min(...values);
+ const span=maximum-minimum,padding=span*.07||Math.max(Math.abs(maximum)*.025,.000001);
+ const high=maximum+padding,low=minimum-padding;
+ if(!Number.isFinite(high-low)||high<=low)return '';
+ const x=instant=>left+(instant-start)/(end-start)*(right-left);
+ const y=value=>bottom-(value-low)/(high-low)*(bottom-top);
+ const compactAxis=Math.max(Math.abs(high),Math.abs(low))>=100000;
+ const divisor=compactAxis?1000**Math.floor(Math.log10(Math.max(Math.abs(high),Math.abs(low)))/3):1;
+ const digits=Math.max(0,Math.min(12,Math.ceil(-Math.log10((high-low)/(4*divisor)))+1));
+ const axisNumber=new Intl.NumberFormat('en-US',{notation:compactAxis?'compact':'standard',maximumFractionDigits:digits});
+ const grid=[];
+ for(let tick=0;tick<=4;tick++){
+  const value=low+(high-low)*tick/4,yy=y(value);
+  grid.push(`<path class="report-chart-gridline" d="M${left} ${yy}H${right}"/>
+   <text class="report-chart-axis" x="${left-6}" y="${yy+3}" text-anchor="end">${esc(axisNumber.format(value))}</text>`);
+ }
+ for(const fraction of [0,.5,1]){
+  const instant=start+(end-start)*fraction;
+  const anchor=fraction===0?'start':fraction===1?'end':'middle';
+  grid.push(`<path class="report-chart-gridline report-chart-time-grid" d="M${x(instant)} ${top}V${bottom}"/>
+   <text class="report-chart-axis" x="${x(instant)}" y="158" text-anchor="${anchor}">
+    <tspan x="${x(instant)}">${esc(reportDay.format(instant))}</tspan><tspan x="${x(instant)}" dy="12">${esc(reportHour.format(instant))}</tspan>
+   </text>`);
+ }
+ const segments=[];
+ for(const point of points){
+  if(!segments.length||point.gap_before)segments.push([]);
+  segments.at(-1).push([x(point.instant),y(point.number)]);
+ }
+ const curves=segments.map(segment=>{
+  if(segment.length===1)return `<circle class="report-chart-dot" cx="${segment[0][0]}" cy="${segment[0][1]}" r="2.2"/>`;
+  const coordinates=segment.map(([xx,yy])=>`${xx.toFixed(3)},${yy.toFixed(3)}`).join(' ');
+  return `<polyline class="report-chart-line" points="${coordinates}"/>`;
+ });
+ const name=`${chart.asset} ${chart.title} (${chart.unit})`;
+ const breaks=segments.length-1;
+ return `<svg class="report-chart-svg${chart.metric==='volume_asset'?' report-chart-volume':''}" viewBox="0 0 360 178"
+  role="img" aria-labelledby="report-chart-title-${index} report-chart-desc-${index}">
+  <title id="report-chart-title-${index}">${esc(name)}</title>
+  <desc id="report-chart-desc-${index}">${points.length} observations on a linear time axis in UTC and a linear value axis in ${esc(chart.unit)}.${breaks?` The line breaks across ${breaks} gaps.`:''}</desc>
+  ${grid.join('')}${curves.join('')}
+ </svg>`;
+}
+
+function reportChartHTML(chart,index,sid){
+ const points=(chart.points||[]).map(point=>({...point,instant:Date.parse(point.at),number:Number(point.value)}))
+  .filter(point=>Number.isFinite(point.instant)&&finite(point.value));
+ const svg=reportChartSVG(chart,index,points);
+ const coverage=chart.coverage||{};
+ const gap=coverage.internal_gap_count>0||coverage.starts_after_window||coverage.ends_before_window;
+ const sample=points.length?[points[0],points.at(-1)]:[];
+ const links=(chart.sources||[]).map(source=>sharedSourceLink(source.url,source.publisher+' ↗')).filter(Boolean);
+ return `<figure class="report-chart-card">
+  <figcaption><h3>${esc(chart.asset)} ${esc(chart.title)}</h3>
+   <p class="report-chart-meta">${esc(reportPublisher(chart.provider))} · ${esc(chart.frequency)} · ${esc(chart.unit)} · ${points.length} saved observations</p></figcaption>
+  ${svg||'<p class="body-copy">Chart preview unavailable. Open the saved evidence for the original values.</p>'}
+  ${gap?'<p class="report-chart-gap">Coverage is incomplete within the research window.</p>':''}
+  <div class="report-evidence-links">${sourceButton(chart.evidence_id,'Inspect saved series ↗',sid)}</div>
+  <details class="report-chart-details"><summary>Exact endpoint values and sources</summary>
+   ${sample.length?`<dl>${sample.map((point,n)=>`<div><dt>${n===0?'First point':'Last point'}</dt>
+    <dd>${esc(point.value)} ${esc(chart.unit)} · ${reportTime(point.at)} ${sourceButton(point.evidence_id,'Evidence ↗',sid)}</dd></div>`).join('')}</dl>`:''}
+   ${links.length?`<p class="report-evidence-links">${links.join(' ')}</p>`:''}
+  </details>
+ </figure>`;
+}
+
+function reportPublisher(value){
+ const names={ethereum:'Ethereum Foundation',bitstamp:'Bitstamp',coinbase:'Coinbase',lido:'Lido Research',
+  aave:'Aave Governance',federal_reserve:'Federal Reserve',sec:'SEC',okx:'OKX'};
+ return Object.hasOwn(names,value)?names[value]:value;
+}
+
+function reportDocumentsHTML(documents,sid,review){
+ if(!documents.length)return '';
+ const verdicts=new Map((review?.verdicts||[]).map(verdict=>[verdict.claim_id,verdict.status]));
+ return `<section class="report-featured-documents" aria-label="Important documents"><h2>Important documents</h2>
+  ${documents.map((doc,index)=>{
+   const reviewed=['supported','reasonable_inference'].includes(verdicts.get('DOC'+(index+1)));
+   return `<article class="report-document-card">
+    <span class="pill neutral">${esc(reportDocumentRoles[doc.role]||'Saved original')}</span>
+    <h3>${esc(doc.title)}</h3><p class="report-document-publisher">${esc(reportPublisher(doc.publisher))}</p>
+    <p class="report-document-relevance">${esc(doc.relevance)}</p>
+    <div class="report-evidence-links">${sourceButton(doc.evidence_id,'Read saved original ↗',sid)} ${sharedSourceLink(doc.url,'Captured publication ↗')}</div>
+    <details class="report-source-excerpt"><summary>Quoted passage and dates${reviewed?' · source checked':''}</summary>
+     <blockquote>${esc(doc.quote)}</blockquote>
+     <dl class="report-metadata"><div><dt>Published</dt><dd>${reportTime(doc.published_at)}</dd></div>
+      <div><dt>Captured</dt><dd>${reportTime(doc.retrieved_at)}</dd></div></dl>
+    </details>
+   </article>`;
+  }).join('')}
+ </section>`;
+}
+
+function reportMetricCards(draft,numbers,sid,review){
+ const numeric=(draft.observations||[]).filter(claim=>claim.metric&&finite(claim.value));
+ const selected=[];
+ for(const pattern of [/^(close_usd|price_usd)$/, /return|change/, /volatility/]){
+  const claim=numeric.find(item=>pattern.test(item.metric)&&!selected.includes(item));
+  if(claim)selected.push(claim);
+ }
+ for(const claim of numeric)if(selected.length<3&&!selected.includes(claim))selected.push(claim);
+ if(!selected.length)return '';
+ const labels=[[/return|change/,'Period change'],[/volatility/,'Annualized volatility'],[/close|price/,'Closing price'],
+  [/high/,'Period high'],[/low/,'Period low'],[/volume/,'Trading volume'],[/tvl/,'DeFi TVL'],[/stablecoin/,'Stablecoin supply']];
+ return '<div class="report-key-metrics">'+selected.map(claim=>{
+  const label=labels.find(([pattern])=>pattern.test(claim.metric))?.[1]||'Key measure';
+  let value=new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(claim.value))+' '+claim.unit;
+  if(claim.unit==='USD')value=usd(claim.value);
+  if(claim.unit==='fraction')value=/return|change/.test(claim.metric)?pct(claim.value):(Number(claim.value)*100).toFixed(2)+'%';
+  return `<div class="report-key-metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><details><summary>Measurement details</summary><p>${esc(claim.statement)}</p>${claim.evidence_ids.map(rid=>sourceButton(rid,'['+numbers[rid]+']',sid,window.AetherDesk?.claimContext(claim,draft,review))).join(' ')}</details></div>`;
+ }).join('')+'</div>';
+}
+
+async function showReport(id){
+ let meta=state.reports.find(report=>report.report_id===id);
+ if(!meta){$('report-query').value='';await loadReports();meta=state.reports.find(report=>report.report_id===id)}
+ if(!meta){toast('This report is unavailable.');return}
+ const box=beginReport(id);
+ let packet;
+ try{packet=await api(`/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.json')}`)}
+ catch(error){if(box.dataset.reportId===id)box.innerHTML=reportToolbar(id)+'<p class="empty">'+esc(error.message)+'</p>';return}
+ if(box.dataset.reportId!==id)return;
+ const draft=packet.report,presentation=packet.presentation?.version==='report-presentation-v1'?packet.presentation:null;
+ const charts=presentation?.charts||[],documents=presentation?.documents||[];
+ const all=[...(draft.observations||[]),...(draft.key_changes||[]),...(draft.interpretations||[])];
+ const extra=(draft.forecasts||[]).flatMap(forecast=>[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids]);
+ const purchase=draft.purchase_decision?[...draft.purchase_decision.conditions_to_consider,...draft.purchase_decision.reasons_to_wait].flatMap(condition=>condition.evidence_ids):[];
+ const ids=[...new Set([...all.flatMap(claim=>claim.evidence_ids),...extra,...purchase,...adviceSourceIDs(draft.advice),...[...charts,...documents].map(item=>item.evidence_id)])];
+ const numbers=Object.fromEntries(ids.map((value,index)=>[value,index+1]));
+ const claims=list=>(list||[]).map(claim=>`<div class="statement">${esc(claim.statement)} ${claim.evidence_ids.map(rid=>sourceButton(rid,'['+(numbers[rid]||'Source')+']',meta.session_id,window.AetherDesk?.claimContext(claim,draft,packet.review))).join(' ')}${claim.metric?`<details class="numeric-detail"><summary>Exact measurement</summary><small>${esc(claim.metric)} = ${esc(claim.value)} ${esc(claim.unit)}</small></details>`:''}</div>`).join('');
+ const scope=presentation?.overview||draft.scope;
+ const day=new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'});
+ const windowLabel=scope?.start&&scope?.end?day.format(new Date(scope.start))+' – '+day.format(new Date(Date.parse(scope.end)-1))+' · UTC':'';
+ const badge=reportDeliveryBadge(draft.delivery_kind,packet.review?.status);
+ const reviewLabel=draft.delivery_kind==='evidence_gap'?'':reportReviewLabel(packet.run_metadata?.report_review_provider,packet.review?.reviewer_model);
+ let body=reportToolbar(id)+`<header class="report-title"><div class="report-title-meta"><span class="report-kicker">Ethereum research</span><span class="pill ${badge.tone}">${badge.label}</span></div><h1>${esc(draft.title)}</h1><p>${esc(windowLabel||date(packet.created_at))}${windowLabel?' · Published '+esc(date(packet.created_at)):''}${jevOptionLabel(packet.run_metadata?.jev_assistance_requested)?' · '+jevOptionLabel(packet.run_metadata.jev_assistance_requested):''}${reviewLabel?' · '+esc(reviewLabel):''}</p></header>`;
+ if(draft.delivery_kind==='minimal')body+='<p class="card-note">This limited report keeps the findings that passed final source review. Unresolved claims and dependent conclusions were removed; the remaining gaps are disclosed below.</p>';
+ if(draft.delivery_kind==='evidence_gap')body+='<p class="card-note">This is an evidence availability notice. No source-reviewed market conclusions were published.</p>';
+ body+=presentation?reportOverviewHTML(presentation,meta.session_id):'<section class="report-lead"><h2>Summary</h2>'+reportSummaryHTML(draft.summary)+'</section>';
+ body+=reportMetricCards(draft,numbers,meta.session_id,packet.review);
+ if(charts.length)body+=`<section class="report-chart-section" aria-label="Key data charts"><h2>Key data</h2>${charts.map((chart,index)=>reportChartHTML(chart,index,meta.session_id)).join('')}</section>`;
+ const highlights=(draft.key_changes?.length?draft.key_changes:draft.observations||[]).slice(0,3);
+ if(highlights.length)body+='<section class="report-takeaways"><h2>What matters</h2>'+claims(highlights)+'</section>';
+ body+=reportDocumentsHTML(documents,meta.session_id,packet.review);
+ if(draft.questions_to_watch?.length)body+='<section class="report-watch"><h2>What to watch next</h2><ul>'+draft.questions_to_watch.map(question=>'<li>'+esc(question)+'</li>').join('')+'</ul></section>';
+ body+='<section class="report-limits"><h2>Limits to keep in mind</h2><ul>'+draft.limitations.map(limit=>'<li>'+esc(limit)+'</li>').join('')+'</ul></section>';
+ body+='<details class="report-disclosure"><summary>Full analysis and supporting facts</summary><h2>Facts</h2>'+claims(draft.observations);
+ if(draft.key_changes?.length)body+='<h2>Changes</h2>'+claims(draft.key_changes);
+ if(draft.interpretations?.length)body+='<h2>Interpretation</h2>'+claims(draft.interpretations);
+ if(draft.judgment_reason)body+='<h2>Research judgment</h2><p>'+esc(draft.judgment_reason)+'</p>';
+ if(draft.forecasts?.length)body+='<h2>Conditional outlook</h2>'+draft.forecasts.map(forecast=>`<p>${esc(forecast.statement)} ${[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids].map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p><small>${esc(forecast.uncertainty)}</small>`).join('');
+ if(draft.purchase_decision){
+  const purchase=draft.purchase_decision;body+='<h2>Decision context</h2>';
+  for(const [label,rows] of [['Conditions to investigate',purchase.conditions_to_consider],['Reasons to wait',purchase.reasons_to_wait]])body+=`<h3>${label}</h3>`+rows.map(row=>`<p>${esc(row.condition)} ${row.evidence_ids.map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p>`).join('');
+  for(const [label,rows] of [['Invalidation conditions',purchase.invalidation_conditions],['Missing information',purchase.missing_information],['What to monitor',purchase.monitor],['Costs and execution assumptions',purchase.cost_and_execution_notes]])body+=`<h3>${label}</h3><ul>${rows.map(row=>'<li>'+esc(row)+'</li>').join('')}</ul>`;
+ }
+ body+=adviceHTML(draft.advice,claims,meta.session_id)+'</details>';
+ body+='<details class="report-disclosure"><summary>Sources, review and downloads</summary><div class="report-evidence-links">'+ids.map(rid=>sourceButton(rid,'['+numbers[rid]+'] '+rid,meta.session_id)).join(' ')+'</div><h3>Claim-level review</h3>';
+ for(const verdict of packet.review?.verdicts||[])body+=`<details class="review-item"><summary><span class="pill ${['contradicted','insufficient'].includes(verdict.status)?'warn':'neutral'}">${esc(verdict.status.replaceAll('_',' '))}</span> ${esc(verdict.claim_id)} · ${esc(verdict.reason)}</summary>${verdict.quotes.map(quote=>`<blockquote>${esc(quote.text)}</blockquote>${sourceButton(quote.record_id,'View source ↗',meta.session_id)}`).join('')}</details>`;
+ body+=`<div class="report-actions"><a class="button" href="/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.md')}" target="_blank">Original Markdown ↗</a></div><p class="card-note">Source checks assess support in the saved material. They do not guarantee publisher accuracy or future performance.</p></details>`;
+ box.innerHTML=body;
+ api('/api/sessions/'+meta.session_id+'/packages').then(packages=>{
+  if(box.dataset.reportId!==id)return;
+  const pack=packages.find(item=>item.package_id.startsWith(id+'-'));
+  if(pack)box.querySelector('.report-actions').insertAdjacentHTML('beforeend',`<a class="button" href="/api/audits/${pack.package_id}/download">Evidence ZIP ↓</a><button class="button" data-audit="${pack.package_id}" data-kind="verify">Check integrity</button><button class="button" data-audit="${pack.package_id}" data-kind="replay">Replay calculations</button>`);
+ }).catch(()=>{});
+ return packet;
+}
+async function openSource(rid,sourceSession){const shared=/^(live|page|web)-/.test(rid);if(!shared&&!sourceSession&&!state.sid)await createSession();sourceSession=sourceSession||state.sid;const dialog=$('source-dialog');$('source-detail').innerHTML='<div class="empty">Loading saved evidence…</div>';if(!dialog.open)dialog.showModal();try{const d=await api(shared?`/api/evidence/${encodeURIComponent(rid)}`:`/api/sessions/${sourceSession}/evidence/${encodeURIComponent(rid)}`),r=d.record,src=r.source||{},kind=r.record_id.startsWith('page-')?'Original page':(r.recipe_sha256||r.quality_flags?.includes('derived'))?'Derived calculation':r.source_kind==='feed_item'?'Publisher feed excerpt':r.record_id.startsWith('web-')?'Search excerpt':'Saved data';$('source-detail').innerHTML=`<span class="pill neutral">${kind}</span><h3>${esc(r.title||src.name||r.dataset_id)}</h3><div class="metadata"><div><small>Observed / effective time</small>${esc(date(r.observed_at))}</div><div><small>Retrieved</small>${esc(date(r.retrieved_at))}</div><div><small>Published</small>${esc(date(r.published_at))}</div><div><small>Snapshot integrity</small>${d.raw_verified?'Raw response verified':r.recipe_sha256?'Saved calculation recipe':'Structured source record'}</div></div>${src.url?`<a href="${esc(safeURL(src.url))}" target="_blank" rel="noopener">Open publisher / API ↗</a>`:''}${r.scope?'<p class="body-copy">'+esc(r.scope)+'</p>':''}${r.text?'<h3>Saved source text</h3><pre>'+esc(r.text)+'</pre>':''}${Object.keys(r.values||{}).length?'<h3>Original numeric fields</h3><pre>'+esc(JSON.stringify({values:r.values,units:r.units},null,2))+'</pre>':''}${r.method?'<h3>Calculation method</h3><pre>'+esc(r.method)+'</pre>':''}${r.input_record_ids?'<h3>Inputs</h3>'+r.input_record_ids.map(i=>sourceButton(i)).join(' · '):''}<details class="section-gap"><summary>Provenance details</summary><pre>${esc(JSON.stringify(r,null,2))}</pre></details><p class="card-note">Publication metadata may be unverified. A valid source pointer and matching snapshot do not guarantee the publisher’s claims.</p>`}catch(e){$('source-detail').innerHTML='<p class="body-copy">'+esc(e.message)+'</p>'}}
+const viewTitles={
+ today:['Home','Ethereum price, performance, and key investment data.'],
+ news:['Home','The latest Ethereum developments worth following.'],
+ research:['Analyst','Ask a question about Ethereum and explore the evidence.'],
+ reports:['Analyst','Browse your previous Ethereum research reports.'],
+ library:['Library','Explore saved sources, typed data series and earlier research.'],
+ portfolio:['Portfolio','Explore an editable scenario or review your private local ledger.'],
+ strategies:['Strategy Lab','Inspect dated predictions, holdout results and frozen research experiments.'],
+ resources:['Resources','Browse your research tools and saved activity.'],
+ help:['How to use Aether','Follow a source from research to a report, scenario or saved experiment.'],
+ settings:['Settings','Manage your workspace and see which data sources are available.'],
+};
+const workspaceRoutes={
+ home:'today',overview:'today',today:'today','home/news':'news',news:'news',
+ research:'research',analyst:'research','analyst/chat':'research',
+ 'research/reports':'reports','analyst/reports':'reports',reports:'reports',
+ 'research/updates':'library','analyst/library':'library',library:'library',
+ portfolio:'portfolio','advanced/strategy-lab':'strategies',strategies:'strategies',settings:'settings',
+ resources:'resources','advanced/resources':'resources',help:'help','resources/help':'help',
+};
+const workspacePaths={today:'home',news:'home/news',research:'analyst/chat',reports:'analyst/reports',
+ library:'analyst/library',portfolio:'portfolio',strategies:'advanced/strategy-lab',settings:'settings',
+ resources:'resources',help:'help'};
+function selectView(requested){
+ let view=Object.hasOwn(workspaceRoutes,requested)?workspaceRoutes[requested]:'today';
+ if(view!=='research'&&$('expanded-chat').open)$('expanded-chat').close();
+ const group=['today','news'].includes(view)?'home':['research','reports','library'].includes(view)?'research':view;
+ window.scrollTo(0,0);state.view=view;document.body.dataset.workspace=group;document.body.dataset.view=view;
+ $('report-list-view').hidden=false;
+ $('report-detail').hidden=true;
+ $('report-detail').dataset.reportId='';
+ $('job-progress-link').hidden=!state.researchActive||view==='research';
+ document.querySelectorAll('.view').forEach(n=>n.hidden=n.id!=='view-'+view);
+ document.querySelectorAll('.nav-item').forEach(n=>{
+  const active=n.closest('[aria-label="Primary navigation"]')?(n.dataset.view==='today'?'home':n.dataset.view)===group:n.dataset.view===view;
+  n.classList.toggle('active',active);
+  if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');
+ });
+ $('home-navigation').hidden=group!=='home';
+ $('research-navigation').hidden=group!=='research';
+ document.querySelectorAll('.section-nav button').forEach(n=>{
+  const active=n.dataset.view===view;
+  n.classList.toggle('selected',active);
+  if(active)n.setAttribute('aria-current','page');else n.removeAttribute('aria-current');
+ });
+ const [title,subtitle]=viewTitles[view];
+ $('page-title').textContent=title;
+ $('page-subtitle').textContent=subtitle;
+ $('page-eyebrow').textContent=group==='home'?'ETHEREUM MARKET':group==='research'?'RESEARCH WORKSPACE':'AETHER WORKSPACE';
+ $('breadcrumb').textContent={today:'Home / Overview',news:'Home / Latest News',research:'Analyst / Chat',
+  reports:'Analyst / Reports',library:'Analyst / Library',portfolio:'Portfolio',strategies:'More / Strategy Lab',
+  resources:'More / Resources',help:'More / How to use',settings:'Settings'}[view];
+ $('refresh-data').hidden=!['today','news'].includes(view);
+ $('freshness').hidden=!['today','news'].includes(view);
+ $('open-research').hidden=view==='research';
+ $('market-review-status').hidden=!['today','news'].includes(view)||!$('market-review-status').textContent;
+ $('more-menu').open=false;
+ if(view==='research')requestAnimationFrame(()=>{$('chat').scrollTop=$('chat').scrollHeight});
+ if(view==='today')renderPriceChart();
+ if(view==='news')loadLatestNews().catch(()=>toast('Latest news is temporarily unavailable.'));
+ if(view==='reports')loadReports().catch(()=>toast('Reports are temporarily unavailable.'));
+ if(view==='library')loadLibrary().catch(()=>toast('The library is temporarily unavailable.'));
+ history.replaceState(null,'','#'+workspacePaths[view]);
+ document.dispatchEvent(new CustomEvent('aether:view',{detail:{view}}));
+}
+const marketReviewTitle='ETH market refresh';
+let marketReviewSession=null, startingMarketReview=false;
+async function sessions(){
+ const rows=await api('/api/sessions');
+ marketReviewSession=rows.find(s=>s.title===marketReviewTitle)?.session_id||null;
+ state.sessions=rows.filter(s=>s.title!==marketReviewTitle);
+ if(!state.sessions.some(s=>s.session_id===state.sid)){
+  const saved=workspaceStorageGet('aether-session');
+  state.sid=state.sessions.some(s=>s.session_id===saved)?saved:state.sessions[0]?.session_id||null;
+ }
+ const picker=$('session-picker');
+ picker.innerHTML=state.sessions.length?state.sessions.map(s=>`<option value="${esc(s.session_id)}" ${s.session_id===state.sid?'selected':''}>${esc(s.title)}</option>`).join(''):'<option>No conversation yet</option>';
+}
+async function createSession(){const s=await api('/api/sessions','POST',{title:'ETH research · '+new Intl.DateTimeFormat('en-US',{month:'short',day:'numeric'}).format(new Date()),research_mode:'current'});state.sid=s.session_id;state.jobKey='';renderResearchProgress(null);workspaceStorageSet('aether-session',state.sid);await sessions();await refreshSession();return s}
 function showAnalyst(){selectView('research');$('question').focus()}
-async function ask(prompt,deliverable='answer'){if(!state.modelConfigured){toast('Configure your Ark model in the private server .env before asking the analyst.');return}if(state.busy){toast('This session is already researching. You can stop or continue after it finishes.');return}if(!state.sid)await createSession();await api('/api/sessions/'+state.sid+'/messages','POST',{prompt,deliverable});$('question').value='';showAnalyst();await refreshSession()}
-const eventNames={experience_recalled:'Reviewing relevant research lessons',context_measured:'Preparing focused research context',context_calibrated:'Updating context estimate',harness_started:'Preparing research',model_started:'Analyzing evidence',tool_started:'Using research tools',source_validation_started:'Checking cited data and calculations',source_validation_finished:'Source and number checks completed',review_started:'Checking source support',review_finished:'Reviewing results',context_summary_started:'Saving working context',context_summary_finished:'Working context saved',evidence_judgment:'Assessing additional source signals',evidence_sidecar_disabled:'Additional checks unavailable · continuing research',working_memory_unavailable:'Task notes unavailable · original history retained',bundle_created:'Saving evidence package',answer_pending:'Preparing verified answer',report_pending:'Completing report'};
-async function refreshSession(){if(!state.sid)return;const requestedSID=state.sid,snap=await api('/api/sessions/'+requestedSID);if(requestedSID!==state.sid)return;const jobs=snap.jobs,j=jobs.at(-1);state.busy=Boolean(snap.active_job_id);$('job-status').hidden=!state.busy;$('send-question').disabled=state.busy||!state.modelConfigured;$('purchase-report').disabled=state.busy||!state.modelConfigured;$('stop-job').disabled=!state.busy;$('job-description').textContent=eventNames[j?.last_event]||'Research in progress';$('job-error').hidden=!j||!['failed','cancelled','interrupted'].includes(j.state);$('job-error').textContent=j?'Research '+j.state+'. Saved sources and work are retained.':'';$('continue-job').hidden=!j||state.busy||!['failed','cancelled','interrupted'].includes(j.state);
- const key=requestedSID+':'+jobs.map(x=>x.job_id+':'+x.state+':'+(x.finished_at||'')).join('|');if(key!==state.jobKey){state.jobKey=key;if(jobs.length){$('chat').innerHTML=jobs.slice(-4).map(x=>`<div class="speaker">You</div><div class="chat-message user">${esc(x.prompt)}</div>${x.answer?`<div class="speaker">Aether analyst</div><div class="chat-message">${markdown(x.answer,x.verified_answer)}</div>${x.verified_answer?`<div class="checked-note"><span class="live-dot"></span>${x.verified_answer.review.claims_checked} claims checked · clickable saved sources</div>`:''}`:''}`).join('');$('chat').scrollTop=$('chat').scrollHeight}else{$('chat').innerHTML=welcomeHTML;$('research-trace').innerHTML=''}if(j?.state==='completed'){loadReports().catch(()=>{});loadNews().catch(()=>{})}}
- if(j){const events=await api('/api/sessions/'+requestedSID+'/events');if(requestedSID!==state.sid)return;$('research-trace').innerHTML=events.slice(-18).map(e=>'<div>'+esc(new Date(e.time).toLocaleTimeString('en-US',{hour12:false}))+' · '+esc(e.name||eventNames[e.kind]||e.kind.replaceAll('_',' '))+'</div>').join('')}
- state.lastJob=j}
-function profileValues(){const n=id=>$(id).value.trim()===''?null:Number($(id).value);return {horizon_days:Number($('profile-horizon').value),budget_usd:n('profile-budget'),existing_crypto_usd:n('profile-existing'),portfolio_total_usd:n('profile-total'),max_loss_usd:n('profile-loss'),allocation_fraction:Number($('profile-allocation').value),fee_bps:Number($('profile-fee').value),slippage_bps:Number($('profile-slippage').value),preference:$('profile-preference').value}}
-async function loadPurchaseEstimate(){const d=await api('/api/decision-context'),r=d.purchase_estimate?.record;const box=$('purchase-estimate');if(!r){box.innerHTML='<p class="card-note">Purchase estimate unavailable: '+esc(d.purchase_estimate?.reason||'Missing order book')+'</p>';return}const v=r.values;box.innerHTML='<div class="section-divider"></div><h3>Saved-book purchase estimate</h3>'+metricRow('Scenario amount',usd(v.budget_usd),d.purchase_amount_is_default?'Hypothetical default; your budget is unknown':'Saved research budget',r.record_id)+metricRow('Estimated average price',usd(v.estimated_vwap_usd),'Before fees · '+date(r.observed_at),r.record_id)+metricRow('Visible-book slippage',finite(v.slippage_from_best_ask_bps)?Number(v.slippage_from_best_ask_bps).toFixed(2)+' bps':'—','Compared with saved best ask',r.record_id)+metricRow('Uncovered notional',usd(v.uncovered_notional_usd),'No invented fills beyond first 25 asks',r.record_id)+'<p class="card-note">Saved depth only; fees, latency, and later book changes are excluded. This is not an executable quote.</p>'}
-async function loadProfile(){state.profile=await api('/api/decision-profile');for(const [field,id] of Object.entries({horizon_days:'profile-horizon',budget_usd:'profile-budget',existing_crypto_usd:'profile-existing',portfolio_total_usd:'profile-total',max_loss_usd:'profile-loss',allocation_fraction:'profile-allocation',fee_bps:'profile-fee',slippage_bps:'profile-slippage',preference:'profile-preference'}))$(id).value=state.profile[field]??''}
-function renderSimulation(data){const names={buy_hold:'Buy & hold',dca:'Weekly staged entry',momentum:'7D momentum',model_signals:'Model hypotheses'},colors=['#7d73c6','#77a999','#d3a574','#7e94b8'];let html='<div class="table-wrap"><table class="data-table"><thead><tr><th>Scenario</th><th>Net return</th><th>Max drawdown</th><th>Fees + slippage</th></tr></thead><tbody>'+data.results.map(r=>`<tr><td>${names[r.strategy]}</td><td class="numeric ${color(r.net_return_fraction)}">${pct(r.net_return_fraction)}</td><td class="numeric">${pct(r.max_drawdown_fraction)}</td><td class="numeric">${usd(r.fees_usd+r.slippage_usd)}</td></tr>`).join('')+'</tbody></table></div>';const vals=data.results.flatMap(r=>r.curve.map(p=>p.equity_usd)),lo=Math.min(...vals),hi=Math.max(...vals),span=hi-lo||1;let svg='';data.results.forEach((r,k)=>{const points=r.curve.map((p,i)=>(10+i*790/(r.curve.length-1))+','+(12+(hi-p.equity_usd)/span*150)).join(' ');svg+=`<polyline points="${points}" fill="none" stroke="${colors[k]}" stroke-width="2"/>`});html+=`<div class="equity-chart"><svg viewBox="0 0 820 190" role="img" aria-label="Historical scenario equity curves after assumed trading costs">${svg}</svg></div><div class="legend">${data.results.map((r,k)=>`<span><i style="background:${colors[k]}"></i>${names[r.strategy]}</span>`).join('')}</div><p class="card-note">${data.results[0].budget_is_default_scenario?'Hypothetical $1,000 starting capital.':'Scenario capital '+usd(data.results[0].budget_usd)+'.'} Same dates, per-side costs, and terminal liquidation. Retrospective prices and these preset scenarios do not prove future investment performance.</p>`;$('simulation-results').innerHTML=html}
-async function loadSubscriptions(){const d=await api('/api/subscriptions');state.subscriptions=d.items;$('subscription-list').innerHTML=d.items.length?d.items.map(s=>`<div class="subscription-row"><span class="pill ${s.enabled?'':'neutral'}">${s.enabled?'Enabled':'Off'}</span><div class="info"><strong>${esc(s.name)}</strong><p>${s.mode==='monitor'?'Changes only':'Research brief'} · ${esc(s.cadence)} · ${esc(s.timezone)}<br>Next: ${s.next_run_at?esc(date(s.next_run_at)):'Not scheduled'} · ${esc((s.last_status||'').replaceAll('_',' '))}</p></div><div class="subscription-actions"><button class="button" data-sub-edit="${s.id}">Edit</button><button class="button" data-sub-run="${s.id}">Run now</button><button class="icon-button" data-sub-delete="${s.id}" aria-label="Remove ${esc(s.name)}">×</button></div></div>`).join(''):'<div class="empty">No schedules enabled. Add a daily brief or a change monitor.</div>';$('scheduled-runs').innerHTML=d.runs.length?'<div class="table-wrap"><table class="data-table"><thead><tr><th>Run</th><th>Time</th><th>Status</th><th>Research</th></tr></thead><tbody>'+d.runs.map(r=>`<tr><td>${esc(d.items.find(s=>s.id===r.subscription_id)?.name||'Archived schedule')}</td><td>${esc(date(r.created_at))}</td><td><span class="pill ${r.state==='completed'?'':r.state==='failed'?'warn':'neutral'}">${esc(r.state)}</span></td><td>${r.session_id?`<button class="text-button" data-session="${r.session_id}">Open session ↗</button>`:'—'}</td></tr>`).join('')+'</tbody></table></div>':'<div class="empty">Scheduled research results will appear here.</div>'}
-function editSchedule(id){const s=state.subscriptions.find(s=>s.id===id)||{name:'ETH daily brief',mode:'brief',cadence:'daily',timezone:'Asia/Shanghai',hour:9,minute:0,interval_minutes:15,price_change_fraction:.03,enabled:true};$('schedule-id').value=s.id||'';$('schedule-name').value=s.name;$('schedule-mode').value=s.mode;$('schedule-cadence').value=s.cadence;$('schedule-zone').value=s.timezone;$('schedule-time').value=String(s.hour).padStart(2,'0')+':'+String(s.minute).padStart(2,'0');$('schedule-interval').value=s.interval_minutes;$('schedule-threshold').value=s.price_change_fraction*100;$('schedule-enabled').checked=s.enabled;$('schedule-start').value='';$('schedule-error').textContent='';$('schedule-dialog').showModal()}
-async function loadValidation(){const d=await api('/api/evaluations/latest');if(!d.summary){$('validation-summary').innerHTML='<p class="body-copy">No finished historical evaluation is available.</p>';return}const s=d.summary;let h='<div class="table-wrap"><table class="data-table"><thead><tr><th>Split</th><th>Completed</th><th>Passed gates</th><th>Directional predictions</th></tr></thead><tbody>';for(const [name,r] of Object.entries(s.splits))h+=`<tr><td>${name}</td><td>${r.completed} / ${r.planned}</td><td>${r.gate_passed}</td><td>${r.directional_predictions} · coverage ${pct(r.directional_coverage)}</td></tr>`;h+='</tbody></table></div><p class="body-copy">Failures and abstentions remain in the record. This small retrospective pilot does not establish prediction skill or profitable trading.</p>';$('validation-summary').innerHTML=h}
-document.addEventListener('click',async e=>{const b=e.target.closest('button,a');if(!b)return;try{if(b.dataset.view){e.preventDefault();selectView(b.dataset.view)}if(b.dataset.source){e.preventDefault();await openSource(b.dataset.source,b.dataset.sourceSession)}if(b.hasAttribute('data-source-link')){e.preventDefault();await openSource(new URL(b.href).pathname.split('/').at(-1))}if(b.dataset.report)await showReport(b.dataset.report);if(b.dataset.prompt)await ask(b.dataset.prompt);if(b.dataset.close)$(b.dataset.close).close();if(b.dataset.subEdit)editSchedule(b.dataset.subEdit);if(b.dataset.subRun){await api('/api/subscriptions/'+b.dataset.subRun+'/run','POST',{});await loadSubscriptions();toast('Research queued')}if(b.dataset.subDelete){await api('/api/subscriptions/'+b.dataset.subDelete,'DELETE');await loadSubscriptions()}if(b.dataset.session){state.sid=b.dataset.session;state.jobKey='';localStorage.setItem('aether-session',state.sid);await sessions();await refreshSession();showAnalyst()}if(b.dataset.audit){b.disabled=true;const r=await api('/api/audits/'+b.dataset.audit+'/'+b.dataset.kind,'POST',{});toast(r.status==='passed'?'Check passed'+(r.calculations_recomputed!==undefined?' · '+r.calculations_recomputed+' calculations replayed':''):'Check '+r.status);b.disabled=false}}catch(error){b.disabled=false;toast(error.message)}});
-$('refresh-data').onclick=()=>loadData(true).catch(e=>toast(e.message));$('open-research').onclick=showAnalyst;$('mobile-analyst').onclick=showAnalyst;$('close-analyst').onclick=()=>selectView('today');$('subscribe-research').onclick=()=>{selectView('watchlist');editSchedule()};$('new-session').onclick=()=>createSession().catch(e=>toast(e.message));$('session-picker').onchange=async()=>{state.sid=$('session-picker').value;state.jobKey='';localStorage.setItem('aether-session',state.sid);await refreshSession()};
-$('question-form').onsubmit=e=>{e.preventDefault();const text=$('question').value.trim();if(text)ask(text).catch(e=>toast(e.message))};$('question').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('question-form').requestSubmit()}});$('stop-job').onclick=()=>api('/api/sessions/'+state.sid+'/stop','POST',{}).then(()=>toast('Stop requested; the current network call may finish first.')).catch(e=>toast(e.message));$('continue-job').onclick=()=>ask('Continue the last unfinished research from saved sources and work. Make the minimum necessary correction. Do not repeat blocked requests or claim completion without a verified answer or published report.',state.lastJob?.deliverable||'answer').catch(e=>toast(e.message));
-document.querySelectorAll('[data-period]').forEach(b=>b.onclick=()=>{state.period=Number(b.dataset.period);document.querySelectorAll('[data-period]').forEach(n=>n.classList.toggle('selected',n===b));renderData()});$('chart-style').onclick=()=>{state.line=!state.line;$('chart-style').textContent=state.line?'Line':'Candles';renderChart()};
-$('profile-form').onsubmit=async e=>{e.preventDefault();try{state.profile=await api('/api/decision-profile','POST',profileValues());await loadPurchaseEstimate();toast('Research context saved')}catch(e){toast(e.message)}};
-$('purchase-report').onclick=async()=>{try{state.profile=await api('/api/decision-profile','POST',profileValues());await ask('Create and publish a concise ETH investment-research brief for the saved research context. Choose relevant current data, original announcements, and calculations yourself. Include source-backed conditions to investigate, reasons to wait, invalidation conditions, costs, missing information, and monitoring in purchase_decision. Do not invent my holdings or risk tolerance. Any paper comparison is hypothetical. Avoid fixed trading scores and unsupported price forecasts.','report')}catch(e){toast(e.message)}};
-$('new-report').onclick=()=>ask('Create and publish a concise English ETH market research brief using actual current data and important recent announcements. Recall earlier research when useful and explain material changes. Separate observations, cautious interpretation, and unknowns.','report').catch(e=>toast(e.message));$('scan-news').onclick=()=>ask('Search recent ETH news and official announcements. Read important original sources where available, recall saved events, and save meaningful event classifications. Distinguish plans from confirmed events and submit a concise source-checked answer.').catch(e=>toast(e.message));
-$('news-query').addEventListener('input',()=>{clearTimeout(loadNews.timer);loadNews.timer=setTimeout(()=>loadNews().catch(e=>toast(e.message)),350)});$('news-window').onchange=()=>loadNews().catch(e=>toast(e.message));$('report-query').addEventListener('input',()=>{clearTimeout(loadReports.timer);loadReports.timer=setTimeout(()=>loadReports().catch(e=>toast(e.message)),350)});$('run-simulation').onclick=async()=>{const b=$('run-simulation');b.disabled=true;try{const d=await api('/api/simulations','POST',{profile:profileValues(),lookback_days:7});renderSimulation(d)}catch(e){toast(e.message)}finally{b.disabled=false}};
-$('add-subscription').onclick=()=>editSchedule();$('schedule-mode').onchange=()=>{if($('schedule-mode').value==='monitor')$('schedule-cadence').value='interval'};$('schedule-form').onsubmit=async e=>{e.preventDefault();try{const [hour,minute]=$('schedule-time').value.split(':').map(Number),start=$('schedule-start').value;await api('/api/subscriptions','POST',{id:$('schedule-id').value||null,name:$('schedule-name').value,asset:'ETH',enabled:$('schedule-enabled').checked,mode:$('schedule-mode').value,cadence:$('schedule-cadence').value,timezone:$('schedule-zone').value,hour,minute,weekday:0,interval_minutes:Number($('schedule-interval').value),price_change_fraction:Number($('schedule-threshold').value)/100,start_at:start?new Date(start).toISOString():null});$('schedule-dialog').close();await loadSubscriptions();toast('Schedule saved')}catch(error){$('schedule-error').textContent=error.message}};
-let polling=false;setInterval(async()=>{if(polling||document.hidden)return;polling=true;try{await loadData();await refreshSession();if(state.view==='watchlist')await loadSubscriptions()}catch{}finally{polling=false}},4000);setInterval(()=>{if(!document.hidden)loadData(true).catch(()=>{})},60000);new ResizeObserver(()=>{if(state.view==='today')renderChart()}).observe($('market-chart'));
-(async()=>{try{const cfg=await api('/api/config');state.modelConfigured=cfg.configured;$('send-question').disabled=!cfg.configured;$('purchase-report').disabled=!cfg.configured;if(!cfg.configured)$('question').placeholder='Configure your Ark model to start research…';$('service-state').textContent='Local service connected';$('engine-status').textContent=cfg.configured?'Connected':'Not configured';$('model-label').textContent=cfg.configured?'Doubao 2.1 Pro':'No API model';$('engine-details').innerHTML=metricRow('Model',cfg.model_id,'API-backed research')+metricRow('Harness',cfg.harness,'Runs on this computer')+metricRow('Search',cfg.search_enabled?'Available':'Disabled','Ark search plus saved-source recall')+metricRow('Execution','Local terminal','Python and public tools');await sessions();await loadProfile();await Promise.all([loadData(),loadNews(),loadReports(),loadSubscriptions(),loadValidation()]);await refreshSession();selectView(location.hash.slice(1)||'overview');if(!state.dashboard.updated_at||Date.now()-Date.parse(state.dashboard.updated_at)>60000)await loadData(true)}catch(e){$('service-state').textContent='Connection needs attention';toast(e.message)}})();
+async function ask(prompt,deliverable='answer'){
+ if(!state.modelConfigured){toast('The assistant is unavailable. Check Settings.');return}
+ if(state.busy&&deliverable==='report'){toast('This session is already researching.');return}
+ if(!state.sid)await createSession();
+ await api('/api/sessions/'+state.sid+'/messages','POST',{prompt,deliverable,jev_assistance:state.jevAssistance,report_review_provider:state.reportReviewProvider});
+ $('question').value='';$('question').style.height='';showAnalyst();
+ await refreshSession();
+ $('chat').scrollTop=$('chat').scrollHeight;
+}
+function chatReportLinks(job){
+ const kind=job.report_delivery_kind;
+ const title=kind==='evidence_gap'?'Evidence gap saved':kind==='minimal'?'Your limited report is ready':'Your report is ready';
+ const reviewer=reportReviewLabel(job.report_review_provider,job.report_review_model);
+ return (job.published_reports||[]).flatMap(path=>{
+  const match=/^\/reports\/(research-[a-f0-9]{12})\.md$/.exec(path);
+  return match?[`<button class="chat-report-card" data-report="${match[1]}"><span class="chat-report-icon" aria-hidden="true">▤</span><span><strong>${title}</strong><small>Open the saved ${kind==='evidence_gap'?'notice':'report'}${jevOptionLabel(job.jev_assistance_requested)?' · '+jevOptionLabel(job.jev_assistance_requested):''}${reviewer&&kind!=='evidence_gap'?' · '+esc(reviewer):''}</small></span><span aria-hidden="true">↗</span></button>`]:[];
+ }).join('');
+}
+function chatTurn(job){
+ const continued=job.continued_from_job_id||job.prompt==='Continue the last unfinished research from saved sources and work. Reuse verified evidence and complete the requested answer or report.';
+ const prompt=continued?'<div class="chat-resume-note">Continuing the previous request</div>':`<div class="chat-user"><div class="chat-message user">${esc(job.prompt)}</div></div>`;
+ const reportLinks=chatReportLinks(job);
+ let reply='';
+ if(job.answer||reportLinks){
+  const time=job.finished_at?new Intl.DateTimeFormat('en',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Shanghai'}).format(new Date(job.finished_at)):'';
+  reply=`<article class="chat-assistant"><div class="chat-assistant-heading"><span class="chat-avatar" aria-hidden="true">✦</span><span>Aether</span><time>${esc(time)}</time></div><div class="chat-message">${job.answer?markdown(job.answer,job.verified_answer):'<p>Your report has been saved.</p>'}</div>${job.verified_answer?'<div class="chat-response-meta">Sources checked</div>':''}${reportLinks}</article>`;
+ }else if(['failed','cancelled','interrupted'].includes(job.state)){
+  reply='<div class="chat-turn-note">'+({failed:'This request could not finish.',cancelled:'You stopped this request.',interrupted:'This request was interrupted.'})[job.state]+'</div>';
+ }
+ return `<section class="chat-turn">${prompt}${reply}</section>`;
+}
+const researchStages={
+ responding:'Preparing a reply',
+ starting:'Starting research', working:'Working on your request', planning:'Planning the research',
+ library:'Checking saved data and research', web:'Checking fresh data and news',
+ evidence:'Reading the sources', analysis:'Analyzing the data', verification:'Checking sources and claims',
+ revision:'Revising the findings', finalizing:'Preparing your result',
+};
+function researchElapsed(job){
+ const start=Date.parse(job.created_at), end=job.finished_at?Date.parse(job.finished_at):Date.now();
+ if(!Number.isFinite(start)||!Number.isFinite(end))return '';
+ const seconds=Math.max(0,Math.floor((end-start)/1000));
+ const hours=Math.floor(seconds/3600),minutes=Math.floor(seconds/60)%60;
+ return hours?`${hours}h ${minutes}m`:minutes?`${minutes}m ${seconds%60}s`:`${seconds}s`;
+}
+function renderResearchProgress(job,progress=null,active=false,stopping=false){
+ const panel=$('job-status'),link=$('job-progress-link');
+ state.researchActive=active;
+ panel.hidden=!job||!active;
+ link.hidden=!active||state.view==='research';
+ if(!job)return;
+ const stage=progress?.job_id===job.job_id?progress.stage:null;
+ const phase=researchStages[stage]||researchStages.working;
+ const outcomes={completed:job.published_reports?.length?(job.report_delivery_kind==='evidence_gap'?'Evidence gap saved':job.report_delivery_kind==='minimal'?'Limited report ready':'Report ready'):'Answer ready',
+  failed:'Research could not finish',cancelled:'Research stopped',interrupted:'Research interrupted',
+  waiting_for_conversation:'Waiting for a response'};
+ const reviewer=reportReviewLabel(progress?.reviewer_provider||job.report_review_provider,progress?.reviewer_model||job.report_review_model);
+ const label=stopping?'Stopping research…':outcomes[job.state]||phase+(stage==='verification'&&job.deliverable==='report'&&reviewer?' · '+reviewer:'');
+ panel.dataset.state=job.state;
+ if($('job-description').textContent!==label)$('job-description').textContent=label;
+ const earlier=progress?.job_id===job.job_id?progress.previous||[]:[];
+ const trail=(active||job.state==='completed'?earlier:[...earlier,stage]).map(step=>researchStages[step]).filter(Boolean).slice(-2);
+ $('job-previous').hidden=true;
+ $('job-previous').textContent=trail.length?trail.join(' · '):'';
+ $('job-elapsed').textContent=researchElapsed(job);
+ $('stop-job').hidden=!active;
+ $('stop-job').disabled=stopping;
+ $('job-progress-label').textContent=label;
+ link.setAttribute('aria-label',label+' — open chat');
+}
+async function refreshSession(){
+ if(!state.sid)return;
+ const requestedSID=state.sid,snap=await api('/api/sessions/'+requestedSID);
+ if(requestedSID!==state.sid)return;
+ const jobs=snap.jobs,latest=jobs.at(-1);
+ const job=jobs.find(x=>x.job_id===snap.research_progress?.job_id)||jobs.findLast(x=>!x.chat_reply);
+ state.busy=Boolean(snap.active_job_id);
+ const active=job?.job_id===snap.active_job_id&&['running','waiting_for_conversation'].includes(job?.state);
+ renderResearchProgress(active||!latest?.chat_reply?job:null,snap.research_progress,active,active&&snap.stopping);
+ $('send-question').disabled=!state.modelConfigured;
+ $('create-chat-report').disabled=state.busy||!state.modelConfigured;
+ configureJevControl();
+ const canContinue=job&&['failed','cancelled','interrupted'].includes(job.state);
+ $('job-error').hidden=!canContinue||Boolean(latest?.chat_reply);
+ $('job-error').textContent=canContinue?'Your progress is saved.':'';
+ $('continue-job').hidden=!canContinue||state.busy;
+ const key=requestedSID+':'+jobs.map(x=>x.job_id+':'+x.state+':'+(x.finished_at||'')).join('|');
+ if(key!==state.jobKey){
+  const chat=$('chat'),follow=state.jobKey.split(':')[0]!==requestedSID||chat.scrollHeight-chat.clientHeight-chat.scrollTop<100;
+  const scroll=chat.scrollTop;
+  state.jobKey=key;
+  chat.innerHTML=jobs.length?jobs.map(chatTurn).join(''):welcomeHTML;
+  chat.scrollTop=follow?chat.scrollHeight:scroll;
+  if(latest?.state==='completed'&&!latest.chat_reply){loadReports().catch(()=>{});loadLatestNews().catch(()=>{})}
+ }
+ state.lastJob=job;
+}
+document.addEventListener('click',async event=>{
+ const control=event.target.closest('button,a');
+ if(!control)return;
+ try{
+  if(control.hasAttribute('data-report-back')){selectView('reports');return}
+  if(control.dataset.view){event.preventDefault();selectView(control.dataset.view)}
+  if(control.dataset.source){event.preventDefault();await openSource(control.dataset.source,control.dataset.sourceSession)}
+  if(control.hasAttribute('data-source-link')){event.preventDefault();await openSource(new URL(control.href).pathname.split('/').at(-1))}
+  if(control.dataset.report)await showReport(control.dataset.report);
+  if(control.dataset.prompt)await ask(control.dataset.prompt);
+  if(control.dataset.close)$(control.dataset.close).close();
+  if(control.dataset.audit){
+   control.disabled=true;
+   const result=await api('/api/audits/'+control.dataset.audit+'/'+control.dataset.kind,'POST',{});
+   toast(result.status==='passed'?'Evidence check passed.':'Evidence check '+result.status+'.');
+   control.disabled=false;
+  }
+ }catch(error){control.disabled=false;toast(error.message)}
+});
+function showMarketReviewStatus(text, busy=false){
+ const status=$('market-review-status'), button=$('refresh-data');
+ status.textContent=text;
+ status.hidden=!text;
+ button.disabled=busy||!state.modelConfigured;
+ button.textContent=busy?'↻ Reviewing…':'↻ Refresh';
+}
+async function checkMarketReview(){
+ if(!marketReviewSession||startingMarketReview)return;
+ const snapshot=await api('/api/sessions/'+marketReviewSession);
+ const pending=workspaceStorageGet('aether-market-review')===marketReviewSession;
+ if(snapshot.active_job_id){
+  workspaceStorageSet('aether-market-review',marketReviewSession);
+  showMarketReviewStatus('Reviewing ETH data and looking for new sources…',true);
+  return;
+ }
+ if(!pending)return;
+ workspaceStorageRemove('aether-market-review');
+ const job=snapshot.jobs.at(-1);
+ if(job?.state==='completed'){
+  showMarketReviewStatus('Market review complete. Open Latest News or Library to see saved sources.');
+  await Promise.allSettled([loadData(),loadLatestNews(),...(state.view==='library'?[loadLibrary()]:[])]);
+ }else{
+  showMarketReviewStatus('The market review did not finish. Any saved sources are still available.');
+ }
+}
+async function requestMarketReview(){
+ if(!state.modelConfigured||startingMarketReview)return;
+ startingMarketReview=true;
+ showMarketReviewStatus('Starting an ETH market review…',true);
+ try{
+  if(!marketReviewSession){
+   const session=await api('/api/sessions','POST',{title:marketReviewTitle,research_mode:'current'});
+   marketReviewSession=session.session_id;
+  }
+  const path='/api/sessions/'+marketReviewSession;
+  const snapshot=await api(path);
+  if(!snapshot.active_job_id){
+   await api(path+'/messages','POST',{
+    deliverable:'answer',
+    purpose:'market_refresh',
+    prompt:'Refresh the Ethereum research library. Check the latest available ETH market data and source timestamps. Search for material Ethereum news and official announcements from the past seven days, compare with saved sources, and open the original public pages for relevant new material so the existing evidence tools save them in the searchable library. Skip duplicate material, distinguish confirmed events from plans, and cite saved evidence in a short status update. Report missing or inaccessible sources accurately. Focus on ETH. Do not publish a report or use personal portfolio details.',
+   });
+   api('/api/dashboard/refresh','POST',{}).catch(()=>{});
+  }
+  workspaceStorageSet('aether-market-review',marketReviewSession);
+  showMarketReviewStatus('Reviewing ETH data and looking for new sources…',true);
+ }catch{
+  showMarketReviewStatus('The review could not start. Please try again.');
+ }finally{
+  startingMarketReview=false;
+ }
+}
+$('refresh-data').onclick=()=>requestMarketReview();
+$('open-research').onclick=showAnalyst;
+$('mobile-analyst').onclick=showAnalyst;
+$('close-analyst').onclick=()=>selectView('today');
+$('new-session').onclick=()=>createSession().catch(()=>toast('Could not start a new conversation.'));
+$('session-picker').onchange=async()=>{
+ state.sid=$('session-picker').value;
+ state.jobKey='';
+ renderResearchProgress(null);
+ workspaceStorageSet('aether-session',state.sid);
+ await refreshSession();
+};
+$('question-form').onsubmit=event=>{
+ event.preventDefault();
+ const question=$('question').value.trim();
+ if(question)ask(question).catch(error=>toast(error.message));
+};
+$('jev-assistance').onchange=event=>saveJevPreference(event.target.checked);
+$('report-review-provider').onchange=event=>saveReportReviewPreference(event.target.value);
+configureJevControl();
+$('create-chat-report').onclick=()=>{
+ const scope=$('question').value.trim();
+ if(!scope){$('question').focus();toast('Enter what the report should cover.');return}
+ ask(scope,'report').catch(error=>toast(error.message));
+};
+$('question').addEventListener('keydown',event=>{
+ if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();$('question-form').requestSubmit()}
+});
+$('question').addEventListener('input',()=>{
+ $('question').style.height='auto';
+ $('question').style.height=Math.min($('question').scrollHeight,160)+'px';
+});
+$('stop-job').onclick=async()=>{
+ const sid=state.sid,job=state.lastJob;
+ if(!sid||!job)return;
+ $('stop-job').disabled=true;
+ try{
+  const result=await api('/api/sessions/'+sid+'/stop?job_id='+encodeURIComponent(job.job_id),'POST',{});
+  if(sid!==state.sid)return;
+  if(result.status==='stopping')renderResearchProgress(job,null,true,true);
+  await refreshSession();
+ }catch{
+  if(sid===state.sid){$('stop-job').disabled=false;toast('Could not stop research.');}
+ }
+};
+$('continue-job').onclick=async()=>{
+ const sid=state.sid,job=state.lastJob;
+ if(!sid||!job||state.busy)return;
+ $('continue-job').disabled=true;
+ try{
+  await api('/api/sessions/'+sid+'/jobs/'+job.job_id+'/continue','POST',{});
+  if(sid===state.sid){showAnalyst();await refreshSession();}
+ }catch(error){toast(error.message)}
+ finally{$('continue-job').disabled=false}
+};
+document.querySelectorAll('[data-period]').forEach(button=>button.onclick=()=>{
+ state.period=Number(button.dataset.period);
+ document.querySelectorAll('[data-period]').forEach(other=>{
+  other.classList.toggle('selected',other===button);
+  other.setAttribute('aria-pressed',String(other===button));
+ });
+ renderData();
+});
+$('chart-style').onclick=()=>{
+ state.line=!state.line;
+ $('chart-style').textContent=state.line?'Line':'Candles';
+ $('chart-style').setAttribute('aria-pressed',String(state.line));
+ renderPriceChart();
+};
+$('new-report').onclick=()=>{
+ showAnalyst();
+ $('question').placeholder='What should this report cover?';
+};
+$('report-query').addEventListener('input',()=>{
+ clearTimeout(loadReports.timer);
+ loadReports.timer=setTimeout(()=>loadReports().catch(()=>toast('Reports are temporarily unavailable.')),350);
+});
+new ResizeObserver(()=>{if(state.view==='today')renderPriceChart()}).observe($('market-chart'));
+{
+ let polling=false;
+ setInterval(async()=>{
+  if(polling||document.hidden)return;
+  polling=true;
+  try{
+   await Promise.allSettled([refreshSession(),checkMarketReview(),...(state.view==='today'?[loadData()]:[])]);
+  }finally{polling=false}
+ },4000);
+ setInterval(()=>{if(!document.hidden&&state.view==='today')loadData(true).catch(()=>{})},60000);
+}
+document.addEventListener('DOMContentLoaded',async()=>{
+ try{
+  selectView(location.hash.slice(1)||'home');
+  const config=await api('/api/config');
+  state.modelConfigured=config.configured;
+  $('send-question').disabled=!config.configured;
+  $('create-chat-report').disabled=!config.configured;
+  $('refresh-data').disabled=!config.configured;
+  $('new-report').disabled=!config.configured;
+  configureJevControl();
+  if(!config.configured)$('question').placeholder='The assistant is unavailable. Check Settings.';
+  $('service-state').textContent='Local service connected';
+  $('engine-status').textContent=config.configured?'Connected':'Unavailable';
+  $('engine-details').innerHTML=metricRow('Assistant',config.configured?'Doubao':'Unavailable','Used for questions and reports')
+   +metricRow('Web research',config.search_enabled?'Available':'Unavailable','Finds current public information');
+  await Promise.allSettled([loadData(),sessions().then(()=>Promise.allSettled([refreshSession(),checkMarketReview()]))]);
+  if(state.view==='today'&&(!state.dashboard.updated_at||Date.now()-Date.parse(state.dashboard.updated_at)>60000))await loadData(true);
+ }catch{
+  $('service-state').textContent='Connection needs attention';
+  $('connection-banner').hidden=false;
+ }
+});
