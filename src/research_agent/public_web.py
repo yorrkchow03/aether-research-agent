@@ -1,6 +1,7 @@
 """Read public source pages without sending any model credential."""
 import ipaddress
 import socket
+import time
 import json
 from html.parser import HTMLParser
 from urllib.parse import urlsplit, urljoin
@@ -70,11 +71,15 @@ class PageText(HTMLParser):
                 if isinstance(value,(list,dict)):self._structured_metadata(value)
 
 
-def fetch_page(url):
+def fetch_page(url, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
     with httpx.Client(timeout=20, trust_env=True, follow_redirects=False) as client:
         for _ in range(5):
             public_url(url)
-            with client.stream("GET", url, headers={"User-Agent": "LocalETHResearch/0.2", "Accept": "text/html,text/plain,application/json"}) as response:
+            remaining = deadline-time.monotonic() if deadline is not None else 20
+            if remaining <= 0:
+                raise TimeoutError("Source request exceeded its time limit")
+            with client.stream("GET", url, timeout=remaining, headers={"User-Agent": "LocalETHResearch/0.2", "Accept": "text/html,text/plain,application/json"}) as response:
                 if response.is_redirect:
                     url = urljoin(url, response.headers["location"]); continue
                 if response.status_code != 200:raise RuntimeError(f"Source page HTTP {response.status_code}; use another source")
@@ -82,6 +87,8 @@ def fetch_page(url):
                 if not any(x in content_type for x in ("html", "text", "json", "xml")):raise ValueError("Source reader supports text/HTML/JSON/XML; not PDF or video")
                 raw = bytearray()
                 for chunk in response.iter_bytes():
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("Source request exceeded its time limit")
                     raw.extend(chunk)
                     if len(raw) > 2_000_000:raise ValueError("Source page exceeds 2 MB")
             decoded = bytes(raw).decode("utf-8", errors="replace")

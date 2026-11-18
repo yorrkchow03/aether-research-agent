@@ -533,7 +533,7 @@ def create_app(runtime=None, port=8765):
         return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
     @app.get("/api/sessions/{sid}/artifact")
-    def artifact(sid:str,path:str):
+    def artifact(sid:str,path:str,view:Literal['reader']|None=None):
         directory=runtime._session_dir(sid);workspace=directory/'workspace'
         relative=PurePosixPath(path.lstrip('/'))
         if (not relative.parts or '..' in relative.parts or relative.suffix not in ('.md','.json','.py')
@@ -545,6 +545,28 @@ def create_app(runtime=None, port=8765):
             'reports/'+str(meta.get('initial_report_id'))+'.md'}:
             raise ValueError('Only the approved initial report is exposed from this provenance session')
         body=workspace_file_bytes(workspace,relative)
+        if view == 'reader' and re.fullmatch(r'reports/research-[a-f0-9]{12}\.(?:json|md)', str(relative)):
+            packet=json.loads(body if relative.suffix=='.json' else
+                              workspace_file_bytes(workspace,relative.with_suffix('.json')))
+            from .report_presentation import (report_display_title, report_display_summary,
+                                              report_display_limits, report_timeline, report_watch_items)
+            draft=packet['report']
+            presentation=packet.get('presentation')
+            if relative.suffix=='.md':
+                from .reports import ReportDraft, render_report
+                body=render_report(ReportDraft.model_validate(draft),packet['cutoff'],packet.get('validation',{}),
+                    packet.get('sources',[]),packet.get('online_retrieved_through'),packet.get('review'),
+                    presentation,lookup=runtime.knowledge.get).encode()
+            else:
+                timeline=report_timeline(draft,presentation,runtime.knowledge.get)
+                packet['timeline']=timeline
+                packet['report']={**draft,'title':report_display_title(draft),'summary':report_display_summary(draft),
+                    'limitations':report_display_limits(draft),
+                    'questions_to_watch':report_watch_items(draft.get('questions_to_watch'))}
+                if presentation:
+                    packet['presentation']={**presentation,'timeline':timeline,
+                        'overview':{**presentation['overview'],'summary':packet['report']['summary']}}
+                return JSONResponse(packet)
         from urllib.parse import quote
         return Response(body,media_type='text/plain; charset=utf-8',
                         headers={'Content-Disposition':"inline; filename*=UTF-8''"+quote(relative.name)})

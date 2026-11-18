@@ -42,6 +42,30 @@ class NumericErrorTests(unittest.TestCase):
         # This checks only the structured contract; publication still needs source review.
         self.assertEqual(validate_report(repaired,lambda rid:row)['numeric_claims_checked'],0)
 
+    def test_one_failure_identifies_all_invalid_annotations_and_only_suggests_removing_text_fields(self):
+        observations = [{'statement':'Bitmine disclosed its holdings.', 'metric':'eth_holdings', 'value':'6077745', 'unit':'ETH', 'evidence_ids':[PAGE]},
+                        {'statement':'The ACDT agenda listed findings.', 'metric':'combined_findings', 'value':'200', 'unit':'findings', 'evidence_ids':[PAGE]},
+                        {'statement':'The saved price was 42.', 'metric':'close', 'value':'42', 'unit':'USD', 'evidence_ids':[CALC]}]
+        draft = ReportDraft(title='Review', summary='Weekly summary.', observations=observations, limitations=['Coverage limited.'])
+        records = {PAGE:{'record_id':PAGE,'text':'PRIVATE_ORIGINAL_BODY_MARKER'},
+                   CALC:{'record_id':CALC,'values':{'close':'40'},'units':{'close':'USD'}}}
+        original = draft.model_dump()
+        with self.assertRaises(ValueError) as caught:
+            validate_report(draft, records.__getitem__)
+        message = str(caught.exception)
+        self.assertIn('3 numeric annotations failed', message)
+        for i, observation in enumerate(observations):
+            self.assertIn('/observations/'+str(i), message)
+            self.assertIn('metric='+observation['metric'], message)
+        self.assertLess(len(message), 1600)
+        self.assertNotIn('PRIVATE_ORIGINAL_BODY_MARKER', message)
+        edits = json.loads(message.split('Example publish_saved_report edits=')[1].removesuffix('.'))
+        self.assertEqual({e['path'] for e in edits}, {f'/observations/{i}/{key}' for i in (0,1) for key in ('metric','unit','value')})
+        repaired = revise_report(original, edits)
+        with self.assertRaisesRegex(ValueError, 'value differs from saved evidence at /observations/2'):
+            validate_report(repaired, records.__getitem__)
+        self.assertEqual(draft.model_dump(), original)
+
     def test_existing_saved_field_reports_actual_value_and_unit_without_accepting_mismatch(self):
         source={'record_id':CALC,'values':{'close_oct23_usd':'2384.38','unrelated':'DO_NOT_EXPOSE'},
                 'units':{'*_usd':'USD','unrelated':'DO_NOT_EXPOSE'},'text':'DO_NOT_EXPOSE_BODY'}

@@ -27,7 +27,8 @@ from .answers import AnswerDraft,answer_targets,validate_answer,render_answer,an
 from .advice import advice_evidence_ids
 from .research_explanations import explanation_evidence_ids
 from .data_contract import numeric_contract
-from .report_recovery import ReportEdit,bind_report_quotes,revise_report
+from .report_recovery import (ARCHIVE_LIMITATION, OMITTED_DOCUMENT_LIMITATION, LivePublicationDraft, LivePublishArguments, ReportEdit, bind_report_quotes,
+                              omit_rejected_optional_items, prepare_report_documents, revise_report)
 from .chat_reply import requests_report
 from .review_feedback import ReviewNeedsRevisionError,review_failure_feedback
 from .review import ReviewBudgetExhausted
@@ -50,6 +51,9 @@ class ResearchTools:
         self.published_reports=[]
         self.report_allowed=True
         self.report_request_prompt=None
+        self.required_report_window=None
+        self.last_source_validated_draft_id=None
+        self.last_report_checkpoint_id=None
         self.knowledge=knowledge;self.submitted_answers=[];self.last_report=None
         self.library=library
         self.evidence_memory=evidence_memory;self.retrieval_judgments=retrieval_judgments
@@ -646,8 +650,10 @@ class ResearchTools:
         result=self.shell.replay_recipe(body,rows)
         if result.exit_code!=0 or result.truncated:raise ValueError("Recipe failed when replayed with declared inputs in a fresh working directory. Read sys.argv JSON inputs; do not depend on exploratory notes or fetch new data during registration. "+result.output[:2500])
         try:obj=json.loads(result.output)
-        except ValueError:raise ValueError('Recipe stdout must be one JSON object with "values" and "units"') from None
-        values={k:number(v) for k,v in obj.get("values",{}).items()};units=obj.get("units",{})
+        except ValueError:obj=None
+        if not isinstance(obj,dict) or not all(isinstance(obj.get(key),dict) for key in ('values','units')):
+            raise ValueError('Recipe stdout must contain exactly one JSON object with "values" and "units" maps. Send debug output to stderr (print(..., file=sys.stderr)).')
+        values={k:number(v) for k,v in obj["values"].items()};units=obj["units"]
         if not values or len(values)>30 or any(v is None for v in values.values()) or set(values)!=set(units) or any(not isinstance(u,str) or not u for u in units.values()):raise ValueError("Return finite numeric values and one explicit unit for every field")
         retrieved=utcnow();rid="live-"+hashlib.sha256(dumps({"code":code_hash,"inputs":input_record_ids,"values":values,"retrieved":retrieved},sort_keys=True).encode()).hexdigest()[:24]
         recipe=self.workspace/"data/calculations"/(rid+".py");recipe.write_bytes(body)
@@ -684,28 +690,108 @@ class ResearchTools:
     def _check_delivery_cancelled(self):
         if getattr(self,'cancel',None) and self.cancel.is_set():raise RuntimeError('User cancelled; publication stopped before commit')
 
+    def _save_report_draft(self, draft, *, emit=True):
+        body = draft.model_dump()
+        draft_id = hashlib.sha256(dumps(body, sort_keys=True).encode()).hexdigest()[:24]
+        path = self.workspace/'drafts'/(draft_id+'.json')
+        if not path.exists():
+            atomic(path, {'draft': body, 'created_at': utcnow()})
+        self.latest_report_draft_id = draft_id
+        if emit and self.event_sink:
+            self.event_sink('report_draft_saved', {'draft_id': draft_id, 'path': '/drafts/'+draft_id+'.json'})
+        return draft_id
+
+    def _report_window_matches(self, scope):
+        expected = self.required_report_window
+        return not expected or bool(scope and (scope.start, scope.end) == tuple(expected))
+
     def publish(self,draft):
         self._check_delivery_cancelled()
         if not self.report_allowed:raise ValueError('Market refresh cannot publish reports')
-        if not isinstance(draft,ReportDraft):draft=ReportDraft.model_validate(draft)
-        draft_id=hashlib.sha256(dumps(draft.model_dump(),sort_keys=True).encode()).hexdigest()[:24]
-        path=self.workspace/'drafts'/(draft_id+'.json')
-        if not path.exists():atomic(path,{'draft':draft.model_dump(),'created_at':utcnow()})
-        self.latest_report_draft_id=draft_id
-        if self.event_sink:self.event_sink('report_draft_saved',{'draft_id':draft_id,'path':'/drafts/'+draft_id+'.json'})
+        if not isinstance(draft, ReportDraft):
+            draft = (LivePublicationDraft if self.allow_live else ReportDraft).model_validate(draft)
+        input_adjustments = None
+        if isinstance(draft, LivePublicationDraft):
+            if draft._submitted is not None:
+                digest = hashlib.sha256(dumps(draft._submitted, sort_keys=True).encode()).hexdigest()
+                original_path = f'drafts/submissions/{digest}.json'
+                atomic(self.workspace/original_path, {'draft': draft._submitted})
+                input_adjustments = {'original_path': '/'+original_path, 'submitted_sha256': digest,
+                                     'changes': draft._adjustments}
+            draft = ReportDraft.model_validate(draft.model_dump())
+        draft_id = self._save_report_draft(draft)
+        if input_adjustments and self.event_sink:
+            self.event_sink('report_input_adjusted', {**input_adjustments, 'draft_id': draft_id})
         try:
-            draft=self._delivery_disclosures(draft.model_copy(deep=True))
-            draft_id=hashlib.sha256(dumps(draft.model_dump(),sort_keys=True).encode()).hexdigest()[:24]
-            normalized=self.workspace/'drafts'/(draft_id+'.json')
-            if not normalized.exists():atomic(normalized,{'draft':draft.model_dump(),'created_at':utcnow()})
-            self.latest_report_draft_id=draft_id
-            draft,bindings=bind_report_quotes(draft,self.lookup)
-            draft_id=hashlib.sha256(dumps(draft.model_dump(),sort_keys=True).encode()).hexdigest()[:24]
-            bound=self.workspace/'drafts'/(draft_id+'.json')
-            if not bound.exists():atomic(bound,{'draft':draft.model_dump(),'created_at':utcnow()})
-            self.latest_report_draft_id=draft_id
-            if self.event_sink:self.event_sink('report_draft_saved',{'draft_id':draft_id,'path':'/drafts/'+draft_id+'.json'})
-            return self._publish_checked(draft,bindings)
+            if draft.delivery_kind != 'evidence_gap' and not self._report_window_matches(draft.scope):
+                start, end = self.required_report_window
+                raise ValueError(f'This report request covers {start} inclusive to {end} exclusive. '
+                                 'Select evidence and calculate metrics for that window before correcting the draft scope.')
+            evidence_as_of = None
+            document_omissions = None
+            if self.allow_live and draft.scope is not None and draft.documents:
+                evidence_as_of = utcnow()
+                draft, bindings, omitted = prepare_report_documents(draft, self.lookup, evidence_as_of=evidence_as_of)
+                if omitted:
+                    document_omissions = {'source_draft_id': draft_id, 'documents': omitted}
+                    if self.event_sink:
+                        self.event_sink('report_documents_omitted', document_omissions)
+            draft=self._delivery_disclosures(draft.model_copy(deep=True), refresh_bound_records=bool(document_omissions))
+            if self.allow_live and draft.questions_to_watch:
+                from .report_presentation import report_watch_items
+                follow_ups=report_watch_items(draft.questions_to_watch)
+                if len(follow_ups) < len(draft.questions_to_watch) and self.event_sink:
+                    self.event_sink('report_watch_items_trimmed', {'source_draft_id':draft_id,'kept':len(follow_ups)})
+                draft.questions_to_watch=follow_ups
+            event_number_bindings = None
+            if self.allow_live and draft.scope and draft.key_changes:
+                from .report_recovery import bind_text_event_numbers
+                bound_events = bind_text_event_numbers(draft, self.lookup)
+                if bound_events:
+                    event_number_bindings = {'source_draft_id': draft_id, 'items': bound_events}
+                    if self.event_sink:
+                        self.event_sink('report_text_event_numbers_bound', event_number_bindings)
+            calculation_bindings = None
+            if self.allow_live and draft.scope and draft.charts:
+                from .report_recovery import bind_calculation_chart_inputs
+                bound_inputs = bind_calculation_chart_inputs(draft, self.lookup)
+                if bound_inputs:
+                    calculation_bindings = {'source_draft_id': draft_id, 'items': bound_inputs}
+                    if self.event_sink:
+                        self.event_sink('report_calculation_inputs_bound', calculation_bindings)
+            draft_id = self._save_report_draft(draft, emit=False)
+            if evidence_as_of is None:
+                draft, bindings = bind_report_quotes(draft, self.lookup)
+            draft_id = self._save_report_draft(draft)
+            options = {'evidence_as_of': evidence_as_of, 'document_omissions': document_omissions} if evidence_as_of else {}
+            if input_adjustments:
+                options['input_adjustments'] = input_adjustments
+            if calculation_bindings:
+                options['calculation_input_bindings'] = calculation_bindings
+            if event_number_bindings:
+                options['event_number_bindings'] = event_number_bindings
+            try:
+                return self._publish_checked(draft, bindings, **options)
+            except ReviewNeedsRevisionError:
+                reviewed = getattr(self, 'last_report_review', None)
+                if not self.allow_live or not reviewed or reviewed['draft'] != draft.model_dump():
+                    raise
+                result = omit_rejected_optional_items(draft, reviewed['review'])
+                if result is None:
+                    raise
+
+            candidate, omissions = result
+            removed_card = len(candidate.documents) < len(draft.documents)
+            receipt = {'source_draft_id': draft_id, 'review_id': reviewed['review']['review_id'], 'items': omissions}
+            draft = self._delivery_disclosures(candidate, refresh_bound_records=removed_card)
+            draft_id = self._save_report_draft(draft)
+            if self.event_sink:
+                self.event_sink('report_review_items_omitted', {**receipt, 'revised_draft_id': draft_id})
+            if removed_card:
+                positions = {doc.evidence_id: i for i, doc in enumerate(draft.documents)}
+                bindings = [{**b, 'path': f"/documents/{positions[b['evidence_id']]}/quote"}
+                            for b in bindings if b['evidence_id'] in positions]
+            return self._publish_checked(draft, bindings, review_omissions=receipt, **options)
         except ReviewBudgetExhausted:
             if getattr(self,'_minimal_attempted',False):raise
             return self.finalize_minimal_delivery(draft=draft,reason='normal_review_budget_exhausted')
@@ -714,60 +800,204 @@ class ResearchTools:
         except ValueError as exc:
             raise ValueError(f'Draft {draft_id} retained. Use publish_saved_report(draft_id="{draft_id}", edits=[...]) for focused corrections; do not rewrite or reread the whole report. '+str(exc)) from exc
 
-    def _delivery_disclosures(self,draft):
+    def _delivery_disclosures(self,draft,*,refresh_bound_records=False):
         if draft.delivery_kind=='evidence_gap':return draft
         from .audit import report_evidence_ids
-        ids=report_evidence_ids(draft.model_dump())
+        body=draft.model_dump()
+        ids=report_evidence_ids(body)
         if self.mode=='observed' and any(not i.startswith(('live-','page-','web-','context-')) for i in ids):
-            text='Archived datasets are reconstructed by observation time; unknown publication times prevent strict point-in-time claims.'
+            text=ARCHIVE_LIMITATION
             if text not in draft.limitations:draft.limitations.append(text)
         from .host_review_facts import (automatic_disclosure,bound_record_timestamp,
                                        BOUND_RECORDS_PREFIX,BOUND_RECORDS_SUFFIX)
-        online={rid:self.lookup(rid) for rid in ids if rid.startswith(('live-','page-','web-'))}
+        online={}
+        for rid in sorted(ids):
+            if not rid.startswith(('live-','page-','web-')):
+                continue
+            try:
+                online[rid]=self.lookup(rid)
+            except (ValueError,KeyError,FileNotFoundError) as exc:
+                from .report_recovery import evidence_reference_paths
+                fields=', '.join(evidence_reference_paths(body,rid)[:8])
+                location=f' at {fields}' if fields else ''
+                raise ValueError(f'Cannot use saved evidence {rid!r}{location}: {exc}. '
+                    'Verify this original record ID and edit only the affected field(s), or remove the unsupported claim.') from exc
         latest=bound_record_timestamp(online)
-        if latest:
+        if latest or refresh_bound_records:
             # Replace only complete known host templates, not an author's
             # custom limitation or a similarly prefixed external assertion.
             draft.limitations=[item for item in draft.limitations if automatic_disclosure(item) is None]
+        if latest:
             text=BOUND_RECORDS_PREFIX+latest+BOUND_RECORDS_SUFFIX
             if text not in draft.limitations:draft.limitations.append(text)
+        elif refresh_bound_records and not draft.limitations:
+            draft.limitations.append(OMITTED_DOCUMENT_LIMITATION)
         return ReportDraft.model_validate(draft.model_dump())
 
     def finalize_minimal_delivery(self,*,draft=None,reason='normal_review_incomplete'):
-        """One reserved final audit, then a literal notice; no unbounded new loop."""
+        """Share two reserved requests across factual delivery and an optional supported subset."""
         if getattr(self,'_minimal_attempted',False):raise ValueError('Final delivery was already attempted')
         if not self.report_allowed:raise ValueError('Market refresh cannot publish reports')
         if getattr(self,'cancel',None) and self.cancel.is_set():raise RuntimeError('User cancelled; no fallback publication')
         self._minimal_attempted=True
-        if draft is None and getattr(self,'latest_report_draft_id',None):
-            saved=self.workspace/'drafts'/(self.latest_report_draft_id+'.json')
-            if saved.is_file():draft=ReportDraft.model_validate(json.loads(saved.read_text())['draft'])
-        from .minimal_delivery import minimal_report,evidence_gap_notice
+
+        def saved_draft(draft_id):
+            if not draft_id:
+                return None
+            path = self.workspace/'drafts'/(draft_id+'.json')
+            try:
+                return ReportDraft.model_validate(json.loads(path.read_text())['draft'])
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+
+        if draft is None:
+            draft = saved_draft(getattr(self,'latest_report_draft_id',None))
+        if (draft is None or draft.delivery_kind == 'evidence_gap' or not self._report_window_matches(draft.scope)):
+            validated = saved_draft(self.last_source_validated_draft_id)
+            if validated is not None and self._report_window_matches(validated.scope):
+                draft = validated
+        notice_scope = draft.scope if draft is not None else None
+        if draft is not None and not self._report_window_matches(draft.scope):
+            if notice_scope is not None:
+                start, end = self.required_report_window
+                notice_scope = notice_scope.model_copy(update={'start': start, 'end': end})
+            draft = None
+        from .minimal_delivery import (minimal_report,evidence_gap_notice,prepare_factual_minimal,
+                                       omit_single_reviewed_event,saved_market_fallback)
         previous=getattr(self,'last_report_review',None)
-        candidate=None;retained=[]
-        if draft is not None and previous and previous['draft']==draft.model_dump():
-            candidate,retained=minimal_report(draft,previous['review'])
+        candidate=None;retained=[];pending=[];event_candidate=None
+        from .etf_flow_validation import check_etf_flow_statement
+
+        def passes_dated_flow_check(claim):
+            try:
+                check_etf_flow_statement(claim.statement,claim.evidence_ids,self.lookup)
+            except ValueError:
+                return False
+            return True
+
+        evidence_as_of=utcnow() if self.allow_live else self.cutoff
+        selection={'lookup':self.lookup,'evidence_as_of':evidence_as_of,'claim_filter':passes_dated_flow_check}
+
+        def select_factual_delivery(source):
+            if previous and previous['draft'] == source.model_dump():
+                subset, supported = minimal_report(source, previous['review'], **selection)
+                return subset, supported, [], omit_single_reviewed_event(source, previous['review'])
+            subset, unreviewed = prepare_factual_minimal(source, **selection)
+            return subset, [], unreviewed, None
+
+        if draft is not None:
+            candidate, retained, pending, event_candidate = select_factual_delivery(draft)
+        checkpoint_used = None
+        if candidate is None and event_candidate is None:
+            checkpoint = saved_draft(self.last_report_checkpoint_id)
+            if (checkpoint is not None and checkpoint != draft and checkpoint.delivery_kind == 'full'
+                    and self._report_window_matches(checkpoint.scope)
+                    and (checkpoint.scope is not None or not getattr(self, 'require_report_scope', False))):
+                candidate, retained, pending, event_candidate = select_factual_delivery(checkpoint)
+                if candidate is not None or event_candidate is not None:
+                    draft = checkpoint
+                    notice_scope = checkpoint.scope
+                    checkpoint_used = self.last_report_checkpoint_id
+        market_fallback = False
+        if candidate is None and self.allow_live and self.required_report_window:
+            prompt = getattr(self,'report_user_prompt','')
+            explicitly_narrow = re.search(
+                r'只关注|只看|只要|仅限|\b(?:only cover|without market data|governance-only)\b',prompt,re.I)
+            if not explicitly_narrow:
+                assets = [asset for asset,pattern in (('ETH',r'\bETH(?:ereum)?\b|以太坊'),
+                          ('BTC',r'\bBTC\b|\bBitcoin\b|比特币')) if re.search(pattern,prompt,re.I)]
+                candidate = saved_market_fallback(self.required_report_window,assets or ['ETH'],
+                    knowledge=self.knowledge,lookup=self.lookup,evidence_as_of=evidence_as_of)
+                if candidate:
+                    market_fallback = True
+                    notice_scope = candidate.scope
         metadata={'reason':reason,'normal_request_limit':getattr(self.reviewer,'max_requests',0),
             'normal_requests_used':getattr(self.reviewer,'calls',0),'normal_rounds_used':getattr(self.reviewer,'rounds',0),'normal_round_limit':getattr(self.reviewer,'max_rounds',4),'final_request_limit':2,
             'original_draft_id':getattr(self,'latest_report_draft_id',None),'retained_target_ids':retained}
+        if market_fallback:
+            metadata['fallback_basis']='saved_completed_market_candles'
+        if checkpoint_used:
+            metadata['checkpoint_draft_id'] = checkpoint_used
+            metadata.setdefault('fallback_basis', 'source_validated_checkpoint')
+        if pending:
+            metadata['unreviewed_targets_selected_for_final_audit']=pending
         self.delivery_metadata=metadata
         if self.event_sink:self.event_sink('minimal_delivery_started',metadata)
         original=self.reviewer
         try:
-            if candidate is not None:
-                factory=getattr(self,'minimal_reviewer_factory',None)
-                if factory:
-                    self.reviewer=factory()
+            factory = getattr(self, 'minimal_reviewer_factory', None)
+            spent_on_event_candidate = 0
+            if event_candidate and factory:
+                limited, omission = event_candidate
+                omission['source_draft_id'] = hashlib.sha256(dumps(draft.model_dump(), sort_keys=True).encode()).hexdigest()[:24]
+                metadata['event_omission'] = omission
+                metadata['retained_target_ids'] = [cid for cid in omission['retained_original_review_target_ids']
+                                                   if re.fullmatch(r'[OK][1-9]\d*', cid)]
+                if self.event_sink:
+                    self.event_sink('minimal_event_omitted', omission)
+                try:
+                    event_reviewer = factory(1)
+                    if event_reviewer.max_requests != 1:
+                        raise ValueError('Event-omission audit requires a single review request')
+                    if hasattr(event_reviewer, 'require_single_batch'):
+                        event_reviewer.require_single_batch = True
+                    self.reviewer = event_reviewer
+                    return self.publish(limited)
+                except Exception as exc:
+                    self._check_delivery_cancelled()
+                    spent_on_event_candidate = self.reviewer.calls if self.reviewer is not original else 0
+                    metadata['retained_target_ids'] = retained
+                    omission['outcome'] = 'fall_back_to_supported_facts'
+                    omission['failure_type'] = type(exc).__name__
+                    omission['requests_used'] = spent_on_event_candidate
+                    metadata['final_requests_before_refinement'] = spent_on_event_candidate
+                    metadata['final_requests_used'] = spent_on_event_candidate
+            if candidate is not None and factory and spent_on_event_candidate < 2:
+                self.reviewer = factory(2 - spent_on_event_candidate) if spent_on_event_candidate else factory()
+                if spent_on_event_candidate and self.reviewer.max_requests != 2 - spent_on_event_candidate:
+                    return self.publish(evidence_gap_notice(notice_scope))
+                for attempt in range(2):
                     try:
-                        result=self.publish(candidate)
-                        metadata['final_requests_used']=getattr(self.reviewer,'calls',0)
-                        return result
+                        return self.publish(candidate)
                     except Exception as exc:
-                        if getattr(self,'cancel',None) and self.cancel.is_set():raise
-                        metadata['final_requests_used']=getattr(self.reviewer,'calls',0)
-                        metadata['final_failure_type']=type(exc).__name__
+                        self._check_delivery_cancelled()
+                        spent = metadata.get('final_requests_before_refinement', 0) + self.reviewer.calls
+                        metadata['final_requests_used'] = spent
+                        metadata['final_failure_type'] = type(exc).__name__
+                        if attempt or spent != 1 or not isinstance(exc, ReviewNeedsRevisionError):
+                            break
+                        previous = getattr(self, 'last_report_review', None)
+                        if not previous or previous['review']['review_id'] != exc.feedback['review_id']:
+                            break
+                        failed = ReportDraft.model_validate(previous['draft'])
+                        failed_id = hashlib.sha256(dumps(failed.model_dump(), sort_keys=True).encode()).hexdigest()[:24]
+                        if failed.delivery_kind != 'minimal' or failed_id != exc.feedback.get('draft_id'):
+                            break
+                        review = previous['review']
+                        if review.get('unassessed_targets') or any(batch['status'] != 'validated' for batch in review.get('batches', [])):
+                            break
+                        candidate, supported_ids = minimal_report(failed, review, **selection)
+                        if candidate is None or len(supported_ids) >= len(failed.observations) + len(failed.key_changes):
+                            break
+                        # Only the unspent physical slot can audit the new draft.
+                        try:
+                            next_reviewer = factory(2 - spent)
+                        except Exception as setup_error:
+                            metadata['final_failure_type'] = type(setup_error).__name__
+                            break
+                        if next_reviewer.max_requests != 2 - spent:
+                            metadata['final_failure_type'] = 'InvalidRefinementBudget'
+                            break
+                        self.reviewer = next_reviewer
+                        refinement = {'source_draft_id': failed_id, 'source_review_id': review['review_id'],
+                                      'retained_target_ids': supported_ids,
+                                      'retained_chart_ids': [chart.evidence_id for chart in candidate.charts]}
+                        metadata.update(final_requests_before_refinement=spent, refinement=refinement)
+                        metadata.pop('final_failure_type')
+                        if self.event_sink:
+                            self.event_sink('minimal_delivery_refined', refinement)
             if getattr(self,'cancel',None) and self.cancel.is_set():raise RuntimeError('User cancelled; no fallback publication')
-            notice=evidence_gap_notice(draft.scope if draft is not None else None)
+            notice=evidence_gap_notice(notice_scope)
             return self.publish(notice)
         finally:self.reviewer=original
 
@@ -782,7 +1012,7 @@ class ResearchTools:
             raise ValueError('Saved report draft changed; do not overwrite retained drafts')
         return self.publish(revise_report(saved,edits))
 
-    def _publish_checked(self,draft,quote_bindings):
+    def _publish_checked(self,draft,quote_bindings,*,evidence_as_of=None,input_adjustments=None,document_omissions=None,review_omissions=None,calculation_input_bindings=None,event_number_bindings=None):
         self._check_delivery_cancelled()
         if getattr(self,'require_report_scope',False) and not getattr(draft,'scope',None) and draft.delivery_kind!='evidence_gap':
             raise ValueError('Set the report scope with assets and explicit UTC start and exclusive end')
@@ -790,8 +1020,11 @@ class ResearchTools:
         path=self.workspace/'drafts'/(draft_id+'.json')
         if not path.exists():atomic(path,{"draft":draft.model_dump(),"created_at":utcnow()})
         if self.event_sink:self.event_sink('source_validation_started',{'scope':'Checking source identities, lineage, exact numeric values and units'})
-        evidence_as_of=utcnow() if self.allow_live else self.cutoff
+        if evidence_as_of is None:
+            evidence_as_of=utcnow() if self.allow_live else self.cutoff
         check=validate_report(draft,self.lookup,as_of=evidence_as_of)
+        if draft.delivery_kind == 'full':
+            self.last_source_validated_draft_id = draft_id
         working=getattr(self,'working_memory',None);job_id=getattr(self,'job_id',None)
         if working and job_id:
             try:working.observe_tool(job_id,'publish_report',{'validation':check,'status':'validated_not_published'})
@@ -863,9 +1096,18 @@ class ResearchTools:
         created_at=utcnow()
         bundle={"report":draft.model_dump(),"cutoff":self.cutoff,"online_retrieved_through":online_through,"research_mode":"current" if online_sources else "historical","mode":self.mode,"validation":check,"review":review_meta,"semantic_checks":semantic,"created_at":created_at,"data_run":str(self.run_dir),"sources":sources,"run_metadata":self.run_metadata}
         if getattr(self,'delivery_metadata',None):
-            self.delivery_metadata.setdefault('final_requests_used',getattr(self.reviewer,'calls',0) if draft.delivery_kind=='minimal' else self.delivery_metadata.get('final_requests_used',0))
+            if draft.delivery_kind == 'minimal':
+                self.delivery_metadata['final_requests_used'] = (self.delivery_metadata.get('final_requests_before_refinement', 0)
+                                                                + getattr(self.reviewer, 'calls', 0))
+            else:
+                self.delivery_metadata.setdefault('final_requests_used', 0)
             bundle['delivery']=dict(self.delivery_metadata)
+        if input_adjustments:bundle['input_adjustments']=input_adjustments
         if quote_bindings:bundle['quote_bindings']=quote_bindings
+        if calculation_input_bindings:bundle['calculation_input_bindings']=calculation_input_bindings
+        if event_number_bindings:bundle['event_number_bindings']=event_number_bindings
+        if document_omissions:bundle['document_omissions']=document_omissions
+        if review_omissions:bundle['review_omissions']=review_omissions
         render_options={}
         if getattr(draft,'scope',None):
             from .report_presentation import build_report_presentation
@@ -876,20 +1118,36 @@ class ResearchTools:
         body=dumps(bundle,indent=2).encode();digest=hashlib.sha256(body).hexdigest();base="research-"+digest[:12]
         pending=self.workspace/'reports/.pending';pending.mkdir(parents=True,exist_ok=True)
         (pending/(base+'.json')).write_bytes(body)
-        (pending/(base+'.md')).write_text(render_report(draft,self.cutoff,check,sources,online_through,review_meta,**render_options))
+        (pending/(base+'.md')).write_text(render_report(draft,self.cutoff,check,sources,online_through,review_meta,
+                                                       lookup=self.lookup,**render_options))
         package=None
         if self.audit_builder:
             config={"model":review_meta.get("reviewer_model") or (self.reviewer.settings.model_id if self.reviewer else 'conversation-bridge'),
                     "harness":"deepagents==0.7.23","decision_profile":self.decision_profile,"review_version":review_meta.get('review_version'),"software_fingerprint":self.run_metadata.get('software_fingerprint')}
             package=self.audit_builder.build(self.workspace,self.run_dir,"/reports/.pending/"+base+".md",self.lookup,config)
             if self.event_sink:self.event_sink('bundle_created',{"package_id":package['package_id'],"files":package['files'],"status":package['verification']['status']})
-        self._check_delivery_cancelled()
-        (pending/(base+'.json')).replace(self.workspace/'reports'/(base+'.json'))
-        (pending/(base+'.md')).replace(self.workspace/'reports'/(base+'.md'))
-        if package:atomic(self.workspace/'reports'/(base+'.audit.json'),package)
-        self.published_reports.append('/reports/'+base+'.md')
-        self.last_report={'path':'/reports/'+base+'.md','draft':draft.model_dump(),'delivery_kind':draft.delivery_kind}
-        if self.knowledge:self.knowledge.retain_report(base,self.run_metadata.get('session_id',''),bundle)
+        staged = [pending/(base+'.json'), pending/(base+'.md')]
+        if package:
+            receipt = pending/(base+'.audit.json')
+            atomic(receipt, package)
+            staged.append(receipt)
+        with self.lock:
+            self._check_delivery_cancelled()
+            moved = []
+            try:
+                for source in staged:
+                    destination = pending.parent/source.name
+                    source.replace(destination)
+                    moved.append((destination, source))
+                if self.knowledge:
+                    self.knowledge.retain_report(base, self.run_metadata.get('session_id', ''), bundle)
+            except Exception:
+                for destination, source in reversed(moved):
+                    destination.replace(source)
+                raise
+            # Reports lists the indexed copy. A file alone is not a completed publication.
+            self.published_reports.append('/reports/'+base+'.md')
+            self.last_report={'path':'/reports/'+base+'.md','draft':draft.model_dump(),'delivery_kind':draft.delivery_kind}
         cases=self.retain_explanation_cases(draft.explanations,base,'reviewed_report',bundle['created_at'],review_meta)
         return {"status":"saved","delivery_kind":draft.delivery_kind,"report_path":"/reports/"+base+".md","structured_path":"/reports/"+base+".json","sha256":digest,"validation":check,"review":review_meta,"audit_package":package,"case_memory":cases}
 
@@ -1210,7 +1468,7 @@ class ResearchTools:
         def analyze_market(asset:Literal["ETH","BTC"]="ETH",days:int=30)->str:
             """Use trusted local Python to compute return, volatility and drawdown over a contiguous daily price window. Fraction fields remain fractions. Returns a citable calculation ID and reproducible inputs."""
             return dumps(service.analyze(asset,days))
-        @tool
+        @tool(args_schema=LivePublishArguments if self.allow_live else None)
         def publish_report(draft:ReportDraft,user_request:str='')->str:
             """Save a source-checked report only when requested. In chat, quote the user's publication request verbatim in user_request. Include the UTC research scope, relevant saved chart series and featured originals when available. Numeric values must match saved evidence."""
             if service.report_request_prompt is not None:

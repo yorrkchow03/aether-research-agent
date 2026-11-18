@@ -8,18 +8,21 @@ Choose depth, sources and order from the user's question. This is guidance, not 
 mandatory checklist. Read supporting references only when needed.
 
 Use the supplied asset, time window, source IDs, collections and registered
-measurements as the starting state. For a report with an established window and
-usable measurements, begin substantive evidence work with date-scoped news recall;
-read the named calculation directly for its exact fields as needed. Do not first
-map directories, discover JSON schemas or inventory every available source.
+measurements as the starting state. Reuse exact saved excerpts and registered
+fields already supplied for this report. If the in-window events are missing,
+begin evidence work with date-scoped news recall. Reopen a saved source or read
+the named calculation when an exact field, qualification or conflict needs
+checking. Do not first map directories, discover JSON schemas or inventory
+every available source.
 
 A short plan covers the remaining evidence questions, synthesis and delivery.
 Storage mapping, skill reading and each individual tool are not research stages.
 For report recovery, reuse supplied task notes and acquired work. Batch
 independent focused reads.
 Successful reader quotes already bind exact opened source ranges; use them and
-reopen only a missing condition or a specific spot check. Finish substantive
-research before publish_report. If a draft needs correction, prefer
+reopen only a missing condition or a specific spot check. Save a short
+unpublished draft as soon as the first scoped observation is supported. Then
+fill material gaps before publish_report. If a draft needs correction, prefer
 publish_saved_report with explicit field edits from the actual feedback. A draft
 is a recoverable artifact, not proof that all needed evidence has been read.
 Being recalled or opened does not bind a source to the submitted report. During
@@ -61,12 +64,25 @@ calculation only when a material gap or the user's requested depth requires it.
   Inspect additional fields only when they can change a claim or its limitation.
 - For weekly/monthly reports resolve an explicit UTC start/end window before
   recall and pass it to `recall_memory(kind="news", start=..., end=...)`. Begin
-  with a broad public asset/window query; a single upgrade/entity query cannot
-  establish whole-week event coverage. Inspect candidate and selected coverage,
-  dates, duplicate groups and missing topics. Featured document cards are a
-  reader-facing selection, not a cap on research. Important background/later
-  updates must be labeled separately from in-window news. Missing dates mean
-  missing captured coverage, never that nothing happened. Avoid article quotas.
+  with a broad public asset/window query. Compare selected dates and themes with
+  candidate coverage. If results cluster on a few dates or one event, use a
+  blank-query window overview or a targeted query for the missing dates/themes.
+  For a narrow follow-up start with 6–8 passages. Use a focused original read
+  only when the returned passage leaves a material clause or timestamp unresolved.
+  When the central metrics and distinct developments are supported, submit the
+  draft and use review feedback for remaining corrections.
+  For a broad weekly brief, consider market and fund flows, protocol/security,
+  and adoption/governance or policy as applicable to the request and sources.
+  Begin with one broad window recall and the main saved market series. Three to
+  six distinct supported developments is a useful planning target when sources
+  support them. The requested scope and evidence determine the actual count.
+  Follow up on a specific uncovered date, theme or conflicting account when it
+  could change the report. Stop discovery when another query would repeat
+  covered events or leave the main findings and limitations unchanged.
+  Summarize every material, supported development by event, grouping repeated
+  coverage and tracing corrections to their original sources. Label earlier
+  background and later updates separately. Disclose remaining date or topic
+  gaps in limitations. An explicit price-only request can stay price-only.
 - News retrieval returns independently ranked exact passages, not one bundled
   excerpt per article. Leave max_results unset for task-adaptive initial counts;
   if selected dates/topics do not cover the question, request more or refine the
@@ -239,21 +255,39 @@ Keep summary and judgment consistent with the cited facts. Full purchase reports
 should explain conditions, contrary evidence, invalidation, costs and missing user
 information in purchase_decision. A short market summary needs no forced simulation.
 Questions to watch are optional. For a short factual brief, use zero or one useful
-future question and a few relevant coverage/measurement limits. Do not fill those
-fields with unrelated news or unsupported factual premises; retain source
-disagreements that matter to an actual claim in the brief.
+future question. For a broad period report, default to two priority checks and
+add a third only for a distinct material development. Order short questions by
+importance and verify any factual premise. Use limitations for relevant coverage
+and measurement gaps.
 For a compact brief, keep only central measurements in observations and put each
-news development in one factual section. The summary should give the qualified
-lead, not repeat every metric and key change. A requested main-body word budget
-counts summary, observations, key_changes and interpretations together. Bind
+news development in its own event entry. Open with the main finding and its
+qualification. A requested main-body word budget counts summary, observations,
+key_changes and interpretations together. Bind
 sources used only by summary, questions, limitations or judgment through
 narrative_evidence_ids; those text fields have no nested evidence_ids property.
 
-For an ordinary investor brief, use the default informational judgment. Lead with
-the important developments, sourced key_changes, main facts, qualified meaning,
-open questions and gaps. Qualitative dates, status and reasons use statement and
-evidence_ids only; do not fill metric/value/unit with text. Those three fields
-are exclusively a complete numeric key/value/unit from saved evidence.values.
+For a broad period report, write in reading order:
+
+1. Open with a short summary of what changed and what matters most in the window.
+2. Select saved charts for central series when available.
+3. In observations,
+   highlight meaningful metric changes with their period, units and venue.
+4. Write one key_changes entry per distinct material event. Start with the
+   supported event date or range, preferably YYYY-MM-DD, then explain what
+   changed and its status. Include material facts in the event and cite their
+   original record IDs. Give a selected original document the same evidence ID
+   as its related event so the report can display it on that event card.
+   Use statement and evidence_ids for qualitative events and avoid repeating
+   the same facts across fields.
+5. Summarize the evidence-based research judgment. Include a short, conditional
+   suggestion when warranted.
+6. Use questions_to_watch for the highest-priority next milestones or checks.
+7. Describe material limits and unknowns.
+8. Bind sources to each claim for the generated sources and review section.
+
+For an ordinary investor brief, use the default informational judgment.
+Structured metric/value/unit fields require an exact saved numeric field,
+value and unit from evidence.values.
 Forecasts and investment suggestions are optional. Use
 plain language and rounded percentages in prose while keeping exact values and
 units in structured claims; disclose period, venue and capture clocks. Do not

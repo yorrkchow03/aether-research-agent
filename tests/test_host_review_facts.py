@@ -57,6 +57,17 @@ class HostReviewFactsTests(unittest.TestCase):
                 with self.subTest(override=override,kind=target['kind']):
                     self.assertFalse(is_verified_host_target(target,{**body,**override},{}))
 
+    def test_minimal_literal_allows_only_typed_distinct_scoped_charts(self):
+        body={'delivery_kind':'minimal','summary':MINIMAL_SUMMARY,'limitations':[MINIMAL_LIMIT],
+              'observations':[{'statement':'Synthetic observed fact.','evidence_ids':['fixture']}],
+              'scope':{'assets':['ETH'],'start':'2026-10-25T00:00:00Z','end':'2026-10-27T00:00:00Z'}}
+        spec={'evidence_id':'series-'+'a'*24,'metric':'close_usd'}
+        target={'kind':'summary','statement':MINIMAL_SUMMARY}
+        self.assertTrue(is_verified_host_target(target,{**body,'charts':[spec]},{}))
+        self.assertFalse(is_verified_host_target(target,{**body,'scope':None,'charts':[spec]},{}))
+        self.assertFalse(is_verified_host_target(target,{**body,'charts':[spec,spec]},{}))
+        self.assertFalse(is_verified_host_target(target,{**body,'charts':[{**spec,'title':'Asserted market fact'}]},{}))
+
     def test_global_clock_max_and_exact_text(self):
         target,body,texts=self.fixture()
         self.assertTrue(is_verified_host_target(target,body,texts))

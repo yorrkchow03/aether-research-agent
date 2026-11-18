@@ -14,7 +14,7 @@ import sqlite3
 
 from research_data.http import utcnow
 from research_data.library.time import timestamp
-from .knowledge import identify_assets, news_coverage, source_content_fingerprint
+from .knowledge import _diverse_news, canonical_url, identify_assets, news_coverage, source_content_fingerprint
 
 
 VERSION = 'exact-passage-bm25-potion-rrf-v1'
@@ -150,6 +150,39 @@ def _passages(sources, max_chars):
                 'input_excerpt_sha256':digest,'source_scope':SCOPE})
             if finish==end:break
     return rows
+
+
+def _empty_query_order(sources, passages, cutoff, *, scoped):
+    def newest_first(row):
+        date=row.get('published_at') or row.get('retrieved_at') or row.get('acquired_at') or cutoff
+        return -timestamp(date).timestamp(),row['record_id']
+
+    dated=sorted(sources,key=newest_first)
+    if scoped:
+        # Keep the candidate window's date and publisher breadth when the
+        # passage budget is smaller than the number of captured sources.
+        primary=[]
+        versions=[]
+        origins=set()
+        for row in dated:
+            raw_url=row.get('url') or (row.get('source') or {}).get('url')
+            try:
+                url=canonical_url(raw_url) if isinstance(raw_url,str) else None
+            except ValueError:
+                url=None
+            if url and url in origins:
+                versions.append(row)
+                continue
+            if url:
+                origins.add(url)
+            primary.append({'record_id':row['record_id'],'url':url,
+                'published_at':timestamp(row['published_at']).isoformat()})
+        dated=[*_diverse_news(primary,len(primary)),*versions]
+    by_source={row['record_id']:[] for row in dated}
+    for passage in passages:
+        by_source[passage['record_id']].append(passage['passage_id'])
+    return [items[index] for index in range(max((len(items) for items in by_source.values()),default=0))
+        for items in by_source.values() if index<len(items)]
 
 
 def _nonoverlapping(order, by_id):
@@ -293,9 +326,7 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
     ordered=sorted(totals,key=lambda pid:(-totals[pid],pid))
     if not query.strip():
         # Empty query means a timeline/source overview, not arbitrary vectors.
-        dated=sorted(sources,key=lambda r:(-timestamp(r.get('published_at') or r.get('retrieved_at') or r.get('acquired_at') or cutoff).timestamp(),r['record_id']))
-        by_source={r['record_id']:[p['passage_id'] for p in passages if p['record_id']==r['record_id']] for r in dated}
-        ordered=[items[i] for i in range(max((len(v) for v in by_source.values()),default=0)) for items in by_source.values() if i<len(items)]
+        ordered=_empty_query_order(sources,passages,cutoff,scoped=bool(start and end))
     ordered=_nonoverlapping(ordered,by_id)
     candidate_limit=min(256,max(64,limit*4));at_limit=len(ordered)>candidate_limit
     ordered=ordered[:candidate_limit]
@@ -364,7 +395,8 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
         'jev_selection_warning':'Slot reranking can retain irrelevant passages. Inspect topic and asset scope; abstention is unknown relevance. Do not treat every selected passage as a report-worthy event.' if irrelevant_selected else None,
         'semantic_request_bound':max_judgments if judge else 0,'jev_reranking':jev_meta,
         'retrieval':'BM25 per exact passage + independent Potion passage cosine, fused by reciprocal rank',
-        'empty_query_policy':'date/source breadth; no embedding or Jev call' if not query.strip() else None,
+        'empty_query_policy':('UTC publication-day and publisher breadth with distinct canonical origins ranked first; no embedding or Jev call'
+            if start and end else 'date/source breadth; no embedding or Jev call') if not query.strip() else None,
         'baseline_passage_ids':base_order,'ranked_passage_ids':ordered,
         'time_policy':{'publication_start_inclusive':start,'publication_end_exclusive':end,
             'publication_cutoff':cutoff,'acquisition_cutoff':acquisition_cutoff or (cutoff if mode=='strict' else None),

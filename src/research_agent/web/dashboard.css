@@ -26,7 +26,7 @@
 .report-overview-sources li { min-width: 0; }
 .report-overview-sources button, .report-evidence-links a { white-space: normal; overflow-wrap: anywhere; text-align: left; }
 
-.report-chart-section, .report-featured-documents { margin: 24px 0; }
+.report-chart-section { margin: 24px 0; }
 .report-chart-card, .report-document-card {
   margin: 12px 0;
   padding: 16px 18px;
@@ -35,7 +35,7 @@
   border-radius: 11px;
   background: #fff;
 }
-.report-chart-card h3, .report-document-card h3 { margin: 0; }
+.report-chart-card h3 { margin: 0; }
 .report-chart-meta, .report-document-publisher, .report-chart-gap { margin: 5px 0 12px; color: #5b687f; font-size: 13px; }
 .report-chart-svg { width: 100%; max-width: 730px; height: auto; display: block; margin: 4px auto 6px; color: #635bce; }
 .report-chart-svg.report-chart-volume { color: #218168; }
@@ -51,7 +51,6 @@
 .report-evidence-links { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; }
 .report-chart-details .report-evidence-links { margin: 8px 0 0; }
 
-.report-document-card .pill { margin: 0 0 7px; }
 .report-document-card blockquote {
   margin: 12px 0;
   padding: 8px 12px;

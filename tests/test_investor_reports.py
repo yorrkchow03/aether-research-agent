@@ -48,7 +48,7 @@ class InvestorReportTests(unittest.TestCase):
             markdown=(tools.workspace/result['report_path'].lstrip('/')).read_text()
             self.assertEqual(result['status'],'saved')
             self.assertEqual(saved['report']['judgment'],'informational')
-            self.assertNotIn('## Research judgment',markdown)
+            self.assertIn('The saved sources did not support a separate research judgment.',markdown)
             self.assertNotIn('## Conditional scenarios',markdown)
 
     def test_key_changes_use_the_same_value_unit_and_source_validation(self):
@@ -84,9 +84,10 @@ class InvestorReportTests(unittest.TestCase):
 
     def test_absent_optional_content_does_not_create_empty_prediction_or_advice_sections(self):
         markdown=render_report(self.draft(),'2026-10-13T00:00:00Z',{},[])
-        self.assertIn('## Main facts',markdown)
+        self.assertIn('## Key events',markdown)
+        self.assertNotIn('## Main facts',markdown)
         for heading in ('## Interpretation','## Recent key changes','## Questions to follow up',
-                        '## Conditional outlook','## Conditional scenarios','## Research judgment',
+                        '## Conditional outlook','## Conditional scenarios',
                         '## Decision context','## Conditional research suggestion'):
             self.assertNotIn(heading,markdown)
         self.assertNotIn('No directional forecast is committed',markdown)
@@ -97,9 +98,8 @@ class InvestorReportTests(unittest.TestCase):
         question='Has the announced upgrade actually activated?'
         draft=self.draft(questions_to_watch=[question])
         markdown=render_report(draft,'2026-10-13T00:00:00Z',{},[])
-        self.assertIn('## Questions to follow up',markdown)
-        self.assertIn('not confirmed developments',markdown)
-        self.assertGreater(markdown.index(question),markdown.index('## Questions to follow up'))
+        self.assertIn('## What to watch next',markdown)
+        self.assertGreater(markdown.index(question),markdown.index('## What to watch next'))
         self.assertEqual(len(report_claims(draft)),1)
         self.assertNotIn(question,[c.statement for c in report_claims(draft)])
         with self.assertRaises(ValueError):self.draft(questions_to_watch=[' '])
@@ -114,7 +114,8 @@ class InvestorReportTests(unittest.TestCase):
         self.assertIn('0.03248045917709286',markdown)
         self.assertIn('<summary>Exact saved numeric field</summary>',markdown)
         self.assertEqual(draft.model_dump(),before)
-        self.assertLess(markdown.index('## Recent key changes'),markdown.index('## Main facts'))
+        timeline=markdown.split('## Key events',1)[1].split('## Research judgment',1)[0]
+        self.assertLess(timeline.index('Fixture return.'),timeline.index('A reported fixture observation.'))
 
     def test_optional_scenario_preserves_numbered_support_and_counterevidence_links(self):
         draft=self.draft(forecasts=[{'statement':'A synthetic conditional possibility.',

@@ -122,7 +122,7 @@ class ResearchPlanningMiddleware(AgentMiddleware):
                 return self._error(call, 'A new request cannot start with all work completed.')
         elif not self._accepted(state) and not self._preparation(call):
             return self._error(call, "No plan has been saved for this research request; the requested tool has not executed.")
-        elif self._accepted(state) and not any(item.get("status") == "in_progress" for item in state.get("todos", [])) and call["name"] not in {"submit_research_answer", "publish_report","publish_saved_report"} and not self._preparation(call):
+        elif self._accepted(state) and not any(item.get("status") == "in_progress" for item in state.get("todos", [])) and call["name"] not in {"submit_research_answer", "publish_report","publish_saved_report","save_report_draft"} and not self._preparation(call):
             return self._error(call, "The saved plan has no active step; update it before starting further research.")
         return None
 

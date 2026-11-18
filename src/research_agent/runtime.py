@@ -39,9 +39,9 @@ from .prompts import research_system_prompt
 from .sdk_bridge import ResearchSDKServer
 from .planning import (ResearchPlanningMiddleware, PLANNING_INSTRUCTIONS, PLAN_TOOL_DESCRIPTION,
                        CONVERSATION_PLANNING_INSTRUCTIONS)
-from .chat_reply import chat_answer, chat_intent, requests_report
+from .chat_reply import asks_about_report_notice, chat_answer, chat_intent, requests_report
 from .conversation_context import saved_chat_context, validate_chat_links
-from .research_policy import requests_research, CHAT_EXECUTION_POLICY, RESEARCH_READER_POLICY
+from .research_policy import recent_report_window, requests_research, CHAT_EXECUTION_POLICY, RESEARCH_READER_POLICY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 register_harness_profile("local_bridge:conversation-bridge", HarnessProfile(
@@ -62,6 +62,36 @@ def retain_completed_publications(status,service):
     if paths:
         status.update(published_reports=list(dict.fromkeys(paths)),publication_state='saved_before_interruption')
     return status
+
+
+def _published_report_answer(report, session_id):
+    from .report_presentation import report_display_summary, report_display_title
+
+    draft = report['draft']
+    label = 'Evidence availability notice' if report['delivery_kind'] == 'evidence_gap' else 'Report published'
+    href = f"/api/sessions/{session_id}/artifact?path={report['path']}"
+    return f"{label}: [{report_display_title(draft)}]({href})\n\n{report_display_summary(draft)}"
+
+
+def _misrouted_report(job):
+    return (job.get('state') == 'completed' and job.get('deliverable') == 'answer'
+            and job.get('request_purpose') == 'chat' and not job.get('chat_reply')
+            and not job.get('published_reports') and requests_report(job.get('prompt', '')))
+
+
+def _report_already_recovered(job_id, jobs):
+    lineage = {job_id}
+    for item in jobs:
+        if item.get('continued_from_job_id') in lineage:
+            lineage.add(item['job_id'])
+            if item.get('published_reports') and item.get('report_delivery_kind') != 'evidence_gap':
+                return True
+    return False
+
+
+def _evidence_gap_report(job):
+    return (job.get('state') == 'completed' and job.get('deliverable') == 'report'
+            and job.get('request_purpose') == 'chat' and job.get('report_delivery_kind') == 'evidence_gap')
 
 
 def freeze_software(root,state_dir):
@@ -463,6 +493,9 @@ class AgentRuntime:
             jobs=self._session_jobs(directory)
             live=self.active.get(sid)
             stopping=bool(live and live[1].is_set())
+        for job in jobs:
+            if _misrouted_report(job) or _evidence_gap_report(job):
+                job['report_retry_available'] = not _report_already_recovered(job['job_id'], jobs)
         return {"session":meta,"jobs":jobs,"reports":reports,"active_job_id":live[0] if live else None,"stopping":stopping}
 
     def start(self, sid, prompt, deliverable='answer', schedule_run_id=None, *, request_purpose=None, continued_from=None,jev_assistance=None,report_review_provider="generation_model"):
@@ -473,20 +506,26 @@ class AgentRuntime:
         directory=self._session_dir(sid)
         meta=json.loads((directory/"session.json").read_text())
         if meta.get("hidden_seed"):raise ValueError("Initial report provenance is read-only; start a new personal conversation")
-        intent = chat_intent(prompt) if request_purpose == 'chat' and deliverable == 'answer' and not schedule_run_id else None
+        quick_chat = request_purpose == 'chat' and deliverable == 'answer' and not schedule_run_id
+        intent = chat_intent(prompt) if quick_chat else None
+        notice_question = quick_chat and not intent and asks_about_report_notice(prompt)
         report_from_chat = request_purpose == 'chat' and deliverable == 'answer' and not intent and requests_report(prompt)
         if report_from_chat:
             deliverable = 'report'
         with self.lock:
-            if intent:
+            if intent or notice_question:
                 active = self.active.get(sid)
-                answer = chat_answer(intent, prompt, self._session_jobs(directory), active[0] if active else None)
+                local_intent = intent or 'report_explanation'
+                answer = chat_answer(local_intent, prompt, self._session_jobs(directory), active[0] if active else None)
+            else:
+                answer = None
+            if answer is not None:
                 now = utcnow()
                 job_id = uuid.uuid4().hex
                 job_dir = directory / 'jobs' / job_id
                 job_dir.mkdir(parents=True)
                 status = {'job_id':job_id, 'session_id':sid, 'state':'completed', 'prompt':prompt,
-                          'deliverable':deliverable, 'request_purpose':request_purpose, 'chat_reply':intent,
+                          'deliverable':deliverable, 'request_purpose':request_purpose, 'chat_reply':local_intent,
                           'created_at':now, 'finished_at':now, 'answer':answer, 'published_reports':[]}
                 write_json(job_dir / 'status.json', status)
                 return status
@@ -505,6 +544,14 @@ class AgentRuntime:
             if request_purpose:status['request_purpose']=request_purpose
             if report_from_chat:status['report_from_chat']=True
             if continued_from:status['continued_from_job_id']=continued_from
+            if request_purpose=='chat' and deliverable=='report' and meta.get('research_mode')=='current':
+                reference = status['created_at']
+                if continued_from:
+                    previous = json.loads((directory/'jobs'/continued_from/'status.json').read_text())
+                    reference = previous.get('report_window_reference_at', previous['created_at'])
+                if window := recent_report_window(prompt, reference):
+                    status['report_window_reference_at'] = reference
+                    status['required_report_window'] = list(window)
             if schedule_run_id or meta.get('external_run_id'):status['schedule_run_id']=schedule_run_id or meta['external_run_id']
             write_json(job_dir/"status.json",status)
             cancel=threading.Event();self.active[sid]=(job_id,cancel)
@@ -515,11 +562,17 @@ class AgentRuntime:
     def continue_job(self, sid, job_id):
         if not re.fullmatch(r'[a-f0-9]{32}', job_id):
             raise ValueError('Invalid research job ID')
-        path = self._session_dir(sid) / 'jobs' / job_id / 'status.json'
+        directory = self._session_dir(sid)
+        path = directory / 'jobs' / job_id / 'status.json'
         original = json.loads(path.read_text())
-        if (original['state'] not in ('failed', 'cancelled', 'interrupted') or original.get('published_reports')
+        misrouted = _misrouted_report(original)
+        evidence_gap = _evidence_gap_report(original)
+        if ((original['state'] not in ('failed', 'cancelled', 'interrupted') and not (misrouted or evidence_gap))
+                or (original.get('published_reports') and not evidence_gap)
                 or original.get('request_purpose') == 'market_refresh' or chat_intent(original['prompt'])):
             raise ValueError('Select an unfinished research request in this chat')
+        if (misrouted or evidence_gap) and _report_already_recovered(job_id, self._session_jobs(directory)):
+            raise ValueError('The report from this request is already in the library')
         deliverable = 'answer' if original.get('report_from_chat') else original['deliverable']
         return self.start(sid, original['prompt'], deliverable, request_purpose='chat', continued_from=job_id,
                           jev_assistance=original.get('jev_assistance_requested',False),report_review_provider=original.get('report_review_provider','generation_model'))
@@ -621,15 +674,16 @@ class AgentRuntime:
                 memory=EvidenceMemory(self.knowledge,judge=retrieval_judgments)
             # Install current resources for continuing sessions too.
             install_skills(workspace)
-            def make_report_reviewer(limit):
-                kwargs=dict(event_sink=emit,diagnostic_dir=workspace/'reviews'/('minimal-attempts' if limit==2 else 'attempts'),
+            def make_report_reviewer(limit, *, final=False):
+                minimal = final or limit == 2
+                kwargs=dict(event_sink=emit,diagnostic_dir=workspace/'reviews'/('minimal-attempts' if minimal else 'attempts'),
                     cancel=cancel,research_cutoff=None if current else meta['cutoff'],max_requests=limit)
                 if status.get('report_review_provider')=='jev' and status.get('deliverable')=='report':
                     from .jev_review import JevReportReviewer
-                    kwargs['max_requests']=2 if limit==2 else min(32,limit*4)
-                    kwargs['max_rounds']=1 if limit==2 else min(4,max(1,limit//2))
+                    kwargs['max_requests']=limit if minimal else min(32,limit*4)
+                    kwargs['max_rounds']=1 if minimal else min(4,max(1,limit//2))
                     instance=JevReportReviewer(active_settings,root=self.root,**kwargs)
-                elif limit==2 and status.get('deliverable')=='report':
+                elif minimal and status.get('deliverable')=='report':
                     from .hybrid_minimal_review import MinimalEvidenceReviewer
                     instance=MinimalEvidenceReviewer(active_settings,**kwargs)
                 else:instance=EvidenceReviewer(active_settings,**kwargs)
@@ -648,21 +702,42 @@ class AgentRuntime:
                                   retrieval_judgments=retrieval_judgments,report_judgments=report_judgments,
                                   judgment_mode=self.settings.judgment_mode)
             service.working_memory=working;service.job_id=status['job_id'];service.cancel=cancel
-            service.minimal_reviewer_factory=lambda:make_report_reviewer(2)
+            service.minimal_reviewer_factory=lambda remaining=2:make_report_reviewer(remaining,final=True)
+            recovered_unsaved_draft = False
+            retry_candidate = None
+            retry_feedback = ''
             if status.get('continued_from_job_id') and status['deliverable']=='report':
                 prior_dir=directory/'jobs'/status['continued_from_job_id']
                 prior_status=json.loads((prior_dir/'status.json').read_text())
-                draft_id=prior_status.get('report_draft_id')
+                retry_notice = _evidence_gap_report(prior_status)
+                # The final notice has its own draft ID. Reuse the latest
+                # authored data-bearing draft instead of trying to revise the notice.
+                draft_id=None if retry_notice else prior_status.get('report_draft_id')
                 if not draft_id and (prior_dir/'messages.json').is_file():
                     from .reports import ReportDraft
+                    from .report_recovery import LivePublicationDraft
                     for message in reversed(json.loads((prior_dir/'messages.json').read_text())):
-                        for call in message.get('data',{}).get('tool_calls',[]):
-                            if call['name']=='publish_report' and call.get('args',{}).get('draft'):
-                                body=ReportDraft.model_validate(call['args']['draft']).model_dump()
-                                from research_data.http import dumps
-                                draft_id=hashlib.sha256(dumps(body,sort_keys=True).encode()).hexdigest()[:24]
-                                break
-                        if draft_id:break
+                        for call in reversed(message.get('data',{}).get('tool_calls',[])):
+                            arguments = call.get('args', {})
+                            if call['name'] not in ('publish_report', 'save_report_draft') or not arguments.get('draft'):
+                                continue
+                            if _misrouted_report(prior_status):
+                                excerpt = arguments.get('user_request')
+                                if not isinstance(excerpt, str) or not excerpt.strip() or excerpt not in prompt:
+                                    continue
+                            try:
+                                candidate = (LivePublicationDraft if current else ReportDraft).model_validate(arguments['draft'])
+                            except ValueError:
+                                continue
+                            if candidate.delivery_kind == 'evidence_gap' or not (candidate.observations or candidate.key_changes):
+                                continue
+                            draft_id = service._save_report_draft(candidate)
+                            recovered_unsaved_draft = True
+                            if retry_notice:
+                                retry_candidate = candidate
+                            break
+                        if draft_id:
+                            break
                 if draft_id and re.fullmatch(r'[a-f0-9]{24}',draft_id) and (workspace/'drafts'/(draft_id+'.json')).is_file():
                     service.latest_report_draft_id=draft_id
                     emit('report_draft_resumed',{'draft_id':draft_id,'continued_from':status['continued_from_job_id']})
@@ -676,8 +751,12 @@ class AgentRuntime:
                 service.collection_status_path=self.state_dir/'collection-status.json'
             purpose=status.get('request_purpose')
             service.report_allowed=purpose!='market_refresh'
-            service.report_request_prompt=prompt if purpose=='chat' and (status['deliverable']=='answer' or status.get('report_from_chat')) else None
+            # The report route is already authorized by the explicit UI action
+            # or by start() recognizing the original user message. Keep the
+            # extra publication guard when report tools are visible in chat.
+            service.report_request_prompt=prompt if purpose=='chat' and status['deliverable']=='answer' else None
             service.require_report_scope=current and purpose=='chat'
+            service.required_report_window=status.get('required_report_window')
             service.report_user_prompt=self.settings.redact(prompt)
             # A task-scoped public research question, never the whole chat
             # history, is passed through the public-query eligibility checks.
@@ -685,6 +764,23 @@ class AgentRuntime:
             service.case_memory=getattr(self,'case_memory',None)
             if working:working.evidence_lookup=service.lookup
             service.memory_index=getattr(self,'memory_index',None);service.memory_retriever=getattr(self,'memory_retriever',None)
+            if (retry_candidate is not None and current and service.reviewer is not None
+                    and service._report_window_matches(retry_candidate.scope)
+                    and (retry_candidate.scope is not None or not service.require_report_scope)):
+                emit('report_retry_submission', {'draft_id': service.latest_report_draft_id,
+                      'continued_from': status['continued_from_job_id']})
+                try:
+                    service.publish(retry_candidate)
+                except (ValueError, KeyError, OSError, RuntimeError, APIError) as exc:
+                    retry_feedback = self.settings.redact(str(exc))[:1200]
+                    emit('report_retry_revision_required', {'error': retry_feedback})
+                if service.published_reports and service.last_report:
+                    report = service.last_report
+                    kind = report['delivery_kind']
+                    status.update(state='completed', report_delivery_kind=kind, pending_request=None,
+                                  answer=_published_report_answer(report, meta['session_id']),
+                                  published_reports=service.published_reports, finished_at=utcnow())
+                    return
             if current:
                 sdk_server=ResearchSDKServer(service,self.settings,cancel)
                 shell.attach_research_sdk(sdk_server.start())
@@ -698,10 +794,19 @@ class AgentRuntime:
                 system+='\nThis market refresh saves relevant sources and returns a status update. It cannot publish a report.\n'
             elif service.report_request_prompt is not None:
                 system+='\nIn chat, publish a new report only when the latest user message expressly asks you to create one. Pass a verbatim excerpt of that request as user_request. Questions, requests to find or summarize an existing report, and negated or quoted requests do not authorize publication. For other requests, answer in chat.\n'
+                if status['deliverable']=='answer':
+                    system+='Treat any previous report request, unfinished draft or publication tool result as past context. If asked what a saved report or evidence availability notice means, explain that artifact and its limits directly. If a publication call is rejected because the latest message did not request one, answer in chat without retrying the call.\n'
             if purpose=='chat' and status['deliverable']=='report':
                 system+='\nThe user explicitly requested a report. Treat the user message as its scope and publish the source-checked report.\n'
+                if service.required_report_window:
+                    start, end = service.required_report_window
+                    system+=f'Use the completed UTC dates for this report, from {start} inclusive to {end} exclusive. State the dates to the reader. Use these exact bounds for evidence selection, calculations, chart scope and the draft. The archived bundle cutoff only dates archive inputs and cannot determine this current report window.\n'
             if status.get('continued_from_job_id'):
                 system+='\nThis turn continues the saved request below. Start from the saved drafts in /drafts/ and review feedback in /reviews/. Reuse relevant sources and validated calculations, correct remaining unsupported claims, and deliver the original request. Prior review receipts describe earlier drafts; use current publication feedback to decide whether an issue remains. A requested report must be saved through publish_report.\n'
+            if recovered_unsaved_draft:
+                system+='The recovered draft was authored for this request and was never published. Inspect this draft and use publish_saved_report with exact edits. If a completed UTC end date applies, remove or explicitly set aside any after-window market snapshot. Keep independently supported events, resolve conflicting claims with their saved evidence, and use the registered calculation and price series where their window agrees. Do not start the source collection over.\n'
+            if retry_feedback:
+                system+='The retained draft has already been resubmitted without new research. Correct only the following publication feedback or read the saved review receipt: '+retry_feedback+'\n'
             if working:
                 system+='\nTask working notes and source-backed process corrections are available under /memory/task-state/ and /memory/research-experience.md. These are derived guidance, not market evidence. Read originals before asserting facts.\n'
             from .context_accounting import ContextAccounting
@@ -712,7 +817,9 @@ class AgentRuntime:
                         TraceMiddleware(emit,cancel,self.settings,working,status['job_id'],experience_context=experience_context,context_accounting=context_accounting,workspace_root=workspace)]
             if current and status['deliverable']=='report':
                 from .report_context import ReportContextMiddleware
-                middleware.insert(1,ReportContextMiddleware(emit,service))
+                plan_job_ids = () if conversation else (status['job_id'], status.get('continued_from_job_id'))
+                middleware.insert(1,ReportContextMiddleware(emit,service,max_model_calls=self.settings.max_model_calls,
+                    plan_job_ids=tuple(job_id for job_id in plan_job_ids if job_id)))
             completion=self.build_finalization_middleware(service,emit)
             if completion is not None:middleware.insert(0,completion)
             if current:
@@ -723,6 +830,9 @@ class AgentRuntime:
             tools=service.as_tools()
             if status['deliverable']=='report':
                 tools=[tool for tool in tools if tool.name!='submit_research_answer']
+                if current:
+                    from .report_context import report_checkpoint_tool
+                    tools.append(report_checkpoint_tool(service))
             subagents=[]
             if current and self.settings.evidence_reader_enabled:
                 from .evidence_reader import build_evidence_reader
@@ -747,7 +857,8 @@ class AgentRuntime:
                 backend=backend,permissions=permissions,
                 memory=["/memory/preferences.md"],skills=["/skills/"],
                 middleware=middleware,subagents=subagents,checkpointer=saver,name="eth-research-local")
-            config={"configurable":{"thread_id":meta["session_id"]},"recursion_limit":200,"max_concurrency":4}
+            thread_id = status['job_id'] if recovered_unsaved_draft else meta['session_id']
+            config={"configurable":{"thread_id":thread_id},"recursion_limit":200,"max_concurrency":4}
             if saver.get_tuple(config):
                 # Older checkpoints cache the former one-skill directory. Rediscover
                 # metadata without dropping the conversation or changing preferences.
@@ -768,7 +879,7 @@ class AgentRuntime:
             result=graph.invoke({"messages":[HumanMessage(content=message)]},config=config)
             if status.get('deliverable')=='report' and not service.published_reports:
                 emit('report_pending',{'reason':'报告尚未经过发布工具保存'})
-                result=graph.invoke({'messages':[HumanMessage(content='本次明确要求保存研究报告，当前没有成功发布。请复用已经获得的证据和计算，调用 publish_report 完成简明报告；修正审核或参数错误后发布，不要重新展开大量检索，也不能仅输出聊天文本冒充完成。')]},config=config)
+                result=graph.invoke({'messages':[HumanMessage(content='本次明确要求保存研究报告，当前没有成功发布。优先用 publish_saved_report 发布已保存草稿，或按已有查验反馈做局部修改。若没有草稿或有实质补充，再用 publish_report 提交。复用已有证据与计算，只补查影响交付的缺项。')]},config=config)
                 if not service.published_reports:raise RuntimeError('报告尚未成功保存；数据和草稿已保留，请继续研究修正')
             if current and (not conversation or status.get('research_escalated')) and status.get('deliverable')=='answer' and not (service.submitted_answers or service.published_reports):
                 emit('answer_pending',{'reason':'No source-checked answer has been submitted'})
@@ -789,11 +900,8 @@ class AgentRuntime:
             write_json(job_dir/"messages.json",json.loads(self.settings.redact(serialized)))
             answer=self.settings.redact(final.content) if isinstance(final.content,str) else final.content
             if service.last_report:
-                report=service.last_report;href=f"/api/sessions/{meta['session_id']}/artifact?path="+report['path']
-                kind=report.get('delivery_kind','full')
-                label={'full':'Report published','minimal':'Limited report published','evidence_gap':'Evidence availability notice'}[kind]
-                answer=f"{label}: [{report['draft']['title']}]({href})\n\n"+report['draft']['summary']
-                status['report_delivery_kind']=kind
+                answer = _published_report_answer(service.last_report, meta['session_id'])
+                status['report_delivery_kind'] = service.last_report['delivery_kind']
             elif current and service.submitted_answers:
                 answer=service.submitted_answers[-1]['rendered'];status['verified_answer']=service.submitted_answers[-1]
             status.update(state="completed",pending_request=None,answer=answer,published_reports=service.published_reports,finished_at=utcnow())
@@ -812,10 +920,8 @@ class AgentRuntime:
                     emit('report_finalizing',{'reason':'task_ended_without_approved_full_report'})
                     service.finalize_minimal_delivery(reason='task_ended_without_approved_full_report')
                     report=service.last_report;kind=report.get('delivery_kind','evidence_gap')
-                    href=f"/api/sessions/{meta['session_id']}/artifact?path="+report['path']
-                    label='Limited report published' if kind=='minimal' else 'Evidence availability notice'
                     status.update(state='completed',report_delivery_kind=kind,
-                        answer=f"{label}: [{report['draft']['title']}]({href})\n\n"+report['draft']['summary'],
+                        answer=_published_report_answer(report, meta['session_id']),
                         published_reports=service.published_reports,finished_at=utcnow())
                 except Exception as delivery_exc:
                     status.update(state='cancelled' if cancel.is_set() else 'failed',

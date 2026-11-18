@@ -318,6 +318,7 @@ def _aggregate(targets, texts, verdicts, host_ids):
 
 class JevReportReviewer:
     supports_process_context = True
+    require_single_batch = False
 
     def __init__(self, settings, event_sink=None, user_context_id=None, diagnostic_dir=None,
                  cancel=None, research_cutoff=None, max_requests=16, *, root=None,
@@ -384,6 +385,8 @@ class JevReportReviewer:
                 omitted.append({'claim_id':target['claim_id'],'reason':'oversized_context_not_dispatched'});continue
             pending.append(target)
         if pending:batches.append(_batch(pending,texts,task,context))
+        if self.require_single_batch and (len(batches) != 1 or omitted):
+            raise ValueError('The reduced event report does not fit one complete public Jev batch')
         receipts = []
         for batch in batches:
             units = list(batch['state']['targets'].values())

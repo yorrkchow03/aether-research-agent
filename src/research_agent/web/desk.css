@@ -366,13 +366,21 @@ body[data-view="reports"]:has(#report-list-view[hidden]) .section-nav { margin-b
 .report-key-metric details { font-size: 12px; line-height: 1.7; color: #738096; }
 .report-key-metric summary { cursor: pointer; font-size: 11px; color: #938a9f; }
 .report-key-metric details p { margin-top: 8px; }
-.report-takeaways .statement { position: relative; border: 0; padding: 0 0 0 18px; margin: 0 0 17px; line-height: 1.8; color: #3c4760; }
-.report-takeaways .statement::before { content: ''; position: absolute; top: 11px; left: 0; width: 5px; height: 5px; background: #9682bc; border-radius: 50%; }
-.report-takeaways .numeric-detail { font-size: 12px; }
-.report-featured-documents { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
-.report-featured-documents > h2 { grid-column: 1 / -1; margin-bottom: 0; }
-.report-document-card { margin: 0; padding: 18px; }
-.report-document-card h3 { margin: 8px 0 0; font-size: 16px; line-height: 1.5; }
+.report-availability-note { color: #5c687d; font-size: 14px; }
+.report-timeline { list-style: none; padding: 0; margin: 0; }
+.report-timeline-item { position: relative; margin: 0 0 0 4px; padding: 0 0 14px 19px; border-left: 1px solid #ddd7eb; }
+.report-timeline-item:last-child { padding-bottom: 0; }
+.report-timeline-item::before { content: ''; position: absolute; top: 21px; left: -4px; width: 7px; height: 7px; background: #7562a5; border-radius: 50%; }
+.report-event-card { min-width: 0; padding: 14px 17px; border: 1px solid #e8e5ef; border-radius: 10px; background: #fff; }
+.report-event-card .report-event-date { margin: 0 0 5px; color: #655486; font-size: 13px; line-height: 1.5; }
+.report-event-statement { color: #354057; line-height: 1.75; overflow-wrap: anywhere; }
+.report-event-facts { margin: 7px 0 0; padding-left: 19px; color: #56637a; font-size: 14px; }
+.report-event-facts > li + li { margin-top: 5px; }
+.report-event-card .numeric-detail { font-size: 12px; }
+.report-event-documents { margin-top: 9px; }
+.report-event-documents > summary { color: #655486; font-size: 13px; cursor: pointer; }
+.report-event-documents .report-document-card { margin: 9px 0 0; padding: 11px 13px; background: #faf9fd; }
+.report-document-card h4 { margin: 0; color: #354057; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
 .report-document-relevance { line-height: 1.75; color: #647086; }
 .report-document-card .report-evidence-links { font-size: 12px; margin-top: 14px; }
 .report-document-card .text-button, .report-document-card .text-link { font-size: 12px; }
@@ -402,5 +410,6 @@ body[data-view="reports"]:has(#report-list-view[hidden]) .section-nav { margin-b
   .report-key-metric > span { font-size: 10px; }
   .report-key-metric > strong { font-size: 18px; }
   .report-key-metric summary { font-size: 10px; }
-  .report-featured-documents { grid-template-columns: 1fr; }
+  .report-timeline-item { padding-left: 13px; }
+  .report-event-card { padding: 11px 12px; }
 }

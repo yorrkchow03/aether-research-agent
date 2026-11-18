@@ -1,7 +1,7 @@
 """Report media derived from verified, saved evidence."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from fnmatch import fnmatchcase
 from hashlib import sha256
@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 import re
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -19,9 +19,197 @@ from .claims import Claim
 
 
 CANDLE_FIELDS = {"low_usd": 1, "high_usd": 2, "open_usd": 3, "close_usd": 4, "volume_asset": 5}
+RAW_CANDLE_FIELDS = {"low": "low_usd", "high": "high_usd", "open": "open_usd",
+                     "close": "close_usd", "volume": "volume_asset"}
 FIXED_FREQUENCIES = {"1h": timedelta(hours=1), "1d": timedelta(days=1)}
 METRIC_LABELS = {"low_usd": "Low price", "high_usd": "High price", "open_usd": "Opening price",
                  "close_usd": "Closing price", "volume_asset": "Trading volume"}
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MONTH = r"(?P<month>Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+_DAY = r"(?P<day>[0-9]{1,2})"
+_RANGE = r"(?:\s*[-–—]\s*[0-9]{1,2})?"
+_EVENT_DATES = (
+    re.compile(r"^(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})(?![0-9])"),
+    re.compile(rf"^(?P<label>{_DAY}{_RANGE}\s+{_MONTH}(?:\s+(?P<year>[0-9]{{4}}))?)\b", re.I),
+    re.compile(rf"^(?P<label>{_MONTH}\.?\s+{_DAY}{_RANGE}(?:,?\s+(?P<year>[0-9]{{4}}))?)\b", re.I),
+    re.compile(r"^(?P<label>(?:(?P<year>[0-9]{4})年\s*)?(?P<month>[0-9]{1,2})月\s*(?P<day>[0-9]{1,2})[日号])"),
+)
+
+
+def _body(draft):
+    return draft if isinstance(draft, dict) else draft.model_dump()
+
+
+def report_display_title(draft):
+    """Present saved reports under a neutral title without altering their identity."""
+    body = _body(draft)
+    title = body.get("title") or "Research report"
+    if title.casefold() not in {"limited evidence report", "limited research report", "saved market data brief"}:
+        return title
+    scope = body.get("scope") or {}
+    assets = ", ".join(scope.get("assets") or ())
+    heading = " ".join(filter(None, (assets, "Research report")))
+    try:
+        begin = timestamp(scope["start"]).date()
+        end = (timestamp(scope["end"]) - timedelta(microseconds=1)).date()
+    except (KeyError, ValueError, TypeError):
+        return heading
+    window = end.strftime("%d %b %Y") if begin == end else f"{begin:%d %b %Y} – {end:%d %b %Y}"
+    return f"{heading} · {window} UTC"
+
+
+def report_display_summary(draft):
+    from .minimal_delivery import MINIMAL_SUMMARY
+
+    body = _body(draft)
+    if body.get("summary") != MINIMAL_SUMMARY:
+        return body.get("summary") or ""
+    facts = [*body.get("observations", []), *body.get("key_changes", [])]
+    return " ".join(item["statement"] for item in facts[:2])
+
+
+def report_display_limits(draft):
+    from .minimal_delivery import MINIMAL_LIMIT
+
+    return ["The saved sources leave some developments in this period unresolved."
+            if item == MINIMAL_LIMIT else item for item in _body(draft).get("limitations", [])]
+
+
+def report_watch_items(items):
+    """Respect author priority and show at most three distinct follow-ups."""
+    selected = {}
+    for item in items or ():
+        key = " ".join(item.strip().rstrip(".?？。").casefold().split())
+        if key and key not in selected:
+            selected[key] = item
+        if len(selected) == 3:
+            break
+    return list(selected.values())
+
+
+def _event_date(statement, scope):
+    lead = re.match(r"^(?:on\s+|as of\s+)?", statement, re.I).end()
+    for pattern in _EVENT_DATES:
+        match = pattern.match(statement[lead:])
+        if not match:
+            continue
+        fields = match.groupdict()
+        try:
+            if fields.get("date"):
+                result = date.fromisoformat(fields["date"])
+            else:
+                month = fields["month"]
+                month = int(month) if month.isdecimal() else _MONTHS.index(month[:3].title()) + 1
+                day = int(fields["day"])
+                if fields.get("year"):
+                    result = date(int(fields["year"]), month, day)
+                else:
+                    if not scope:
+                        return None
+                    first = timestamp(scope["start"]).date()
+                    last = (timestamp(scope["end"]) - timedelta(microseconds=1)).date()
+                    candidates = []
+                    for year in range(last.year, first.year - 1, -1):
+                        try:
+                            candidate = date(year, month, day)
+                        except ValueError:
+                            continue
+                        if first <= candidate <= last:
+                            candidates.append(candidate)
+                    if len(candidates) != 1:
+                        return None
+                    result = candidates[0]
+        except (ValueError, KeyError, TypeError):
+            return None
+        label = fields.get("label") or fields["date"]
+        # The full audited sentence stays intact in the report packet.
+        rest = statement[lead + match.end():]
+        delimiter = re.match(r"^\s*[:：—–]\s*", rest)
+        display = rest[delimiter.end():] if delimiter else statement
+        return result.isoformat(), label, display
+    return None
+
+
+def report_timeline(draft, presentation=None, lookup=None):
+    """Place audited evidence on event cards without using publication as event time."""
+    body = _body(draft)
+    documents = (presentation or {}).get("documents", [])
+    scope = body.get("scope")
+    published_days = {item["evidence_id"]: item.get("published_at") for item in documents}
+    cards = []
+
+    def publication_day(ids):
+        days = set()
+        for rid in ids:
+            if not rid.startswith(("page-", "web-")):
+                continue
+            if rid not in published_days:
+                try:
+                    record = lookup(rid) if lookup else {}
+                    published_days[rid] = record.get("published_at")
+                except (KeyError, ValueError, OSError):
+                    published_days[rid] = None
+            if published_days[rid]:
+                try:
+                    days.add(timestamp(published_days[rid]).date().isoformat())
+                except (ValueError, TypeError):
+                    pass
+        return next(iter(days)) if len(days) == 1 else None
+
+    def make_card(statement, ids, *, authored_date=True):
+        authored = _event_date(statement, scope) if authored_date else None
+        if authored:
+            day, label, display = authored
+            kind = "event"
+        else:
+            day = label = publication_day(ids)
+            display = statement
+            kind = "publication" if day else None
+        return {"statement": statement, "display_statement": display, "evidence_ids": list(ids),
+                "date": day, "date_label": label, "date_kind": kind, "measurement": None,
+                "facts": [], "documents": []}
+
+    def matching_card(ids):
+        supplied = set(ids)
+        best = 0
+        match = None
+        for card in cards:
+            sources = set(card["evidence_ids"])
+            sources.update(item["evidence_id"] for item in card["documents"])
+            sources.update(rid for fact in card["facts"] for rid in fact["evidence_ids"])
+            overlap = len(sources & supplied)
+            if overlap > best:
+                best, match = overlap, card
+        return match
+
+    def same_statement(left, right):
+        return " ".join(left.casefold().rstrip(" .。").split()) == " ".join(right.casefold().rstrip(" .。").split())
+
+    for event in body.get("key_changes", []):
+        card = make_card(event["statement"], event["evidence_ids"])
+        if event.get("metric"):
+            card["measurement"] = event
+        if not any(same_statement(item["statement"],card["statement"])
+                   and set(card["evidence_ids"]) <= set(item["evidence_ids"]) for item in cards):
+            cards.append(card)
+    for document in documents:
+        ids = [document["evidence_id"]]
+        card = matching_card(ids)
+        if card is None:
+            card = make_card("", ids, authored_date=False)
+            cards.append(card)
+        card["documents"].append(document)
+    for fact in body.get("observations", []):
+        if fact.get("metric"):
+            continue
+        card = matching_card(fact["evidence_ids"])
+        if card is None:
+            cards.append(make_card(fact["statement"], fact["evidence_ids"]))
+        elif not (set(fact["evidence_ids"]) <= set(card["evidence_ids"])
+                  and any(same_statement(fact["statement"], text)
+                          for text in (card["statement"],card["display_statement"]))):
+            card["facts"].append(fact)
+    return sorted(cards,key=lambda card: (card["date"] is None, card["date"] or ""))
 
 
 def _clock(value):
@@ -31,6 +219,13 @@ def _clock(value):
     if at.utcoffset() is None:
         raise ValueError("A report clock must include a time zone")
     return at
+
+
+def _coinbase_request_clock(value):
+    # Date-only bounds in a captured candles query denote UTC day boundaries.
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        value += "T00:00:00Z"
+    return _clock(value)
 
 
 class ReportScope(BaseModel):
@@ -58,9 +253,9 @@ class ReportChart(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     evidence_id: str = Field(pattern=r"^(series|live)-[a-f0-9]{24}$",
-        description="Saved library collection or completed Coinbase candles capture. The host supplies all chart points.")
+        description="Saved library collection or a saved Coinbase Exchange ETH-USD/BTC-USD hourly or daily candle capture. The host supplies completed points.")
     metric: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_]{0,79}$",
-        description="Exact case-sensitive values key from the saved series, e.g. close_usd, not close or close_USD. Read its saved units/data contract; the host does not infer aliases.")
+        description="Exact case-sensitive values key from the saved series, e.g. close_usd. Raw Coinbase Exchange candles also accept their documented fields, e.g. close.")
 
 
 class FeaturedDocument(BaseModel):
@@ -159,6 +354,76 @@ def _raw_coinbase_values(row, source, metric, raw_reader):
     return values
 
 
+def _public_coinbase_candles(row, spec, raw_reader):
+    """Reconstruct chart points from a host-retained Coinbase Exchange GET."""
+    source = _source(row)
+    url = urlsplit(source["url"])
+    product = re.fullmatch(r"/products/(ETH|BTC)-USD/candles", url.path)
+    received = row.get("retrieved_at")
+    identity = (f"live-{sha256((source['url'] + source['sha256'] + received).encode()).hexdigest()[:24]}"
+                if isinstance(received, str) else None)
+    original = row["source"]
+    if (url.scheme != "https" or url.netloc != "api.exchange.coinbase.com" or not product or url.fragment
+            or identity != row["record_id"] or original.get("source_id") != identity
+            or original.get("name") != f"coinbase{url.path}"
+            or original.get("retrieved_at") != received
+            or row.get("observed_at") != received or row.get("available_at") != received):
+        raise ValueError("Chart needs a bound Coinbase Exchange ETH-USD or BTC-USD candle response")
+
+    params = parse_qs(url.query, keep_blank_values=True, strict_parsing=True, max_num_fields=3)
+    granularity = params.get("granularity")
+    if (granularity not in (["3600"], ["86400"])
+            or set(params) not in ({"granularity"}, {"granularity", "start", "end"})
+            or any(len(values) != 1 for values in params.values())):
+        raise ValueError("Coinbase chart needs explicit hourly or daily granularity and an optional paired date range")
+    asset = product.group(1)
+    seconds = int(granularity[0])
+    frequency = "1d" if seconds == 86400 else "1h"
+    interval = FIXED_FREQUENCIES[frequency]
+    capture = _clock(received)
+    beginning = _coinbase_request_clock(params["start"][0]) if "start" in params else None
+    ceiling = _coinbase_request_clock(params["end"][0]) if "end" in params else capture
+    if beginning is not None and beginning >= ceiling:
+        raise ValueError("Coinbase candle request start must precede its end")
+
+    metric = RAW_CANDLE_FIELDS.get(spec.metric, spec.metric)
+    if metric not in CANDLE_FIELDS:
+        raise ValueError("Chart metric must match a saved Coinbase candle field, such as close_usd or close")
+    unit = asset if metric == "volume_asset" else "USD"
+    raw = _saved_raw(row, source, raw_reader, "Chart source")
+    rows = json.loads(raw, parse_float=Decimal)
+    # The unbounded recent response has been observed with 350 entries. Each
+    # entry must still satisfy the captured endpoint's documented OHLCV layout.
+    if not isinstance(rows, list) or not 2 <= len(rows) <= 350:
+        raise ValueError("Expected a bounded raw array of Coinbase candle rows")
+    seen = set()
+    points = {}
+    for item in rows:
+        if (not isinstance(item, list) or len(item) != 6 or type(item[0]) is not int
+                or not 0 < item[0] <= int(capture.timestamp()) or item[0] % seconds
+                or any(type(value) not in (int, Decimal) for value in item[1:])):
+            raise ValueError("Invalid raw Coinbase candle fields or bucket time")
+        observed = timestamp(item[0])
+        if observed in seen:
+            raise ValueError("Chart source contains duplicate raw candle times")
+        seen.add(observed)
+        low, high, opening, closing, volume = (_numeric(value) for value in item[1:])
+        if low <= 0 or not (low <= opening <= high and low <= closing <= high) or volume < 0:
+            raise ValueError("Invalid raw Coinbase candle price range or volume")
+        close = observed + interval
+        if close <= min(capture, ceiling) and (beginning is None or observed >= beginning):
+            points[observed] = item[CANDLE_FIELDS[metric]]
+
+    records = [
+        {"observed_at": iso(observed), "period_end": iso(observed + interval),
+         "values": {spec.metric: value}, "units": {spec.metric: unit},
+         "record_id": row["record_id"], "source": original, "retrieved_at": received,
+         "available_at": row["available_at"]}
+        for observed, value in sorted(points.items())
+    ]
+    return records, asset, frequency, "coinbase", unit, points
+
+
 def _chart_input(collection, spec, raw_reader):
     if collection.get("collection_kind") == "library_series":
         query = collection.get("query") or {}
@@ -172,6 +437,9 @@ def _chart_input(collection, spec, raw_reader):
             raise ValueError("Chart collection lineage differs from its saved records")
         return (records, contract.get("asset"), contract.get("frequency"), contract.get("provider"),
                 _unit(contract, spec.metric), None)
+
+    if collection.get("dataset_id") == "live.api.coinbase":
+        return _public_coinbase_candles(collection, spec, raw_reader)
 
     kind = collection.get("metric")
     asset = collection.get("asset")
@@ -253,8 +521,9 @@ def _chart(spec, scope, lookup, as_of, raw_reader):
     if interval:
         coverage["starts_after_window"] = first_observed > start
         coverage["ends_before_window"] = final_interval_end < end if final_interval_end else end - previous > interval
+    label_key = RAW_CANDLE_FIELDS.get(spec.metric, spec.metric) if collection.get("dataset_id") == "live.api.coinbase" else spec.metric
     return {"evidence_id": spec.evidence_id, "dataset_id": collection["dataset_id"], "metric": spec.metric,
-            "title": METRIC_LABELS.get(spec.metric, spec.metric.replace("_", " ").capitalize()),
+            "title": METRIC_LABELS.get(label_key, label_key.replace("_", " ").capitalize()),
             "asset": asset, "frequency": frequency, "provider": provider, "unit": unit,
             "start": scope.start, "end": scope.end, "coverage": coverage,
             "sources": list(sources.values()), "points": points}

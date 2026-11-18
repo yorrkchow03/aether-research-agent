@@ -4,10 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+import time
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -38,6 +39,16 @@ CATALOG = {
     "aave_revenue":"DeFiLlama Aave V3 covered-chain daily protocol revenue, not ETH token revenue",
 }
 
+DASHBOARD_MARKET_JOBS = (
+    ("eth_price", "price", "ETH"), ("btc_price", "price", "BTC"),
+    ("eth_candles", "candles", "ETH"), ("btc_candles", "candles", "BTC"),
+    ("eth_hourly", "hourly_candles", "ETH"),
+    *((metric, metric, "ETH") for metric in (
+        "tvl", "stablecoins", "dex_volume", "funding", "open_interest",
+        "reference_price", "orderbook", "funding_history", "aave_fees", "aave_revenue",
+    )),
+)
+
 
 def atomic(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +61,7 @@ class LiveData:
         self.root = Path(root); self.lock = threading.RLock(); self.request_locks = {};self.knowledge=knowledge
         for part in ("raw", "records", "cache"):(self.root / part).mkdir(parents=True, exist_ok=True)
 
-    def request(self, provider, path, params=None, ttl=60):
+    def request(self, provider, path, params=None, ttl=60, *, timeout=None):
         if provider not in PROVIDERS:raise ValueError("Unknown provider; use list_data_sources")
         if not isinstance(path, str) or not path.startswith("/") or path.startswith("//") or any(x in path for x in ("?", "#", "..", "\\")):
             raise ValueError("Use an absolute API path without a host, query or traversal")
@@ -62,7 +73,10 @@ class LiveData:
         identity = hashlib.sha256(url.encode()).hexdigest()
         cache = self.root / "cache" / (identity + ".json")
         with self.lock:request_lock = self.request_locks.setdefault(identity, threading.Lock())
-        with request_lock:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        if not request_lock.acquire(timeout=timeout if timeout is not None else -1):
+            raise TimeoutError("Public data request is busy")
+        try:
             if cache.exists():
                 saved = json.loads(cache.read_text())
                 if (timestamp(utcnow()) - timestamp(saved["retrieved_at"])).total_seconds() < ttl:
@@ -73,11 +87,16 @@ class LiveData:
                     if self.knowledge:self.knowledge.register(record)
                     return {**saved, "cache_hit": True}
             # Public requests use the user's configured macOS proxy; no credentials are sent.
-            with httpx.Client(timeout=20, trust_env=True, follow_redirects=False) as client:
+            remaining = deadline-time.monotonic() if deadline is not None else 20
+            if remaining <= 0:
+                raise TimeoutError("Public data request exceeded its time limit")
+            with httpx.Client(timeout=remaining, trust_env=True, follow_redirects=False) as client:
                 with client.stream("GET", url, headers={"User-Agent": "LocalETHResearch/0.2", "Accept": "application/json"}) as response:
                     if response.status_code != 200:raise RuntimeError(f"{provider} HTTP {response.status_code}")
                     raw = bytearray()
                     for chunk in response.iter_bytes():
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError("Public data request exceeded its time limit")
                         raw.extend(chunk)
                         if len(raw) > 16_000_000:raise RuntimeError("Public API response exceeds 16 MB")
             obj = json.loads(raw, parse_float=Decimal)
@@ -96,8 +115,10 @@ class LiveData:
             result = {"record": record, "retrieved_at": retrieved, "cache_hit": False}
             atomic(cache, result)
             return result
+        finally:
+            request_lock.release()
 
-    def get(self, metric, asset="ETH"):
+    def get(self, metric, asset="ETH", *, timeout=None):
         asset = asset.upper()
         if asset not in ("ETH", "BTC"):raise ValueError("Supported assets: ETH, BTC")
         if metric not in CATALOG:raise ValueError("Unknown metric; use list_data_sources")
@@ -124,7 +145,8 @@ class LiveData:
         provider, path, params, ttl = specs[metric]
         # Use a stable midnight start so the daily candle cache survives polling.
         if metric == "candles":params["start"] = (datetime.now(timezone.utc).date() - timedelta(days=91)).isoformat()
-        fetched = self.request(provider, path, params, ttl)
+        fetched = (self.request(provider, path, params, ttl, timeout=timeout) if timeout is not None
+                   else self.request(provider, path, params, ttl))
         raw_record = fetched["record"]; data = raw_record["data"]; values = {}; units = {}; series = []
         observed = raw_record["retrieved_at"]; flags = ["live_retrieval"]
         if metric == "price":
@@ -209,38 +231,125 @@ class Dashboard:
     def __init__(self, live):
         self.live = live; self.lock = threading.RLock(); self.refreshing = False
         self.path = live.root / "dashboard.json"
+        self.daily_path = None
+        self.fresh = None
+
+    @staticmethod
+    def _newer_dashboard_item(saved, daily):
+        if not saved.get('record'):
+            return daily
+        if not daily.get('record'):
+            return saved
+        def clocks(item):
+            row = item['record']
+            return tuple(timestamp(row.get(key) or '1970-01-01T00:00:00Z')
+                         for key in ('observed_at', 'retrieved_at'))
+        return daily if (clocks(daily), daily.get('status') == 'ok') > (clocks(saved), saved.get('status') == 'ok') else saved
 
     def snapshot(self):
         with self.lock:
             obj = json.loads(self.path.read_text()) if self.path.exists() else {"items": {}, "updated_at": None}
+            if self.daily_path and self.daily_path.is_file():
+                daily = json.loads(self.daily_path.read_text())
+                for group in ('items', 'indicators'):
+                    saved = obj.setdefault(group, {})
+                    for key, item in daily.get(group, {}).items():
+                        saved[key] = self._newer_dashboard_item(saved.get(key, {}), item)
+                obj['collection'] = {'checked_at': daily.get('updated_at'), 'status': daily.get('collection_status')}
+                obj['updated_at'] = max(filter(None, (obj.get('updated_at'), daily.get('updated_at'))), key=timestamp, default=None)
             if self.live.knowledge:
                 for group in ('items','indicators'):
                     for item in obj.get(group,{}).values():
                         if item.get('record'):
                             try:item['record']=self.live.lookup(item['record']['record_id'])
                             except (ValueError,KeyError,OSError) as exc:item.update(status='unavailable',error=str(exc)[:200])
+            if self.fresh is not None:
+                obj['fresh'] = dict(self.fresh)
             return {**obj, "refreshing": self.refreshing, "now": utcnow()}
 
     def start_refresh(self):
+        from .feeds import PUBLISHERS
         with self.lock:
-            if self.refreshing:return {"state": "already_running"}
+            if self.refreshing:
+                return {"state": "already_running", "fresh": dict(self.fresh)}
             self.refreshing = True
-        threading.Thread(target=self._refresh, daemon=True).start()
-        return {"state": "started"}
+            self.fresh = {"status": "running", "started_at": utcnow(), "finished_at": None,
+                          "market_done": False, "news_done": False, "market_updated": 0,
+                          "market_total": len(DASHBOARD_MARKET_JOBS), "feeds_updated": 0,
+                          "feeds_total": len(PUBLISHERS) if self.live.knowledge else 0, "news_items": 0}
+            running = dict(self.fresh)
+            threading.Thread(target=self._refresh, name='dashboard-fresh', daemon=True).start()
+            return {"state": "started", "fresh": running}
 
     def _refresh(self):
-        previous = self.snapshot().get("items", {})
-        jobs = [("eth_price", "price", "ETH"), ("btc_price", "price", "BTC"), ("eth_candles", "candles", "ETH"), ("btc_candles","candles","BTC"),('eth_hourly','hourly_candles','ETH')]
-        jobs += [(metric, metric, "ETH") for metric in ("tvl", "stablecoins", "dex_volume", "funding", "open_interest","reference_price","orderbook","funding_history","aave_fees","aave_revenue")]
+        from .feeds import PUBLISHERS, scan_feed
+        from .metrics import derive_dashboard
+
+        jobs = DASHBOARD_MARKET_JOBS
+        feeds = PUBLISHERS if self.live.knowledge else ()
+        with self.lock:
+            if self.fresh is None:
+                self.fresh = {'started_at': utcnow()}
+            self.fresh.update(market_total=len(jobs), feeds_total=len(feeds))
+        saved = None
+        selected_news = set()
+        latest = {}
+        feeds_updated = 0
+        market_done = news_done = False
+        provider_timeout = 8
+
         def fetch(job):
             key, metric, asset = job
-            try:return key, self.live.get(metric, asset)
+            try:return self.live.get(metric, asset, timeout=provider_timeout)
             except Exception as exc:
-                return key, {**previous.get(key, {}), "status": "unavailable", "error": str(exc)[:300], "failed_at": utcnow(), "retained_previous": key in previous}
+                return {**previous.get(key, {}), "status": "unavailable", "error": str(exc)[:300],
+                        "failed_at": utcnow(), "retained_previous": key in previous}
+
+        def fetch_feed(spec):
+            publisher, url, asset, match = spec
+            return scan_feed(self.live.knowledge, url, publisher=publisher, asset=asset, match=match,
+                             since=timestamp(utcnow())-timedelta(days=7), timeout=provider_timeout)
+
+        def market_successes():
+            return sum(item.get('status') == 'ok' for item in latest.values())
+
         try:
-            with ThreadPoolExecutor(max_workers=4) as pool:items = dict(pool.map(fetch, jobs))
-            from .metrics import derive_dashboard
-            indicators=derive_dashboard(items,self.live.root,self.live.knowledge)
-            with self.lock:atomic(self.path, {"items": items, "indicators":indicators,"updated_at": utcnow()})
+            previous_snapshot = self.snapshot()
+            previous = previous_snapshot.get('items', {})
+            with ThreadPoolExecutor(max_workers=8) as market_pool, ThreadPoolExecutor(max_workers=4) as news_pool:
+                market_tasks = {market_pool.submit(fetch, job): job[0] for job in jobs}
+                news_tasks = {news_pool.submit(fetch_feed, feed) for feed in feeds}
+                for future in as_completed(market_tasks):
+                    latest[market_tasks[future]] = future.result()
+                items = {**previous, **latest}
+                indicators = derive_dashboard(items, self.live.root, self.live.knowledge)
+                saved = {"items": items, "indicators": indicators,
+                         "updated_at": utcnow() if market_successes() else previous_snapshot.get('updated_at')}
+                with self.lock:
+                    market_done = True
+                    self.fresh.update(market_done=True, market_updated=market_successes())
+                    atomic(self.path, saved)
+                for future in as_completed(news_tasks):
+                    try:
+                        result = future.result()
+                        selected_news.update(result['record_ids'])
+                        feeds_updated += 1
+                    except Exception:
+                        continue
+                news_done = True
         finally:
-            with self.lock:self.refreshing = False
+            with self.lock:
+                updated = market_successes() if market_done else 0
+                if market_done and news_done and updated == len(jobs) and feeds_updated == len(feeds):
+                    status = 'completed'
+                else:
+                    status = 'partial' if updated or feeds_updated else 'failed'
+                self.fresh.update(status=status, finished_at=utcnow(), market_done=market_done,
+                                  news_done=news_done, market_updated=updated, feeds_updated=feeds_updated,
+                                  news_items=len(selected_news))
+                try:
+                    if saved is None:
+                        saved = json.loads(self.path.read_text()) if self.path.exists() else {'items': {}, 'updated_at': None}
+                    atomic(self.path, {**saved, 'fresh': dict(self.fresh)})
+                finally:
+                    self.refreshing = False

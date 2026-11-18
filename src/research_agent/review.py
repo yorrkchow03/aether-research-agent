@@ -11,16 +11,22 @@ from typing import Literal
 from dataclasses import replace
 
 from langchain_core.messages import HumanMessage,SystemMessage,AIMessage
+from openai import LengthFinishReasonError
 from pydantic import BaseModel, Field, ConfigDict
 from research_data.http import dumps, utcnow
 from .settings import PLAN_BASE_URL
+from .model_usage import completion_usage, response_usage
 from .model import create_ark_model
 from .advice import advice_evidence_ids, advice_targets
+from .host_review_facts import ONLINE_PREFIXES, automatic_disclosure, is_verified_host_target
 from .reports import report_claims
 from .research_explanations import explanation_evidence_ids, explanation_targets
 
 REVIEW_VERSION='support-v14-adjudicated-scope-review'
+HOST_DISCLOSURE_VERSION='support-v15-host-disclosures'
+MINIMAL_REVIEW_VERSIONS=('support-hybrid-minimal-v1','support-hybrid-minimal-v2')
 SOURCE_TEXT_BUDGET=14000
+MAX_REVIEW_QUOTES=12
 _CONTEXT_KEYS={'text','text_segments','text_context'}
 _COMMON_WORDS=set('a an and are as at be been before being both by can could did do does for from had has have how if in into is it its may might of on or our should than that the their them then there these they this those through to under was we were what when where which while who will with would you your'.split())
 
@@ -134,7 +140,7 @@ class Verdict(BaseModel):
     claim_id: str
     status: Literal["supported", "reasonable_inference", "conditional", "contradicted", "insufficient"]
     reason: str = Field(min_length=1, max_length=1000)
-    quotes: list[Quote] = Field(default_factory=list, max_length=12)
+    quotes: list[Quote] = Field(default_factory=list, max_length=MAX_REVIEW_QUOTES)
     correction: str = Field(default="", max_length=1000)
     scope_alignment: Literal['aligned','overstated','ambiguous','not_applicable'] | None = Field(default=None,
         description="For scope_alignment_required targets compare the literal claim with source status, event/publication/measurement interval and quantity subject. aligned covers ALL external factual clauses; future outcomes being investigated need not be proven. not_applicable is only for pure future questions or process limits with no external premise. Explain the comparison in reason.")
@@ -155,7 +161,7 @@ class ExcerptReference(BaseModel):
 
 
 class IndexedVerdict(Verdict):
-    quotes:list[ExcerptReference]=Field(default_factory=list,max_length=12)
+    quotes:list[ExcerptReference]=Field(default_factory=list,max_length=MAX_REVIEW_QUOTES)
 
 
 class IndexedResponse(BaseModel):
@@ -187,11 +193,11 @@ class CriticAssessment(BaseModel):
     reason:str=Field(min_length=1,max_length=500)
     target_text:str=Field(default='',max_length=2000)
     process_refs:list[str]=Field(default_factory=list,max_length=4)
-    quotes:list[Quote]=Field(default_factory=list,max_length=4)
+    quotes:list[Quote]=Field(default_factory=list,max_length=MAX_REVIEW_QUOTES)
 
 
 class IndexedCriticAssessment(CriticAssessment):
-    quotes:list[ExcerptReference]=Field(default_factory=list,max_length=4)
+    quotes:list[ExcerptReference]=Field(default_factory=list,max_length=MAX_REVIEW_QUOTES)
 
 
 class AdjudicatedResponse(IndexedResponse):
@@ -206,7 +212,8 @@ class HostProcessFact(BaseModel):
     pointer:dict
 
 
-def _adjudication_contract(version):return version=='support-v14-adjudicated-scope-review'
+def _adjudication_contract(version):
+    return version in ('support-v14-adjudicated-scope-review',HOST_DISCLOSURE_VERSION)
 
 
 def _critic_contract(version):
@@ -214,10 +221,11 @@ def _critic_contract(version):
     return bool(match and int(match[1])>=12)
 
 
-def scope_critic_context_hash(targets,texts,summary_context,report_scope,research_cutoff,*,process_context=None,review_version=None):
+def scope_critic_context_hash(targets,texts,summary_context,report_scope,research_cutoff,*,process_context=None,review_version=None,host_disclosure_id=None):
     body={'targets':targets,'evidence_text':texts,'summary_context':summary_context,
         'report_scope':report_scope,'research_cutoff':research_cutoff}
     if _adjudication_contract(review_version):body['process_context']=process_context
+    if review_version==HOST_DISCLOSURE_VERSION:body['host_disclosure_target_id']=host_disclosure_id
     return _text_hash(dumps(body,sort_keys=True))
 
 
@@ -281,6 +289,30 @@ def hydrate_adjudicated_review(response,index,source_ids):
     return hydrated,assessments
 
 
+def _check_adjudicated_full(response,critic,targets,texts,index,source_ids,process_context,host_disclosure_id):
+    hydrated,assessments=hydrate_adjudicated_review(response,index,source_ids)
+    semantic_targets=[t for t in targets if t['claim_id']!=host_disclosure_id]
+    result=check_review(hydrated,semantic_targets,texts)
+    checked,issues=check_critic_assessments(assessments,critic,result,semantic_targets,texts,process_context)
+    result['critic_assessments']=checked
+    result['host_issues'].extend(issues)
+    result['revision_required'].extend(issues)
+    if host_disclosure_id:
+        by_id={verdict['claim_id']:verdict for verdict in result['verdicts']}
+        by_id[host_disclosure_id]={
+            'claim_id':host_disclosure_id,'status':'conditional','scope_alignment':'not_applicable',
+            'premise_assessment':'none','quotes':[],'correction':'',
+            'reason':'Host verified the disclosed timestamp against the complete set of report-bound online evidence records.'}
+        result['verdicts']=[by_id[t['claim_id']] for t in targets]
+        result['claims_checked']=len(targets)
+        result['scope']='Attributed model verdicts for report prose and a deterministic check of the report-bound acquisition and creation clocks.'
+    blocked={row['claim_id'] for row in result['host_issues']}
+    result.update(status='needs_revision' if result['revision_required'] else 'reviewed',
+        supported=sum(v['status']=='supported' and v['claim_id'] not in blocked for v in result['verdicts']),
+        unsupported=sum(v['status']=='insufficient' or (v['claim_id'] in blocked and v['status'] not in ('insufficient','contradicted')) for v in result['verdicts']))
+    return result
+
+
 def check_scope_critic(response,targets,texts,index,source_ids,*,review_version=None):
     """Validate sparse negative findings, never manufacture positive verdicts."""
     parsed=ScopeCriticResponse.model_validate(response)
@@ -301,7 +333,7 @@ def check_scope_critic(response,targets,texts,index,source_ids,*,review_version=
             witnesses.add(rid);quotes.append({'record_id':rid,'text':text,'purpose':'counterevidence'})
         witness_gap=finding.issue_kind=='source_conflict' and len(witnesses)<2
         version=review_version or REVIEW_VERSION
-        if witness_gap and version not in ('support-v13-contextual-source-repair','support-v14-adjudicated-scope-review'):
+        if witness_gap and version!='support-v13-contextual-source-repair' and not _adjudication_contract(version):
             raise ValueError('A source-conflict finding requires two distinct exact source witnesses')
         item={'claim_id':finding.claim_id,'status':'insufficient','origin':'model_scope_critic',
             'issue_kind':finding.issue_kind,'reason':finding.reason,'correction':finding.correction,
@@ -321,7 +353,7 @@ def check_scope_critic(response,targets,texts,index,source_ids,*,review_version=
         'scope':'Sparse attributed model objections, not positive support or independent truth. Unflagged targets remain unassessed.'}
 
 
-def check_saved_scope_critic(review,draft=None):
+def check_saved_scope_critic(review,draft=None,*,lookup=None):
     """New report receipts bind a clear critic to the exact full-review input."""
     # This is certification, not historical report navigation. Missing or
     # corrupt protocol metadata cannot silently downgrade a new receipt.
@@ -332,10 +364,10 @@ def check_saved_scope_critic(review,draft=None):
         'support-v9-explicit-premises','support-v10-scope-and-bindings',
         'support-v11-exact-summary-spans'}
     version=review.get('review_version') if isinstance(review,dict) else None
-    if version=='support-hybrid-minimal-v1':
+    if version in MINIMAL_REVIEW_VERSIONS:
         from .hybrid_minimal_review import verify_saved_minimal_review
         if draft is None:raise ValueError('Minimal certification requires the exact draft')
-        return verify_saved_minimal_review(review,draft)
+        return verify_saved_minimal_review(review,draft,lookup=lookup)
     if version=='support-jev-v1':
         from .jev_review import verify_saved_jev_review
         if draft is None:raise ValueError('Jev certification requires the exact draft')
@@ -346,7 +378,7 @@ def check_saved_scope_critic(review,draft=None):
         return verify_notice_review(review,draft)
     if isinstance(version,str) and version in legacy_versions:return
     modern=_adjudication_contract(version)
-    if version not in ('support-v12-negative-scope-critic','support-v13-contextual-source-repair','support-v14-adjudicated-scope-review'):
+    if version not in ('support-v12-negative-scope-critic','support-v13-contextual-source-repair') and not modern:
         raise ValueError('Missing or unsupported report review_version; historical navigation does not certify a review')
     critic=review.get('scope_critic')
     if not isinstance(critic,dict):raise ValueError('A report requires a saved '+('scope critic' if modern else 'clear scope critic')+' before full review')
@@ -356,8 +388,29 @@ def check_saved_scope_critic(review,draft=None):
     ScopeCriticResponse.model_validate(critic.get('raw_response'))
     if not modern and critic['raw_response']['findings']:
         raise ValueError('A saved clear critic cannot contain unresolved findings')
-    if draft is not None:
-        body=draft.model_dump() if hasattr(draft,'model_dump') else draft
+    body=draft.model_dump() if hasattr(draft,'model_dump') else draft
+    host_disclosure_id=None
+    if version==HOST_DISCLOSURE_VERSION:
+        if not isinstance(body,dict) or review.get('final_prose_bound') is not True:
+            raise ValueError('Host disclosure certification requires the exact final draft')
+        host_disclosure_id=_verified_disclosure_id(review['targets'],body,review['evidence_text'])
+        if not host_disclosure_id or review.get('host_disclosure_target_id')!=host_disclosure_id:
+            raise ValueError('Saved host disclosure does not match the exact bound record clocks')
+        if set(review['evidence_text'])!={rid for target in review['targets'] for rid in target['evidence_ids']}:
+            raise ValueError('Saved host disclosure evidence differs from the complete review context')
+        if lookup is not None:
+            host_target=next(t for t in review['targets'] if t['claim_id']==host_disclosure_id)
+            for rid in host_target['evidence_ids']:
+                if not rid.startswith(ONLINE_PREFIXES):
+                    continue
+                source_targets=[t for t in review['targets'] if rid in t['evidence_ids']]
+                expected_text=evidence_text(lookup(rid),targets=source_targets,review_version=version)
+                if review['evidence_text'][rid]!=expected_text:
+                    raise ValueError('Saved host disclosure review evidence differs from the bundled source record: '+rid)
+        if review.get('review_id')!='review-'+_review_input_hash(body,review['targets'],review['summary_context'],review['evidence_text'],
+                version,review.get('research_cutoff'),True,review.get('process_context'))[:24]:
+            raise ValueError('Saved host disclosure review input identity mismatch')
+    if body is not None:
         if review.get('final_prose_bound'):
             from .reports import ReportDraft
             expected=review_targets(ReportDraft.model_validate(body),review_version=version)
@@ -371,20 +424,30 @@ def check_saved_scope_critic(review,draft=None):
         if not isinstance(text,str) or not isinstance(context,dict) or context.get('text')!=text or context.get('sha256')!=_text_hash(text):
             raise ValueError('Saved scope-critic summary context differs from the actual report')
     expected=scope_critic_context_hash(review['targets'],review['evidence_text'],review.get('summary_context'),
-        review.get('report_scope'),review.get('research_cutoff'),process_context=review.get('process_context'),review_version=version)
+        review.get('report_scope'),review.get('research_cutoff'),process_context=review.get('process_context'),
+        review_version=version,host_disclosure_id=host_disclosure_id)
     if critic.get('context_sha256')!=expected:
         raise ValueError('Saved scope critic differs from the full-review context')
     if modern:
         ids={'R'+str(i+1):rid for i,rid in enumerate(sorted(review['evidence_text']))}
         index=quote_index({alias:review['evidence_text'][rid] for alias,rid in ids.items()})
-        rebuilt=check_scope_critic(critic['raw_response'],review['targets'],review['evidence_text'],index,ids,review_version=version)
+        semantic_targets=[t for t in review['targets'] if t['claim_id']!=host_disclosure_id]
+        rebuilt=check_scope_critic(critic['raw_response'],semantic_targets,review['evidence_text'],index,ids,review_version=version)
         if any(critic.get(key)!=rebuilt[key] for key in ('findings','host_issues','status')):
             raise ValueError('Saved critic notes differ from the original critic output')
         if 'critic_assessments' not in review:raise ValueError('Saved full review lacks critic adjudications')
-        _,issues=check_critic_assessments(review['critic_assessments'],critic,review,review['targets'],review['evidence_text'],review.get('process_context'))
-        if issues:raise ValueError('Saved full review has unresolved critic adjudication issues')
         if review.get('adjudication_context_sha256')!=adjudication_context_hash(critic,review.get('process_context')):
             raise ValueError('Saved critic adjudication context differs from the full review')
+        if host_disclosure_id:
+            result=_check_adjudicated_full(review['raw_full_response'],critic,review['targets'],review['evidence_text'],
+                index,ids,review.get('process_context'),host_disclosure_id)
+            for key in ('status','verdicts','host_issues','claims_checked','supported','unsupported','contradicted',
+                        'revision_required','critic_assessments'):
+                if review.get(key)!=result[key]:
+                    raise ValueError('Saved host disclosure review result mismatch: '+key)
+            return result
+        _,issues=check_critic_assessments(review['critic_assessments'],critic,review,review['targets'],review['evidence_text'],review.get('process_context'))
+        if issues:raise ValueError('Saved full review has unresolved critic adjudication issues')
 
 
 def quote_index(texts):
@@ -427,10 +490,12 @@ def hydrate_review(response,index,source_ids=None):
 
 def evidence_text(row,focus=None,targets=None,*,review_version=None):
     """Exact quoted serialization included in the reviewer context and saved result."""
-    if review_version=="support-hybrid-minimal-v1":review_version=REVIEW_VERSION
+    if review_version in MINIMAL_REVIEW_VERSIONS:review_version='support-v14-adjudicated-scope-review'
     selected = {k: row[k] for k in ("record_id", "dataset_id", "asset", "title", "url", "scope", "observed_at", "period_end",
                 "published_at", "retrieved_at", "available_at", "values", "units", "quality_flags", "method",
                 "calculation_meta", "source", "source_kind", "input_record_ids", "formulas","profile","missing_fields","window_start","window_end","pool","reserve","recipe_sha256","recipe_path","calculated_at","content_type","publication_time_source","cutoff","mode") if k in row}
+    if review_version==HOST_DISCLOSURE_VERSION and 'created_at' in row:
+        selected['created_at']=row['created_at']
     if row.get("text"):
         if not isinstance(row['text'],str):raise ValueError('Saved evidence text must be a string')
         spans,context=_claim_aware_text(row['text'],_focus_statements(focus,targets))
@@ -593,8 +658,9 @@ def saved_report_review_targets(draft, review):
     """
     version=review.get('review_version','support-v8-legacy')
     if version=='support-harness-notice-v1':return []
-    if version in ('support-jev-v1','support-hybrid-minimal-v1') or review.get('final_prose_bound'):
-        return review_targets(draft,review_version=REVIEW_VERSION if version in ('support-jev-v1','support-hybrid-minimal-v1') else version)
+    use_v14=version in ('support-jev-v1',*MINIMAL_REVIEW_VERSIONS)
+    if use_v14 or review.get('final_prose_bound'):
+        return review_targets(draft,review_version='support-v14-adjudicated-scope-review' if use_v14 else version)
     if not _premise_contract(version):return review_targets(draft,review_version=version)
     entries=review.get('targets') if isinstance(review.get('targets'),list) else review.get('verdicts',[])
     labels=[row.get('claim_id') for row in entries if isinstance(row,dict)
@@ -603,6 +669,29 @@ def saved_report_review_targets(draft, review):
         raise ValueError('Saved review must identify a contiguous author-limitation prefix')
     author=draft.model_copy(update={'limitations':draft.limitations[:len(labels)]})
     return review_targets(author,review_version=version)
+
+
+def _verified_disclosure_id(targets,body,texts):
+    """Verify the exact bound-record notice appended by the report harness."""
+    if not isinstance(body,dict) or body.get('delivery_kind','full')!='full' or not body.get('limitations'):
+        return None
+    last=len(body['limitations'])
+    statement=body['limitations'][-1]
+    recognized=automatic_disclosure(statement)
+    if not recognized or recognized[0]!='bound_records':
+        return None
+    claim_id=f'L{last}'
+    target=next((t for t in targets if t['claim_id']==claim_id),None)
+    if (target is not None and target.get('claim_path')==f'/limitations/{last-1}' and
+        target.get('statement')==statement and is_verified_host_target(target,body,texts)):
+        return claim_id
+    return None
+
+
+def _review_input_hash(body,targets,summary_context,texts,version,research_cutoff,scope_critic,process_context):
+    return _text_hash(dumps({'draft':body or targets,'targets':targets,'summary_context':summary_context,
+        'evidence':texts,'review_version':version,'research_cutoff':research_cutoff,
+        **({'scope_critic_required':True} if scope_critic else {}),'process_context':process_context},sort_keys=True))
 
 
 def check_review(response, targets, texts):
@@ -708,7 +797,8 @@ Every target must receive exactly one verdict. Return only JSON matching the spe
 Summary targets S1.1, S1.2, ... are exact continuous partitions of the untouched summary; each needs its own
 verdict. Use summary_context for surrounding conditions, negation and pronouns, never to excuse a stronger
 literal predicate by importing a cautious claim from another report field. summary_span binds exact Unicode
-offsets and hashes; allowed_quote_refs_pointer refers to shared summary_quote_refs, not new evidence.
+offsets and hashes. Select supporting excerpts from quote_index under the source IDs in each target's
+evidence_ids. For summary targets the same eligible excerpt IDs are also listed in summary_quote_refs.
 Keep each reason concise and quote only the necessary supporting/contrary spans so all targets fit the existing
 response budget. Do not omit a summary child or treat another child's approval as its approval.
 For scope_alignment_required targets, explicitly compare the LITERAL claim against source scope before approval:
@@ -814,6 +904,7 @@ SCOPE_CRITIC_SYSTEM="""You are a separate-context scope critic. Find only concre
 Inspect literal predicates and their qualifiers, including factual prefixes within otherwise supported compound sentences. Focus on:
 - Relative event/measurement periods versus publication/reporting dates, and conflicting descriptions across supplied sources. Publication within a report window permits clearly attributed reporting/disclosure during that window; it does NOT require every underlying purchase/event to occur then. Unknown transaction dates can remain unknown. Matching amounts/holdings alone do not prove the same transaction; distinguish unresolved time descriptions from a proven factual contradiction.
 - Comparative claims (more concentrated, stronger, increased, dominant, etc.): identify the compared population, metric and baseline. Matching purchase or stock numbers alone do not supply a comparison. If the supplied context lacks the basis, say only that the comparison is unsupported by the supplied context; do not claim no baseline exists in reality or in omitted source text.
+- A within-window ranking can be established by comparing the actual dated rows of a complete series. Check the values for the specified interval before flagging the ranking. A comparison with a previous period requires observations for that period.
 - Attribution and status: distinguish publisher extrapolation from a named person's statement, disclosure from independently verified execution, proposal/development from adoption/launch. Quotes near a claim do not automatically support every clause.
 Read related passages in every supplied source, not only the excerpt best matching a target's number. Inspect the complete target set and return all concrete problems you identify in this request, not just the first defective target. Exact segments may be bounded; omitted text remains unknown. Report a source_conflict only with two distinct supplied excerpt witnesses. If a target alleges disagreement but the second account is absent from the supplied input, use attribution_scope for that unverified attribution; the wording 'sources disagree' alone does not establish a source_conflict. Two differing time descriptions can require explicit disclosure as unresolved even when transaction identity is not established; do not invent identity or a date to reconcile them.
 Each finding must copy an exact contiguous claim_text from the affected target and cite source_id/excerpt_id witnesses from this request. Give a short literal claim-versus-source reason and minimal author correction. For unsupported_comparison cite the closest relevant supplied evidence and explain what comparative basis it fails to establish, without treating a quotation as proof of universal absence. Do not reject pure future questions because their future outcome is unknown, or honest process limits for lacking external market evidence.
@@ -851,6 +942,14 @@ HYBRID_REVIEW_POLICY = """
 The harness already checks source identities, exact quoted text, numeric values/units and declared calculation replay.
 Use the supplied process context to distinguish replay from independent method validation. Assess the literal
 claim's semantic support, timing, attribution, proposal versus execution, mainnet versus testnet and counterevidence.
+Assess the meaning a reader would take from the sentence. Accept faithful paraphrases, normal unit conversions
+and correctly rounded display values when the source quantity, unit, direction and time basis agree. Several
+bound excerpts may jointly support a sentence. Choose the shortest set that covers its material assertions.
+For a highest or lowest value within the stated week, compare the dated observations for that week. Distinguish
+this from a claim that activity rose compared with another week, which requires a cross-period baseline.
+For a question or conditional recommendation, identify the specific present or past premise being asserted.
+An open choice among future outcomes requires evidence only for an asserted premise. A limitation describing
+what the author could establish may stand as a process disclosure; check any external assertion within it.
 Source support is not world truth. Do not block publication for optional style, preferred wording, length or
 additional research that is not required to support a claim actually made. A material scope defect must name
 the exact unsupported predicate and actual source basis; disclose missing context rather than inventing it.
@@ -871,9 +970,11 @@ class EvidenceReviewer:
     def review(self,draft,lookup,*,process_context=None):
         return self.review_claims(review_targets(draft),lookup,draft.model_dump(),
                                  include_user_context=bool(draft.advice or draft.purchase_decision or draft.judgment!='informational'),
-                                 scope_critic=_critic_contract(REVIEW_VERSION),process_context=process_context)
+                                 scope_critic=_critic_contract(REVIEW_VERSION),process_context=process_context,
+                                 verify_host_disclosure=True)
 
-    def review_claims(self,targets,lookup,identity_payload=None,*,include_user_context=True,scope_critic=False,process_context=None):
+    def review_claims(self,targets,lookup,identity_payload=None,*,include_user_context=True,scope_critic=False,process_context=None,
+                      verify_host_disclosure=False):
         if self.cancel and self.cancel.is_set():raise RuntimeError("用户已停止任务")
         if not 1<=len(targets)<=90:
             raise ValueError('A mandatory source review accepts 1..90 targets; shorten or split this research output before retrying')
@@ -883,17 +984,18 @@ class EvidenceReviewer:
                     target['evidence_ids']=[*target['evidence_ids'],self.user_context_id]
         targets=prepare_review_targets(targets)
         adjudicated=scope_critic and _adjudication_contract(REVIEW_VERSION)
-        ids=set(i for c in targets for i in c["evidence_ids"])
-        texts={rid:evidence_text(lookup(rid),targets=[target for target in targets if rid in target['evidence_ids']]) for rid in sorted(ids)}
+        rows={rid:lookup(rid) for rid in sorted({i for c in targets for i in c['evidence_ids']})}
+        host_disclosure_id=_verified_disclosure_id(targets,identity_payload,rows) if verify_host_disclosure and adjudicated else None
+        version=HOST_DISCLOSURE_VERSION if host_disclosure_id else REVIEW_VERSION
+        semantic_targets=[t for t in targets if t['claim_id']!=host_disclosure_id]
+        texts={rid:evidence_text(row,targets=[t for t in targets if rid in t['evidence_ids']],review_version=version)
+               for rid,row in rows.items()}
         parent_text=identity_payload.get('summary') if isinstance(identity_payload,dict) else None
         summary_context={'text':parent_text,'sha256':_text_hash(parent_text),'claim_path':'/summary',
                          'segmentation_version':SUMMARY_SEGMENTATION_VERSION} if isinstance(parent_text,str) and _summary_contract(REVIEW_VERSION) else None
         if any(target.get('summary_span') for target in targets) and summary_context is None:
             raise ValueError('Exact summary-span targets require their complete original summary context')
-        identity=hashlib.sha256(dumps({"draft":identity_payload or targets,"targets":targets,
-            "summary_context":summary_context,"evidence":texts,"review_version":REVIEW_VERSION,
-            "research_cutoff":self.research_cutoff,**({'scope_critic_required':True} if scope_critic else {}),
-            'process_context':process_context},sort_keys=True).encode()).hexdigest()
+        identity=_review_input_hash(identity_payload,targets,summary_context,texts,version,self.research_cutoff,scope_critic,process_context)
         if identity in self.cache:return self.cache[identity]
         if self.rounds>=self.max_rounds:raise ReviewBudgetExhausted('Normal review rounds exhausted; retain the draft for bounded final delivery')
         if adjudicated and self.max_requests-self.calls<2:
@@ -901,14 +1003,12 @@ class EvidenceReviewer:
         source_ids={'R'+str(i+1):rid for i,rid in enumerate(sorted(texts))};aliases={rid:alias for alias,rid in source_ids.items()}
         alias_texts={alias:texts[rid] for alias,rid in source_ids.items()};index=quote_index(alias_texts)
         target_view=[]
-        for target in targets:
+        for target in semantic_targets:
             view=dict(target)
             for key in ('evidence_ids','supporting_evidence_ids','counter_evidence_ids'):
                 if key in view:view[key]=[aliases[rid] for rid in view[key]]
             if target.get('summary_span'):
                 view['allowed_quote_refs_pointer']='/summary_quote_refs'
-            else:view['allowed_quote_refs']={alias:list(index[alias]) for alias in view['evidence_ids']}
-            view['counterevidence_sources']='Any source in the supplied quote_index; never an outside source.'
             target_view.append(view)
         schema=IndexedResponse.model_json_schema()
         schema['$defs']['ExcerptReference']['properties']['source_id']['enum']=list(source_ids)
@@ -921,7 +1021,7 @@ class EvidenceReviewer:
                  "report_user_prompt":getattr(self,"report_user_prompt",None),
                  "summary_context":summary_context,
                  "summary_quote_refs":{aliases[rid]:list(index[aliases[rid]]) for rid in next((t['evidence_ids'] for t in targets if t.get('summary_span')),[])},
-                 "instruction":"Return verdicts only, with short reasons and at most 12 quotes per target. Each quote has source_id (R1...) and excerpt_id (Q12...). Positive support must use THAT target's allowed_quote_refs. Counterevidence and negative verdicts may quote any source in this request's quote_index; use purpose=counterevidence for counterquotes, which never count as positive support. A real supplied source omitted from the author's claim is citation_missing, not permission to invent or add sources. Do not copy long record hashes or write quote text. Return scope_alignment explicitly and compare literal claim scope with source scope in reason. For premise_check_required targets return premise_assessment explicitly; unsupported/conflicting factual premises require insufficient or contradicted, never conditional. Quotes must cover the actual premise. Pure future inquiry or declared process limits may use none+conditional without a quote. If eligible sources cannot support the whole claim, mark insufficient with no invented quote."}
+                 "instruction":"Return verdicts only, with short reasons and at most 12 quotes per target. Each quote has source_id (R1...) and excerpt_id (Q12...). For positive support select excerpt IDs from quote_index under THAT target's evidence_ids. Counterevidence and negative verdicts may quote any source in this request's quote_index; use purpose=counterevidence for counterquotes, which never count as positive support. A real supplied source omitted from the author's claim is citation_missing, not permission to invent or add sources. Do not copy long record hashes or write quote text. Return scope_alignment explicitly and compare literal claim scope with source scope in reason. For premise_check_required targets return premise_assessment explicitly; unsupported/conflicting factual premises require insufficient or contradicted, never conditional. Quotes must cover the actual premise. Pure future inquiry or declared process limits may use none+conditional without a quote. If eligible sources cannot support the whole claim, mark insufficient with no invented quote."}
         if self.settings.base_url!=PLAN_BASE_URL:raise ValueError("Only the authorized Plan endpoint is supported")
         self.rounds+=1
         diagnostics=[]
@@ -939,20 +1039,30 @@ class EvidenceReviewer:
             model=model.model_copy(update={'root_client':client,'client':client.chat.completions,'max_retries':0})
         def stage_request(stage,system,request,validate):
             messages=[SystemMessage(content=system),HumanMessage(content=dumps(request))]
+            # Full responses contain a verdict per target and a decision per critic finding.
+            output_limit=6000
+            if stage=='full_review':
+                output_limit=min(32768,max(6000,512+240*len(semantic_targets)+160*len(request.get('critic_findings',[]))))
             for repair in range(2):
                 if adjudicated and stage=='scope_critic' and self.max_requests-self.calls<2:
                     raise ReviewBudgetExhausted('剩余审核预算不能同时完成critic格式纠正和完整审核；保留最后一个slot，不伪造clear或跳过critic')
                 if self.calls>=self.max_requests:raise ReviewBudgetExhausted("本任务已达到来源审核请求上限；草稿和错误已保留")
                 if self.cancel and self.cancel.is_set():raise RuntimeError('用户已停止任务')
                 self.calls+=1
-                if self.emit:self.emit('review_started',{'claims':len(targets),'model':self.settings.model_id,'attempt':self.calls,'format_repair':repair>0,'stage':stage})
+                if self.emit:self.emit('review_started',{'claims':len(semantic_targets),'model':self.settings.model_id,'attempt':self.calls,'format_repair':repair>0,'stage':stage})
                 diagnostic={'review_id':'review-'+identity[:24],'attempt':self.calls,'reviewed_at':utcnow(),
                     'reviewer_model':self.settings.model_id,'stage':stage,'targets':targets,'summary_context':summary_context,
                     'report_scope':payload['report_scope'],'research_cutoff':self.research_cutoff,
                     **({'process_context':process_context,'sdk_max_retries':0} if adjudicated else {}),
+                    **({'host_disclosure_target_id':host_disclosure_id} if host_disclosure_id else {}),
                     'review_time_utc':request['review_time_utc'],'request_payload':request,
                     'source_aliases':source_ids,'evidence_text':texts,'usage':{},'usage_status':'unknown','status':'request_started'}
-                try:response=model.invoke(messages,max_tokens=6000,response_format={'type':'json_object'})
+                diagnostic['max_output_tokens']=output_limit
+                try:
+                    response=model.invoke(messages,max_tokens=output_limit,response_format={'type':'json_object'})
+                except LengthFinishReasonError as exc:
+                    truncated=True
+                    usage=completion_usage(exc.completion.usage) or {}
                 except Exception as exc:
                     diagnostic.update(status='cancelled' if self.cancel and self.cancel.is_set() else 'request_failed',
                         error_type=type(exc).__name__)
@@ -960,9 +1070,20 @@ class EvidenceReviewer:
                     if self.emit:self.emit('review_request_failed',{'review_id':diagnostic['review_id'],
                         'stage':stage,'attempt':self.calls,'error_type':type(exc).__name__,'usage_status':'unknown'})
                     raise
+                else:
+                    truncated=response.response_metadata.get('finish_reason')=='length'
+                    usage=response_usage(response) or {}
+                if truncated:
+                    diagnostic.update(status='invalid_response',error_type='output_truncated',
+                                      usage=usage,usage_status='reported' if usage else 'unknown')
+                    retain_diagnostic(diagnostic);diagnostics.append(diagnostic)
+                    if self.emit:self.emit('review_invalid',{'stage':stage,'reason':'output_truncated','usage':usage,'max_output_tokens':output_limit})
+                    if self.cancel and self.cancel.is_set():raise RuntimeError('用户已停止任务')
+                    if repair:raise ValueError('Source review response was truncated twice; retain the draft for final delivery.')
+                    output_limit=min(32768,output_limit*2)
+                    messages.append(HumanMessage(content='The previous response reached the output limit. Return complete compact JSON, covering all requested items. Keep reasons brief and cite only the excerpts needed.'))
+                    continue
                 content=response.content;actual=response.response_metadata.get('model_name',self.settings.model_id)
-                from .model_usage import response_usage
-                usage=response_usage(response) or {}
                 diagnostic.update(reviewer_model=actual,usage=usage,usage_status='reported' if usage else 'unknown',
                     response_content=content,status='unvalidated')
                 if self.cancel and self.cancel.is_set():
@@ -988,9 +1109,9 @@ class EvidenceReviewer:
                 critic_payload.update(stage='scope_critic',required_json_schema=critic_schema,
                     instruction='Find concrete time, comparative, attribution or event-status problems only. Return {"findings": [...]} with exact target claim_text and supplied source/excerpt witnesses. No positive verdicts; an empty findings list does not approve any target.')
                 critic,actual,usage=stage_request('scope_critic',SCOPE_CRITIC_SYSTEM,critic_payload,
-                    lambda value:check_scope_critic(value,targets,texts,index,source_ids))
+                    lambda value:check_scope_critic(value,semantic_targets,texts,index,source_ids,review_version=version))
                 critic.update(context_sha256=scope_critic_context_hash(targets,texts,summary_context,payload['report_scope'],self.research_cutoff,
-                    process_context=process_context,review_version=REVIEW_VERSION if adjudicated else None),
+                    process_context=process_context,review_version=version if adjudicated else None,host_disclosure_id=host_disclosure_id),
                     reviewer_model=actual,attempt=self.calls,reviewed_at=utcnow(),request_time_utc=critic_payload['review_time_utc'])
             if critic and critic['findings'] and not adjudicated:
                 findings=critic['findings'];failed={f['claim_id'] for f in findings}
@@ -1017,19 +1138,13 @@ class EvidenceReviewer:
                         'instruction':payload['instruction']+' Also return critic_assessments for EVERY supplied finding_id exactly once: decision confirm/dismiss, basis source/literal_target/host_process/declared_process and a concise independent reason. Source basis needs source/excerpt quotes; host_process needs known process_refs; literal_target/declared_process needs exact target_text. Confirmed concerns cannot coexist with a positive verdict for that target. Dismissing a concern does not approve the target: independently assess ALL targets and all external premises.'}
                     full_system=SYSTEM+ADJUDICATION_SYSTEM+HYBRID_REVIEW_POLICY
                     def validate_full(value):
-                        hydrated,assessments=hydrate_adjudicated_review(value,index,source_ids)
-                        result=check_review(hydrated,targets,texts)
-                        checked,issues=check_critic_assessments(assessments,critic,result,targets,texts,process_context)
-                        result['critic_assessments']=checked
-                        result['host_issues'].extend(issues);result['revision_required'].extend(issues)
-                        blocked={r['claim_id'] for r in result['host_issues']}
-                        result.update(status='needs_revision' if result['revision_required'] else 'reviewed',
-                            supported=sum(v['status']=='supported' and v['claim_id'] not in blocked for v in result['verdicts']),
-                            unsupported=sum(v['status']=='insufficient' or (v['claim_id'] in blocked and v['status'] not in ('insufficient','contradicted')) for v in result['verdicts']))
+                        result=_check_adjudicated_full(value,critic,targets,texts,index,source_ids,process_context,host_disclosure_id)
+                        if host_disclosure_id:
+                            result.update(host_disclosure_target_id=host_disclosure_id,raw_full_response=value)
                         return result
                 review,actual,usage=stage_request('full_review',full_system,full_payload,validate_full)
         finally:model.http_client.close()
-        review.update(review_id="review-"+identity[:24],review_version=REVIEW_VERSION,reviewed_at=utcnow(),
+        review.update(review_id="review-"+identity[:24],review_version=version,reviewed_at=utcnow(),
                       reviewer_model=actual,usage=usage,evidence_text=texts,targets=targets,summary_context=summary_context,
                       request_usages=[d['usage'] for d in diagnostics],format_repairs=sum(d['status']=='invalid_response' for d in diagnostics))
         if scope_critic:
@@ -1048,11 +1163,13 @@ class ReviewBudgetExhausted(Exception):
     """Terminal for this task; the user can continue from the retained checkpoint."""
 
 
-def validate_saved_report_review(review,draft):
+def validate_saved_report_review(review,draft,*,lookup=None):
     version=review.get('review_version')
-    if version=='support-hybrid-minimal-v1':
+    if version==HOST_DISCLOSURE_VERSION:
+        return check_saved_scope_critic(review,draft,lookup=lookup)
+    if version in MINIMAL_REVIEW_VERSIONS:
         from .hybrid_minimal_review import verify_saved_minimal_review
-        verify_saved_minimal_review(review,draft)
+        verify_saved_minimal_review(review,draft,lookup=lookup)
         return {'status':review['status'],'claims_checked':review['claims_checked']}
     if version=='support-jev-v1':
         from .jev_review import verify_saved_jev_review

@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from research_agent.runtime import AgentRuntime
+from research_agent.minimal_delivery import MINIMAL_SUMMARY, evidence_gap_notice
+from research_agent.runtime import AgentRuntime, _published_report_answer
 from research_agent.settings import BRIDGE_MODE,Settings
 
 
@@ -36,7 +37,8 @@ class ReportFinalizationStatusTests(unittest.TestCase):
                     if outcome=='failed':raise RuntimeError('Synthetic final delivery failure')
                     service.published_reports.append('reports/research-fixture.json')
                     service.last_report={'path':service.published_reports[-1],'delivery_kind':'minimal',
-                        'draft':{'title':'Synthetic limited report','summary':'Fixture for lifecycle only.'}}
+                        'draft':{'title':'Limited evidence report','summary':MINIMAL_SUMMARY,
+                                 'observations':[{'statement':'ETH advanced this week.'}]}}
                     emit('review_finished',{'model':'offline-review-fixture'})
                 service.finalize_minimal_delivery=finalize
                 return service
@@ -71,6 +73,14 @@ class ReportFinalizationStatusTests(unittest.TestCase):
         self.assertEqual(result['report_delivery_kind'],'minimal')
         self.assertIn('Synthetic author budget exhausted',result['delivery_warning'])
         self.assertNotIn('error',result)
+        self.assertTrue(result['answer'].startswith('Report published: [Research report]'))
+        self.assertTrue(result['answer'].endswith('ETH advanced this week.'))
+
+    def test_notice_keeps_an_explicit_label(self):
+        answer = _published_report_answer({
+            'path':'/reports/research-fixture.md','delivery_kind':'evidence_gap',
+            'draft':evidence_gap_notice().model_dump()}, 'fixture')
+        self.assertTrue(answer.startswith('Evidence availability notice:'))
 
     def test_failed_final_delivery_becomes_terminal_only_after_review_finishes(self):
         result=self.run_blocked_finalizer('failed')

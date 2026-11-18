@@ -5,6 +5,10 @@ def response_usage(message):
     usage=getattr(message,'usage_metadata',None)
     if usage:return usage
     raw=(getattr(message,'response_metadata',None) or {}).get('token_usage')
+    return completion_usage(raw)
+
+
+def completion_usage(raw):
     if hasattr(raw,'model_dump'):raw=raw.model_dump()
     if not isinstance(raw,dict):return None
     def valid(value):return isinstance(value,int) and not isinstance(value,bool) and value>=0

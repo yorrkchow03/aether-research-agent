@@ -33,23 +33,31 @@ def replay_bundle(directory,settings,expected=None,execute_recipes=False):
     index=json.loads((directory/'replay_index.json').read_text())
     records={rid:json.loads((directory/path).read_text()) for rid,path in index['records'].items()}
     report=json.loads((directory/'report/report.json').read_text())
+    saved_validation=report.get('validation',{})
+    check_etf_flows='farside_dated_totals_checked' in saved_validation
+
+    def raw_reader(row):
+        return (directory/'raw'/(row['source']['sha256']+'.bin')).read_bytes()
+
     try:
         draft=ReportDraft.model_validate(report['report'])
         if getattr(draft,'scope',None):
             from .report_presentation import build_report_presentation
             saved=report['presentation']
             overview=saved['overview']
-            def raw_reader(row):
-                return (directory/'raw'/(row['source']['sha256']+'.bin')).read_bytes()
             evidence_as_of=overview['evidence_as_of']
-            result['numeric_validation']=validate_report(draft,records.__getitem__,as_of=evidence_as_of,raw_reader=raw_reader)
+            result['numeric_validation']=validate_report(draft,records.__getitem__,as_of=evidence_as_of,
+                raw_reader=raw_reader,check_etf_flows=check_etf_flows)
             rebuilt=build_report_presentation(draft,records.__getitem__,user_prompt=overview['user_prompt'],
                 created_at=report['created_at'],evidence_as_of=evidence_as_of,raw_reader=raw_reader)
             if rebuilt!=saved:
                 raise ValueError('Stored report presentation differs from the replayed source projection')
             result['presentation_validation']='passed'
         else:
-            result['numeric_validation']=validate_report(draft,records.__getitem__)
+            result['numeric_validation']=validate_report(draft,records.__getitem__,raw_reader=raw_reader,
+                check_etf_flows=check_etf_flows)
+        if check_etf_flows and result['numeric_validation'].get('farside_dated_totals_checked')!=saved_validation['farside_dated_totals_checked']:
+            raise ValueError('Saved Farside row validation count differs from the original table replay')
     except (ValueError,KeyError,OSError) as exc:return {**result,'status':'failed','error':str(exc)}
     review=report.get('review',{})
     if review.get('review_id'):
@@ -68,7 +76,7 @@ def replay_bundle(directory,settings,expected=None,execute_recipes=False):
                 if len(saved['targets'])!=len(expected_targets) or saved_targets!=expected_targets:
                     raise ValueError('Saved review does not cover the report and featured-document targets')
             from .review import validate_saved_report_review
-            check=validate_saved_report_review(saved,draft)
+            check=validate_saved_report_review(saved,draft,lookup=records.__getitem__)
             result['review_quote_validation']={'status':'passed','claims_checked':check['claims_checked'],'semantic_status':check['status']}
         except (ValueError,KeyError) as exc:return {**result,'status':'failed','error':str(exc)}
     else:result['review_quote_validation']={'status':'not_available'}
@@ -95,7 +103,7 @@ def replay_bundle(directory,settings,expected=None,execute_recipes=False):
                     shell=ResearchShell(work,settings)
                     recipe=(directory/calculation['recipe']).resolve()
                     args=['python','-I',str(recipe),*[str(inputs/(r+'.json')) for r in calculation['input_ids']]]
-                    output=shell.execute(shlex.join(args),timeout=60)
+                    output=shell.execute(shlex.join(args),timeout=60,separate_stderr=True)
                     if output.exit_code or output.truncated:raise ValueError('Recipe failed: '+output.output[:1000])
                     obj=json.loads(output.output);values=obj['values']
                     if obj['units']!=row['units']:raise ValueError('Replayed units differ')

@@ -167,6 +167,13 @@ def compact_tool_result(tool, text, obj, receipt, *, status, max_chars, root):
         view['tool'] = str(tool)[:80]
     if len(_dump(view)) > max_chars:
         raise ValueError('Tool artifact navigation exceeds the requested view budget')
+    if tool == 'execute' and Path(root).name == 'task-state' and Path(root).parent.name == 'memory':
+        artifact['read_file_path'] = '/memory/task-state/' + Path(receipt['path']).relative_to(root).as_posix()
+        view['next_action'] = 'Read a specific output section only if it is needed. Prefer read_file over printing this JSON envelope in execute again.'
+        if len(_dump(view)) > max_chars:
+            view.pop('next_action')
+        if len(_dump(view)) > max_chars:
+            artifact.pop('read_file_path')
 
     def put(key, value):
         old = view['metadata'].get(key)
@@ -195,7 +202,11 @@ def compact_tool_result(tool, text, obj, receipt, *, status, max_chars, root):
         if not add(entry):
             return
         for index in dict.fromkeys([0, len(lines) - 1]):
-            entry['lines'].append({'line': index + 1, 'text': lines[index]})
+            line = lines[index]
+            item = {'line': index + 1, 'text': line}
+            if pointer == '/output' and len(line) > 500:
+                item.update(text=line[:500], partial=True)
+            entry['lines'].append(item)
             if len(_dump(view)) > max_chars:
                 entry['lines'].pop()
 
@@ -246,6 +257,8 @@ def compact_tool_result(tool, text, obj, receipt, *, status, max_chars, root):
                     'details_in_artifact': True})
     for key in ('stderr', 'stdout'):
         console('/' + key, obj.get(key))
+    if tool == 'execute':
+        console('/output', obj.get('output'))
     for parent, container in (('', obj), ('/review', obj.get('review')),
                               ('/validation', obj.get('validation'))):
         if not isinstance(container, dict):

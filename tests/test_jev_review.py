@@ -78,6 +78,15 @@ class JevReviewTests(unittest.TestCase):
         self.assertEqual(result['status'],'reviewed')
         self.assertIsNone(result['policy']['confidence_gate'])
 
+    def test_complete_single_batch_preflight_leaves_all_slots_for_factual_fallback(self):
+        reviewer = self.reviewer(max_requests=1)
+        reviewer.require_single_batch = True
+        with patch('research_agent.jev_review.MAX_TARGETS',1):
+            with self.assertRaisesRegex(ValueError,'one complete public Jev batch'):
+                reviewer.review(self.draft,lambda _:self.row)
+        self.assertEqual(reviewer.calls,0)
+        self.assertFalse(self.sent)
+
     def test_default_transport_preserves_existing_network_configuration(self):
         real_client=httpx.Client
         def dispatch(request):

@@ -121,12 +121,31 @@ def _minimal_shape(body):
             body.get('judgment', 'informational') != 'informational' or
             body.get('judgment_reason', '') != ''):
         return False
-    if not isinstance(body.get('observations'), list) or not body['observations']:
+    observations, events = body.get('observations'), body.get('key_changes', [])
+    if not isinstance(observations, list) or not isinstance(events, list) or not (observations or events):
         return False
-    for field in ('key_changes', 'interpretations', 'forecasts', 'questions_to_watch',
-                  'explanations', 'charts', 'documents', 'narrative_evidence_ids'):
+    from .claims import Claim
+    try:
+        for claim in [*observations, *events]:
+            Claim.model_validate(claim)
+    except ValueError:
+        return False
+    for field in ('interpretations', 'forecasts', 'questions_to_watch',
+                  'explanations', 'documents', 'narrative_evidence_ids'):
         value = body.get(field, [])
         if not isinstance(value, list) or value:
+            return False
+    charts = body.get('charts', [])
+    if not isinstance(charts, list) or len(charts) > 3:
+        return False
+    if charts:
+        from .report_presentation import ReportChart, ReportScope
+        try:
+            ReportScope.model_validate(body.get('scope'))
+            specs = [ReportChart.model_validate(chart) for chart in charts]
+        except ValueError:
+            return False
+        if len({(spec.evidence_id, spec.metric) for spec in specs}) != len(specs):
             return False
     return body.get('advice') is None and body.get('purchase_decision') is None
 
@@ -173,13 +192,14 @@ def is_verified_host_target(target, body, texts, process_context=None):
         # A global availability statement cannot omit a later bound source.
         if not online or not online.issubset(target_ids):
             return False
-        # Extra online IDs supplied to this target must also have clocks; no
-        # subset of conveniently timed sources may establish the global max.
-        online.update(rid for rid in target_ids if rid.startswith(ONLINE_PREFIXES))
         if recognized[0] == 'legacy':
+            # Retain the historical contract for archived review receipts.
+            online.update(rid for rid in target_ids if rid.startswith(ONLINE_PREFIXES))
             clocks = [_source_clock(texts[rid], rid) for rid in sorted(online)]
             latest = max(clocks, key=lambda item: (item[0], item[1]))[1]
             return statement == AVAILABILITY_PREFIX + latest + AVAILABILITY_SUFFIX
+        # The current wording describes the exact report-bound set. Additional
+        # reviewer context or unbound lineage cannot move that clock.
         latest = bound_record_timestamp({rid: texts[rid] for rid in sorted(online)})
     except (KeyError, TypeError, ValueError, OverflowError):
         return False

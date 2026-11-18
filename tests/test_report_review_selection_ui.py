@@ -62,11 +62,17 @@ class ReportReviewRequestTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'darwin', 'Uses the built-in macOS JavaScript runtime, no downloaded dependencies')
 class ReportReviewFrontendTests(unittest.TestCase):
-    def run_js(self, checks):
+    def run_js(self, checks, *, reader=False):
         script = (WEB/'dashboard.js').read_text()
         source = script.split('const finite=',1)[0]
         source += script[script.index('function chatReportLinks('):script.index('function chatTurn(')]
         source += script[script.index('const researchStages='):script.index('async function refreshSession(')]
+        if reader:
+            source += script[script.index('const finite='):script.index('function toast(')]
+            source += script[script.index('function reportExternalLink('):script.index('function reportToolbar(')]
+            source += script[script.index('function reportToolbar('):script.index('function beginReport(')]
+            source += script[script.index('function reportSummaryHTML('):script.index('function adviceSourceIDs(')]
+            source += script[script.index('function adviceSourceIDs('):script.index('async function showReport(')]
         mocks = '''
           const saved = {};
           const controls = {'chat':{innerHTML:''},'jev-assistance':{},'report-review-provider':{}};
@@ -75,6 +81,9 @@ class ReportReviewFrontendTests(unittest.TestCase):
             controls[id]={dataset:{},textContent:'',setAttribute:(key,value)=>{}};
           const document = {body:{dataset:{}},getElementById:id=>controls[id]};
           const localStorage = {getItem:key=>saved[key]??null,setItem:(key,value)=>saved[key]=value};
+          const window = {};
+          const location = {origin:'http://127.0.0.1:8765'};
+          function sourceButton(id,label){ return '<button data-source="'+esc(id)+'">'+esc(label)+'</button>'; }
         '''
         code = 'function run(){\n' + mocks + source + '\n' + checks + '\n}'
         result = subprocess.run(['/usr/bin/osascript','-l','JavaScript','-'],input=code,
@@ -106,10 +115,10 @@ class ReportReviewFrontendTests(unittest.TestCase):
             jev:reportReviewLabel('jev','jev-1.14.0')
           });
         ''')
-        self.assertEqual(result['gap'], {'label':'Evidence gap','tone':'warn'})
-        self.assertEqual(result['minimal']['label'], 'Limited report')
-        self.assertEqual(result['legacy']['label'], 'Sources checked')
-        self.assertEqual(result['unreviewed']['label'], 'Archived report')
+        self.assertIn('Evidence gap', result['gap'])
+        self.assertEqual(result['minimal'], '')
+        self.assertEqual(result['legacy'], '')
+        self.assertEqual(result['unreviewed'], '')
         self.assertEqual(result['actual'], 'Review: doubao-seed-2.1-pro-260915')
         self.assertEqual(result['jev'], 'Review: jev-1.14.0')
 
@@ -133,9 +142,63 @@ class ReportReviewFrontendTests(unittest.TestCase):
         self.assertIn('Review: jev-1.14.0', result['normalLinks'])
         self.assertIn('Evidence gap saved', result['gapLinks'])
         self.assertNotIn('Review:', result['gapLinks'])
-        self.assertIn('Your limited report is ready', result['limitedLinks'])
+        self.assertEqual(result['limitedLinks'],result['normalLinks'])
         self.assertNotIn('Jev', result['answerProgress'])
         self.assertNotIn('jev', result['answerProgress'])
+
+    def test_legacy_publication_reply_uses_neutral_report_card_and_preserves_summary(self):
+        result = self.run_js('''
+          const path='/reports/research-aaaaaaaaaaaa.md';
+          const header='Limited report published: [Limited evidence report](/api/sessions/123/artifact?path='+path+')';
+          const job={report_delivery_kind:'minimal',published_reports:[path],answer:header+'\\n\\nSaved observation.'};
+          return JSON.stringify({
+            normal:chatReportAnswer(job),
+            distinction:chatReportAnswer({...job,report_delivery_kind:'evidence_gap'}),
+            chat:chatReportAnswer({...job,published_reports:[]})
+          });
+        ''')
+        self.assertEqual(result['normal'],'Saved observation.')
+        self.assertIn('Limited report published',result['distinction'])
+        self.assertIn('Limited report published',result['chat'])
+
+    def test_report_reader_keeps_key_events_facts_and_originals_in_one_timeline(self):
+        result = self.run_js('''
+          const original={evidence_id:'page-aaa',title:'Primary announcement',publisher:'Issuer',
+            role:'primary',quote:'Exact <excerpt>',url:'https://example.org/announcement',
+            published_at:'2026-11-12T01:00:00Z',retrieved_at:'2026-11-12T02:00:00Z'};
+          const event={statement:'2026-11-10: Issuer announced the change.',evidence_ids:['page-aaa']};
+          const fact={statement:'Details for the event.',evidence_ids:['page-aaa']};
+          const draft={title:'Limited evidence report',delivery_kind:'minimal',summary:'Summary text.',
+            observations:[fact],key_changes:[event],limitations:['Coverage details.'],
+            questions_to_watch:['First follow-up.','Second follow-up.','Third follow-up.','Fourth follow-up.'],
+            judgment_reason:'Research judgment text.',interpretations:[fact]};
+          const packet={created_at:'2026-11-13T00:00:00Z',report:draft,timeline:[{
+            ...event,date:'2026-11-10',date_label:'2026-11-10',date_kind:'event',
+            display_statement:'Issuer announced the change.',facts:[fact],documents:[original]
+          }]};
+          return JSON.stringify({html:reportReaderHTML(packet,'research-aaaaaaaaaaaa','session'),
+            notice:reportReaderHTML({report:{...draft,delivery_kind:'evidence_gap',title:'Evidence availability notice'}},
+              'research-bbbbbbbbbbbb','session')});
+        ''',reader=True)
+        html = result['html']
+        headings = ['Summary','Key data charts','Key metric changes','Key events','Research judgment',
+                    'What to watch next','Limits to keep in mind','Sources, review and downloads']
+        self.assertEqual(html.count('<h2>'),len(headings))
+        self.assertEqual(sorted(headings,key=lambda label:html.index(f'<h2>{label}</h2>')),headings)
+        events = html.split('<h2>Key events</h2>')[1].split('<h2>Research judgment</h2>')[0]
+        self.assertIn('<time datetime="2026-11-10">',events)
+        self.assertIn('Issuer announced the change.',events)
+        self.assertIn('Details for the event.',events)
+        self.assertIn('Primary announcement',events)
+        self.assertIn('Exact &lt;excerpt&gt;',events)
+        self.assertIn('data-source="page-aaa"',events)
+        self.assertNotIn('Main facts',html)
+        self.assertNotIn('Important documents',html)
+        self.assertNotIn('Limited evidence report',html)
+        self.assertNotIn('Fourth follow-up.',html)
+        self.assertIn('&amp;view=reader',html)
+        self.assertIn('Evidence gap',result['notice'])
+        self.assertNotIn('<h2>Key events',result['notice'])
 
     def test_whole_dashboard_script_parses(self):
         script = (WEB/'dashboard.js').read_text()

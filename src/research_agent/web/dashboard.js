@@ -41,10 +41,12 @@ function reportReviewLabel(provider,model){
  if(model)return 'Review: '+model;
  return provider==='generation_model'?'Review: same model':'';
 }
-function reportDeliveryBadge(kind,status){
- if(kind==='evidence_gap')return {label:'Evidence gap',tone:'warn'};
- if(kind==='minimal')return {label:'Limited report',tone:'neutral'};
- return status==='reviewed'?{label:'Sources checked',tone:''}:{label:'Archived report',tone:'neutral'};
+function reportDeliveryBadge(kind){
+ return kind==='evidence_gap'?'<span class="pill warn">Evidence gap</span>':'';
+}
+function reportDisplayTitle(title){
+ const value=String(title||'').trim();
+ return !value||/^(?:Limited (?:evidence|research) report|Saved market data brief)$/i.test(value)?'Research report':value;
 }
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const finite=v=>v!==null&&v!==undefined&&v!==''&&Number.isFinite(Number(v));
@@ -56,7 +58,7 @@ const date=v=>v&&Number.isFinite(Date.parse(v))?new Intl.DateTimeFormat('en-US',
 const age=v=>{if(!v||!Number.isFinite(Date.parse(v)))return 'Unknown';const m=Math.max(0,(Date.now()-Date.parse(v))/60000);return m<1?'Just now':m<60?Math.floor(m)+'m ago':m<1440?Math.floor(m/60)+'h ago':Math.floor(m/1440)+'d ago'};
 const safeURL=v=>{try{const u=new URL(v,location.origin);return ['http:','https:'].includes(u.protocol)&&!u.username&&!u.password?u.href:''}catch{return ''}};
 function toast(text){$('toast').textContent=text;clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').textContent='',5500)}
-async function api(path,method='GET',body){const response=await fetch(path,{method,cache:'no-store',headers:{'X-Local-Token':window.AETHER_TOKEN,...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body)});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={error:text.slice(0,200)}}if(!response.ok)throw Error(data.error||data.detail?.map?.(item=>item.msg).join('; ')||'Request failed ('+response.status+')');return data}
+async function api(path,method='GET',body,signal){const response=await fetch(path,{method,signal,cache:'no-store',headers:{'X-Local-Token':window.AETHER_TOKEN,...(body!==undefined?{'Content-Type':'application/json'}:{})},body:body===undefined?undefined:JSON.stringify(body)});const text=await response.text();let data;try{data=JSON.parse(text)}catch{data={error:text.slice(0,200)}}if(!response.ok)throw Error(data.error||data.detail?.map?.(item=>item.msg).join('; ')||'Request failed ('+response.status+')');return data}
 function markdown(text,verified=null){
  const inline=line=>line.replace(/\[([^\]]+)\]\(([^)]+)\)/g,(_,label,url)=>{
   const safe=safeURL(url);if(!safe)return label;let attrs='';const parsed=new URL(safe),match=parsed.pathname.match(/^\/api\/sessions\/([a-f0-9]{32})\/evidence\/([a-z0-9-]+)$/);
@@ -101,14 +103,17 @@ function renderData(){
  const market=state.dashboard;
  const quote=item('eth_price').record, hourly=item('eth_hourly').record, daily=item('eth_candles').record;
  const rate24=indicator('eth_24h').record, rate7=indicator('eth_7d').record, risk=indicator('eth_30d').record;
- const close=quote?.values?.price_usd??daily?.values?.close_usd;
- const priceSource=quote?.values?.price_usd!=null?quote:daily;
+ const latestCandle=market.collection&&hourly?.values?.close_usd!=null?hourly:daily;
+ const useQuote=quote?.values?.price_usd!=null&&(!market.collection||!latestCandle||
+  Date.parse(quote.observed_at)>=Date.parse(latestCandle.observed_at));
+ const priceSource=useQuote?quote:latestCandle;
+ const close=useQuote?quote.values.price_usd:latestCandle?.values?.close_usd;
  const volumeRows=hourly?.series?.slice(-24)||[];
  const volume=volumeRows.length===24&&volumeRows.every((row,n)=>finite(row.volume_asset)&&
   (n===0||Date.parse(row.period_end)-Date.parse(volumeRows[n-1].period_end)===3600000))?
   volumeRows.reduce((sum,row)=>sum+Number(row.volume_asset),0):null;
  const rows=[
-  ['ETH price',usd(close),(priceSource===daily?'Last completed candle':'Coinbase spot')+' · '+age(priceSource?.observed_at),priceSource?.record_id,''],
+  ['ETH price',usd(close),(!useQuote?'Last completed candle':'Coinbase spot')+' · '+age(priceSource?.observed_at),priceSource?.record_id,''],
   ['24h change',pct(rate24?.values?.return_fraction),'Completed hourly prices',rate24?.record_id,color(rate24?.values?.return_fraction)],
   ['7d change',pct(rate7?.values?.return_fraction),'Completed daily prices',rate7?.record_id,color(rate7?.values?.return_fraction)],
   ['24h trading volume',finite(volume)?new Intl.NumberFormat('en-US',{notation:'compact',maximumFractionDigits:2}).format(volume)+' ETH':'—','Coinbase · completed hours',hourly?.record_id,''],
@@ -132,20 +137,44 @@ function renderData(){
  ];
  $('risk-metrics').innerHTML=advanced.join('');
  $('coverage').textContent='Times and sources are available with each metric.';
- $('freshness').textContent=market.refreshing?'Updating prices…':market.updated_at?'Data updated '+age(market.updated_at):'Waiting for data';
+ const collectionLabel={ok:'complete',partial:'partial',failed:'failed'}[market.collection?.status];
+ const collectionNote=collectionLabel&&market.collection.checked_at?
+  ' · Daily check '+collectionLabel+' ('+date(market.collection.checked_at)+')':'';
+ $('freshness').textContent=market.refreshing?'Checking sources…':
+  (market.updated_at?'Saved data '+age(market.updated_at):'Waiting for data')+collectionNote;
  const connectionLabels={eth_price:'ETH spot price',eth_candles:'ETH daily history',eth_hourly:'ETH hourly history',orderbook:'Order book',funding:'Funding rate',open_interest:'Open interest',tvl:'Ethereum TVL',dex_volume:'Ethereum DEX volume'};
  $('data-connections').innerHTML=Object.entries(connectionLabels).map(([key,label])=>{
   const source=item(key);
-  return metricRow(label,source.status==='ok'?'Available':'Unavailable',source.record?'Observed '+date(source.record.observed_at):'No saved observation',source.record?.record_id);
+  const status=source.status==='ok'?'Available':source.record?'Retained from earlier capture':'Unavailable';
+  return metricRow(label,status,source.record?'Observed '+date(source.record.observed_at):'No saved observation',source.record?.record_id);
  }).join('');
  renderPriceChart();
 }
-async function loadData(refresh=false){
- if(refresh)await api('/api/dashboard/refresh','POST',{});
- state.dashboard=await api('/api/dashboard');
+async function loadData(){
+ const previous=state.dashboard.fresh;
+ const dashboard=await api('/api/dashboard','GET',undefined,AbortSignal.timeout?.(8000));
+ const active=state.dashboard.fresh;
+ if(active?.status==='running'&&Date.parse(active.started_at)>Date.parse(dashboard.fresh?.started_at)){
+  dashboard.fresh=active;
+  dashboard.refreshing=true;
+ }
+ state.dashboard=dashboard;
  renderData();
+ if(startingFresh)return;
+ const fresh=state.dashboard.fresh;
+ const status=freshStatus(fresh,state.dashboard.refreshing);
+ if(status)showFreshStatus(status.text,status.busy);
+ if(previous&&fresh?.finished_at&&fresh.finished_at!==previous.finished_at){
+  if(state.view==='news')loadLatestNews().catch(()=>{});
+  if(state.view==='library')loadLibrary().catch(()=>{});
+ }
 }
-function reportRow(r){const badge=reportDeliveryBadge(r.delivery_kind,r.review_status);return `<article class="report-row"><div class="report-symbol">▤</div><div><button data-report="${esc(r.report_id)}"><h3>${esc(r.title)}</h3></button><p>${esc(date(r.created_at))} · <span class="pill ${badge.tone}">${badge.label}</span></p></div></article>`}
+function reportRow(report){
+ const badge=reportDeliveryBadge(report.delivery_kind);
+ return `<article class="report-row"><div class="report-symbol">▤</div><div>
+  <button data-report="${esc(report.report_id)}"><h3>${esc(reportDisplayTitle(report.title))}</h3></button>
+  <p>${esc(date(report.created_at))}${badge?' · '+badge:''}</p></div></article>`;
+}
 async function loadReports(){
  const query=$('report-query').value.trim();
  const data=await api('/api/reports?query='+encodeURIComponent(query));
@@ -153,6 +182,11 @@ async function loadReports(){
  state.reports=data.items;
  $('reports-list').innerHTML=data.items.length?data.items.map(reportRow).join(''):
   `<div class="card empty">${query?'No reports match this search.':'Your research reports will appear here.'}</div>`;
+}
+function reportExternalLink(value,label){
+ if(!value)return '';
+ const url=safeURL(value);
+ return url?`<a class="text-link" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`:'';
 }
 function reportToolbar(id){
  return `<div class="report-reader-toolbar"><button class="text-button" data-report-back>← All reports</button><a class="button primary" href="/api/reports/${encodeURIComponent(id)}/pdf" download="aether-${esc(id)}.pdf">Export PDF ↓</a></div>`;
@@ -178,7 +212,7 @@ function reportSummaryHTML(summary){
  return `<p class="report-summary">${esc(lead.trim())}</p>${remaining?`<details class="report-summary-more"><summary>Read the rest of the summary</summary><p>${esc(remaining)}</p></details>`:''}`;
 }
 function adviceSourceIDs(a){if(!a)return [];return [...new Set([...(a.context_evidence_ids||[]),...['rationale','conditions','counterpoints','invalidation'].flatMap(k=>(a[k]||[]).flatMap(c=>c.evidence_ids)),...(a.historical_cases||[]).flatMap(c=>c.evidence_ids)])]}
-function adviceHTML(a,claims,sid){if(!a)return '';let body=`<section class="advice-section"><h2>Conditional research suggestion</h2><span class="pill neutral">${a.scope==='user_context'?'Supplied personal context':'General market research'}</span><p class="body-copy">${esc(a.summary)} ${adviceSourceIDs(a).map(rid=>sourceButton(rid,'View evidence ↗',sid)).join(' ')}</p>`;if(a.horizon_days)body+=`<p>Research horizon: ${esc(a.horizon_days)} days</p>`;for(const [label,key] of [['Evidence & reasoning','rationale'],['Conditions to investigate','conditions'],['Counterevidence','counterpoints'],['Revisit or invalidate when','invalidation']])if(a[key]?.length)body+=`<h3>${label}</h3>`+claims(a[key]);for(const c of a.historical_cases||[]){body+=`<h3>Historical comparison · ${esc(c.name)}</h3><p>${esc(date(c.case_end))} · ${c.evidence_ids.map(rid=>sourceButton(rid,'View case evidence ↗',sid)).join(' ')}</p><p class="card-note">${c.availability==='point_in_time'?'Saved availability receipts checked against case end.':'Retrospective observed history; historical public availability is not established.'}</p>`;for(const [label,key] of [['Similarities','similarities'],['Material differences','differences'],['Limits of transfer','limitations']])body+=`<strong>${label}</strong><ul>${(c[key]||[]).map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`}for(const [label,key] of [['Scenario assumptions','assumptions'],['Missing information','missing_information'],['What would prompt another review','review_triggers']])if(a[key]?.length)body+=`<h3>${label}</h3><ul>${a[key].map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`;return body+'</section>'}
+function adviceHTML(a,claims,sid){if(!a)return '';let body=`<section class="advice-section"><h3>Conditional research suggestion</h3><span class="pill neutral">${a.scope==='user_context'?'Supplied personal context':'General market research'}</span><p class="body-copy">${esc(a.summary)} ${adviceSourceIDs(a).map(rid=>sourceButton(rid,'View evidence ↗',sid)).join(' ')}</p>`;if(a.horizon_days)body+=`<p>Research horizon: ${esc(a.horizon_days)} days</p>`;for(const [label,key] of [['Evidence & reasoning','rationale'],['Conditions to investigate','conditions'],['Counterevidence','counterpoints'],['Revisit or invalidate when','invalidation']])if(a[key]?.length)body+=`<h4>${label}</h4>`+claims(a[key]);for(const c of a.historical_cases||[]){body+=`<h4>Historical comparison · ${esc(c.name)}</h4><p>${esc(date(c.case_end))} · ${c.evidence_ids.map(rid=>sourceButton(rid,'View case evidence ↗',sid)).join(' ')}</p><p class="card-note">${c.availability==='point_in_time'?'Saved availability receipts checked against case end.':'Retrospective observed history; historical public availability is not established.'}</p>`;for(const [label,key] of [['Similarities','similarities'],['Material differences','differences'],['Limits of transfer','limitations']])body+=`<strong>${label}</strong><ul>${(c[key]||[]).map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`}for(const [label,key] of [['Scenario assumptions','assumptions'],['Missing information','missing_information'],['What would prompt another review','review_triggers']])if(a[key]?.length)body+=`<h4>${label}</h4><ul>${a[key].map(t=>'<li>'+esc(t)+'</li>').join('')}</ul>`;return body+'</section>'}
 
 const reportClock = new Intl.DateTimeFormat('en-GB', {
  day:'numeric', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit',
@@ -271,7 +305,7 @@ function reportChartHTML(chart,index,sid){
  const coverage=chart.coverage||{};
  const gap=coverage.internal_gap_count>0||coverage.starts_after_window||coverage.ends_before_window;
  const sample=points.length?[points[0],points.at(-1)]:[];
- const links=(chart.sources||[]).map(source=>sharedSourceLink(source.url,source.publisher+' ↗')).filter(Boolean);
+ const links=(chart.sources||[]).map(source=>reportExternalLink(source.url,source.publisher+' ↗')).filter(Boolean);
  return `<figure class="report-chart-card">
   <figcaption><h3>${esc(chart.asset)} ${esc(chart.title)}</h3>
    <p class="report-chart-meta">${esc(reportPublisher(chart.provider))} · ${esc(chart.frequency)} · ${esc(chart.unit)} · ${points.length} saved observations</p></figcaption>
@@ -292,45 +326,166 @@ function reportPublisher(value){
  return Object.hasOwn(names,value)?names[value]:value;
 }
 
-function reportDocumentsHTML(documents,sid,review){
- if(!documents.length)return '';
- const verdicts=new Map((review?.verdicts||[]).map(verdict=>[verdict.claim_id,verdict.status]));
- return `<section class="report-featured-documents" aria-label="Important documents"><h2>Important documents</h2>
-  ${documents.map((doc,index)=>{
-   const reviewed=['supported','reasonable_inference'].includes(verdicts.get('DOC'+(index+1)));
-   return `<article class="report-document-card">
-    <span class="pill neutral">${esc(reportDocumentRoles[doc.role]||'Saved original')}</span>
-    <h3>${esc(doc.title)}</h3><p class="report-document-publisher">${esc(reportPublisher(doc.publisher))}</p>
-    <p class="report-document-relevance">${esc(doc.relevance)}</p>
-    <div class="report-evidence-links">${sourceButton(doc.evidence_id,'Read saved original ↗',sid)} ${sharedSourceLink(doc.url,'Captured publication ↗')}</div>
-    <details class="report-source-excerpt"><summary>Quoted passage and dates${reviewed?' · source checked':''}</summary>
-     <blockquote>${esc(doc.quote)}</blockquote>
-     <dl class="report-metadata"><div><dt>Published</dt><dd>${reportTime(doc.published_at)}</dd></div>
-      <div><dt>Captured</dt><dd>${reportTime(doc.retrieved_at)}</dd></div></dl>
-    </details>
-   </article>`;
-  }).join('')}
- </section>`;
+function reportEventDocumentHTML(doc,sid,reviewed){
+ return `<article class="report-document-card">
+  <h4>${esc(doc.title)}</h4>
+  <p class="report-document-publisher">${esc(reportPublisher(doc.publisher))} · ${esc(reportDocumentRoles[doc.role]||'Saved original')}</p>
+  ${doc.relevance?`<p class="report-document-relevance">${esc(doc.relevance)}</p>`:''}
+  <div class="report-evidence-links">${sourceButton(doc.evidence_id,'Read saved original ↗',sid)} ${reportExternalLink(doc.url,'Captured publication ↗')}</div>
+  <details class="report-source-excerpt"><summary>Quoted passage and dates${reviewed?' · source checked':''}</summary>
+   <blockquote>${esc(doc.quote)}</blockquote>
+   <dl class="report-metadata"><div><dt>Published</dt><dd>${reportTime(doc.published_at)}</dd></div>
+    <div><dt>Captured</dt><dd>${reportTime(doc.retrieved_at)}</dd></div></dl>
+  </details>
+ </article>`;
 }
 
-function reportMetricCards(draft,numbers,sid,review){
- const numeric=(draft.observations||[]).filter(claim=>claim.metric&&finite(claim.value));
+function reportEventDateHTML(card){
+ const date=card.date;
+ const isDay=typeof date==='string'&&/^\d{4}-\d{2}-\d{2}$/.test(date)&&Number.isFinite(Date.parse(date));
+ const label=card.date_label;
+ const heading=isDay&&(!label||label===date)
+  ?`<time datetime="${esc(date)}">${esc(reportDay.format(Date.parse(date)))}</time>`
+  :esc(label||'Date not established');
+ const prefix=card.date_kind==='publication'?'Source published · ':'';
+ return prefix+heading;
+}
+
+function reportTimelineHTML(timeline,sid,claimSources,measurement,reviewedDocs){
+ const empty='<p class="report-availability-note">The saved sources did not establish a key event for this report.</p>';
+ const cards=timeline.map(card=>{
+  const text=card.display_statement||card.statement||card.documents?.[0]?.title;
+  const facts=(card.facts||[]).map(fact=>`<li>${esc(fact.statement)} ${claimSources(fact)}${measurement(fact)}</li>`).join('');
+  const documents=(card.documents||[]).map(doc=>reportEventDocumentHTML(doc,sid,reviewedDocs.has(doc.evidence_id))).join('');
+  return `<li class="report-timeline-item"><article class="report-event-card">
+   <h3 class="report-event-date">${reportEventDateHTML(card)}</h3>
+   ${text?`<p class="report-event-statement">${esc(text)} ${claimSources(card)}</p>`:''}
+   ${measurement(card.measurement||card)}
+   ${facts?`<ul class="report-event-facts">${facts}</ul>`:''}
+   ${documents?`<details class="report-event-documents"><summary>Original sources · ${card.documents.length}</summary>${documents}</details>`:''}
+  </article></li>`;
+ }).join('');
+ return `<section class="report-events"><h2>Key events</h2>${cards?`<ol class="report-timeline" role="list">${cards}</ol>`:empty}</section>`;
+}
+
+function reportMetricsHTML(metrics,claims,claimSources,measurement){
+ if(!metrics.length)return '<section><h2>Key metric changes</h2><p class="report-availability-note">No verified metrics were available for this report.</p></section>';
+ const numeric=metrics.filter(claim=>finite(claim.value));
  const selected=[];
  for(const pattern of [/^(close_usd|price_usd)$/, /return|change/, /volatility/]){
   const claim=numeric.find(item=>pattern.test(item.metric)&&!selected.includes(item));
   if(claim)selected.push(claim);
  }
  for(const claim of numeric)if(selected.length<3&&!selected.includes(claim))selected.push(claim);
- if(!selected.length)return '';
  const labels=[[/return|change/,'Period change'],[/volatility/,'Annualized volatility'],[/close|price/,'Closing price'],
   [/high/,'Period high'],[/low/,'Period low'],[/volume/,'Trading volume'],[/tvl/,'DeFi TVL'],[/stablecoin/,'Stablecoin supply']];
- return '<div class="report-key-metrics">'+selected.map(claim=>{
+ const cards=selected.map(claim=>{
   const label=labels.find(([pattern])=>pattern.test(claim.metric))?.[1]||'Key measure';
   let value=new Intl.NumberFormat('en-US',{maximumFractionDigits:2}).format(Number(claim.value))+' '+claim.unit;
   if(claim.unit==='USD')value=usd(claim.value);
   if(claim.unit==='fraction')value=/return|change/.test(claim.metric)?pct(claim.value):(Number(claim.value)*100).toFixed(2)+'%';
-  return `<div class="report-key-metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><details><summary>Measurement details</summary><p>${esc(claim.statement)}</p>${claim.evidence_ids.map(rid=>sourceButton(rid,'['+numbers[rid]+']',sid,window.AetherDesk?.claimContext(claim,draft,review))).join(' ')}</details></div>`;
- }).join('')+'</div>';
+  return `<div class="report-key-metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><p class="report-chart-meta">${esc(claim.statement)} ${claimSources(claim)}</p>${measurement(claim)}</div>`;
+ }).join('');
+ const remaining=metrics.filter(claim=>!selected.includes(claim));
+ return `<section><h2>Key metric changes</h2>${cards?`<div class="report-key-metrics">${cards}</div>`:''}${claims(remaining)}</section>`;
+}
+
+const reportExplanationSections=[
+ ['Observed basis','observed_basis'],['Applies under these conditions','applicability'],
+ ['Alternative explanations','alternative_explanations'],['Counterevidence','counterevidence'],
+ ['Revisit this explanation when','invalidation'],
+];
+function reportAnalysisHTML(draft,claims,sid){
+ let body=draft.judgment_reason?`<p>${esc(draft.judgment_reason)}</p>`:'';
+ if(draft.interpretations?.length)body+='<h3>Interpretation</h3>'+claims(draft.interpretations);
+ for(const explanation of draft.explanations||[]){
+  body+=`<h3>${esc(explanation.name)}</h3>${claims([explanation.hypothesis])}
+   <p class="card-note">${esc(explanation.horizon)}</p>`;
+  for(const [label,key] of reportExplanationSections)
+   if(explanation[key]?.length)body+=`<h4>${label}</h4>`+claims(explanation[key]);
+  if(explanation.uncertainties?.length)body+='<h4>Uncertainties</h4><ul>'+explanation.uncertainties.map(item=>`<li>${esc(item)}</li>`).join('')+'</ul>';
+ }
+ if(draft.forecasts?.length)body+='<h3>Conditional outlook</h3>'+draft.forecasts.map(forecast=>
+  `<p>${esc(forecast.statement)} ${[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids].map(rid=>sourceButton(rid,'View source ↗',sid)).join(' ')}</p><small>${esc(forecast.uncertainty)}</small>`).join('');
+ if(draft.purchase_decision){
+  const purchase=draft.purchase_decision;
+  body+='<h3>Decision context</h3>';
+  for(const [label,rows] of [['Conditions to investigate',purchase.conditions_to_consider],['Reasons to wait',purchase.reasons_to_wait]])
+   if(rows.length)body+=`<h4>${label}</h4>`+rows.map(row=>`<p>${esc(row.condition)} ${row.evidence_ids.map(rid=>sourceButton(rid,'View source ↗',sid)).join(' ')}</p>`).join('');
+  for(const [label,rows] of [['Invalidation conditions',purchase.invalidation_conditions],['Missing information',purchase.missing_information],['What to monitor',purchase.monitor],['Costs and execution assumptions',purchase.cost_and_execution_notes]])
+   if(rows.length)body+=`<h4>${label}</h4><ul>${rows.map(row=>'<li>'+esc(row)+'</li>').join('')}</ul>`;
+ }
+ body+=adviceHTML(draft.advice,claims,sid);
+ return '<section><h2>Research judgment</h2>'+(body||'<p class="report-availability-note">The saved sources did not support a separate research judgment.</p>')+'</section>';
+}
+
+function reportReaderHTML(packet,id,sid){
+ const draft=packet.report;
+ const presentation=packet.presentation?.version==='report-presentation-v1'?packet.presentation:null;
+ const charts=presentation?.charts||[];
+ const documents=presentation?.documents||[];
+ const observations=draft.observations||[];
+ const events=draft.key_changes||[];
+ const timeline=packet.timeline??presentation?.timeline??[
+  ...events,
+  ...observations.filter(claim=>!claim.metric),
+  ...documents.map(doc=>({evidence_ids:[doc.evidence_id],documents:[doc]})),
+ ];
+ const metricChanges=observations.filter(claim=>claim.metric);
+ const explanations=(draft.explanations||[]).flatMap(explanation=>
+  [explanation.hypothesis,...reportExplanationSections.flatMap(([,key])=>explanation[key]||[])]);
+ const all=[...observations,...events,...(draft.interpretations||[]),...explanations];
+ const extra=(draft.forecasts||[]).flatMap(forecast=>[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids]);
+ const purchase=draft.purchase_decision;
+ const purchaseIDs=purchase?[...purchase.conditions_to_consider.flatMap(condition=>condition.evidence_ids),
+  ...purchase.reasons_to_wait.flatMap(condition=>condition.evidence_ids),...(purchase.simulation_evidence_ids||[])]:[];
+ const timelineIDs=timeline.flatMap(card=>[...(card.evidence_ids||[]),
+  ...(card.facts||[]).flatMap(fact=>fact.evidence_ids),...(card.documents||[]).map(doc=>doc.evidence_id)]);
+ const ids=[...new Set([...all.flatMap(claim=>claim.evidence_ids),...timelineIDs,...extra,...purchaseIDs,
+  ...adviceSourceIDs(draft.advice),...(draft.narrative_evidence_ids||[]),...[...charts,...documents].map(item=>item.evidence_id)])];
+ const numbers=Object.fromEntries(ids.map((value,index)=>[value,index+1]));
+ const claimSources=claim=>{
+  const refs=claim.evidence_ids||[];
+  const original=all.find(item=>item===claim||(item.statement===claim.statement&&
+   item.evidence_ids.length===refs.length&&refs.every((rid,index)=>item.evidence_ids[index]===rid)));
+  const context=claim.statement?window.AetherDesk?.claimContext(original||claim,draft,packet.review):null;
+  return refs.map(rid=>sourceButton(rid,'['+(numbers[rid]||'Source')+']',sid,context)).join(' ');
+ };
+ const measurement=claim=>claim.metric?`<details class="numeric-detail"><summary>Exact measurement</summary><small>${esc(claim.metric)} = ${esc(claim.value)} ${esc(claim.unit)}</small></details>`:'';
+ const claims=list=>(list||[]).map(claim=>`<div class="statement">${esc(claim.statement)} ${claimSources(claim)}${measurement(claim)}</div>`).join('');
+ const scope=presentation?.overview||draft.scope;
+ const day=new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'});
+ const windowLabel=scope?.start&&scope?.end?day.format(new Date(scope.start))+' – '+day.format(new Date(Date.parse(scope.end)-1))+' · UTC':'';
+ const notice=draft.delivery_kind==='evidence_gap';
+ const badge=reportDeliveryBadge(draft.delivery_kind);
+ const reviewLabel=notice?'':reportReviewLabel(packet.run_metadata?.report_review_provider,packet.review?.reviewer_model);
+ let body=reportToolbar(id)+`<header class="report-title">
+   <div class="report-title-meta"><span class="report-kicker">Research report</span>${badge}</div>
+   <h1>${esc(reportDisplayTitle(draft.title))}</h1>
+   <p>${esc(windowLabel||date(packet.created_at))}${windowLabel?' · Published '+esc(date(packet.created_at)):''}${jevOptionLabel(packet.run_metadata?.jev_assistance_requested)?' · '+jevOptionLabel(packet.run_metadata.jev_assistance_requested):''}${reviewLabel?' · '+esc(reviewLabel):''}</p></header>`;
+ if(notice)body+='<p class="card-note">This is an evidence availability notice. No source-reviewed market conclusions were published.</p>';
+ body+=presentation?reportOverviewHTML(presentation,sid):'<section class="report-lead"><h2>Summary</h2>'+reportSummaryHTML(draft.summary)+'</section>';
+ if(!notice){
+  const chartHTML=charts.map((chart,index)=>reportChartHTML(chart,index,sid)).join('');
+  body+=`<section class="report-chart-section"><h2>Key data charts</h2>${chartHTML||'<p class="report-availability-note">No verified series was available for this report.</p>'}</section>`;
+  body+=reportMetricsHTML(metricChanges,claims,claimSources,measurement);
+  const verdicts=new Map((packet.review?.verdicts||[]).map(verdict=>[verdict.claim_id,verdict.status]));
+  const reviewedDocs=new Set(documents.filter((doc,index)=>
+   ['supported','reasonable_inference'].includes(verdicts.get('DOC'+(index+1)))).map(doc=>doc.evidence_id));
+  body+=reportTimelineHTML(timeline,sid,claimSources,measurement,reviewedDocs);
+  body+=reportAnalysisHTML(draft,claims,sid);
+  const watch=(draft.questions_to_watch||[]).slice(0,3);
+  body+='<section class="report-watch"><h2>What to watch next</h2>'+
+   (watch.length?'<ul>'+watch.map(question=>'<li>'+esc(question)+'</li>').join('')+'</ul>':
+    '<p class="report-availability-note">No specific follow-up was identified in the saved sources.</p>')+'</section>';
+ }
+ body+='<section class="report-limits"><h2>Limits to keep in mind</h2><ul>'+(draft.limitations||[]).map(limit=>'<li>'+esc(limit)+'</li>').join('')+'</ul></section>';
+ body+='<section class="report-sources"><h2>Sources, review and downloads</h2><details class="report-disclosure"><summary>Open sources and review</summary><div class="report-evidence-links">'+ids.map(rid=>sourceButton(rid,'['+numbers[rid]+'] '+rid,sid)).join(' ')+'</div>';
+ if(packet.review?.verdicts?.length)body+='<h3>Claim-level review</h3>';
+ for(const verdict of packet.review?.verdicts||[])body+=`<details class="review-item"><summary><span class="pill ${['contradicted','insufficient'].includes(verdict.status)?'warn':'neutral'}">${esc(verdict.status.replaceAll('_',' '))}</span> ${esc(verdict.claim_id)} · ${esc(verdict.reason)}</summary>${(verdict.quotes||[]).map(quote=>`<blockquote>${esc(quote.text)}</blockquote>${sourceButton(quote.record_id,'View source ↗',sid)}`).join('')}</details>`;
+ body+=`<div class="report-actions"><a class="button" href="/api/sessions/${sid}/artifact?path=${encodeURIComponent('/reports/'+id+'.md')}&amp;view=reader" target="_blank" rel="noopener">Markdown ↗</a></div>`;
+ if(!notice)body+='<p class="card-note">Source checks assess support in the saved material. They do not guarantee publisher accuracy or future performance.</p>';
+ return body+'</details></section>';
 }
 
 async function showReport(id){
@@ -339,48 +494,10 @@ async function showReport(id){
  if(!meta){toast('This report is unavailable.');return}
  const box=beginReport(id);
  let packet;
- try{packet=await api(`/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.json')}`)}
+ try{packet=await api(`/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.json')}&view=reader`)}
  catch(error){if(box.dataset.reportId===id)box.innerHTML=reportToolbar(id)+'<p class="empty">'+esc(error.message)+'</p>';return}
  if(box.dataset.reportId!==id)return;
- const draft=packet.report,presentation=packet.presentation?.version==='report-presentation-v1'?packet.presentation:null;
- const charts=presentation?.charts||[],documents=presentation?.documents||[];
- const all=[...(draft.observations||[]),...(draft.key_changes||[]),...(draft.interpretations||[])];
- const extra=(draft.forecasts||[]).flatMap(forecast=>[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids]);
- const purchase=draft.purchase_decision?[...draft.purchase_decision.conditions_to_consider,...draft.purchase_decision.reasons_to_wait].flatMap(condition=>condition.evidence_ids):[];
- const ids=[...new Set([...all.flatMap(claim=>claim.evidence_ids),...extra,...purchase,...adviceSourceIDs(draft.advice),...[...charts,...documents].map(item=>item.evidence_id)])];
- const numbers=Object.fromEntries(ids.map((value,index)=>[value,index+1]));
- const claims=list=>(list||[]).map(claim=>`<div class="statement">${esc(claim.statement)} ${claim.evidence_ids.map(rid=>sourceButton(rid,'['+(numbers[rid]||'Source')+']',meta.session_id,window.AetherDesk?.claimContext(claim,draft,packet.review))).join(' ')}${claim.metric?`<details class="numeric-detail"><summary>Exact measurement</summary><small>${esc(claim.metric)} = ${esc(claim.value)} ${esc(claim.unit)}</small></details>`:''}</div>`).join('');
- const scope=presentation?.overview||draft.scope;
- const day=new Intl.DateTimeFormat('en-GB',{day:'numeric',month:'short',year:'numeric',timeZone:'UTC'});
- const windowLabel=scope?.start&&scope?.end?day.format(new Date(scope.start))+' – '+day.format(new Date(Date.parse(scope.end)-1))+' · UTC':'';
- const badge=reportDeliveryBadge(draft.delivery_kind,packet.review?.status);
- const reviewLabel=draft.delivery_kind==='evidence_gap'?'':reportReviewLabel(packet.run_metadata?.report_review_provider,packet.review?.reviewer_model);
- let body=reportToolbar(id)+`<header class="report-title"><div class="report-title-meta"><span class="report-kicker">Ethereum research</span><span class="pill ${badge.tone}">${badge.label}</span></div><h1>${esc(draft.title)}</h1><p>${esc(windowLabel||date(packet.created_at))}${windowLabel?' · Published '+esc(date(packet.created_at)):''}${jevOptionLabel(packet.run_metadata?.jev_assistance_requested)?' · '+jevOptionLabel(packet.run_metadata.jev_assistance_requested):''}${reviewLabel?' · '+esc(reviewLabel):''}</p></header>`;
- if(draft.delivery_kind==='minimal')body+='<p class="card-note">This limited report keeps the findings that passed final source review. Unresolved claims and dependent conclusions were removed; the remaining gaps are disclosed below.</p>';
- if(draft.delivery_kind==='evidence_gap')body+='<p class="card-note">This is an evidence availability notice. No source-reviewed market conclusions were published.</p>';
- body+=presentation?reportOverviewHTML(presentation,meta.session_id):'<section class="report-lead"><h2>Summary</h2>'+reportSummaryHTML(draft.summary)+'</section>';
- body+=reportMetricCards(draft,numbers,meta.session_id,packet.review);
- if(charts.length)body+=`<section class="report-chart-section" aria-label="Key data charts"><h2>Key data</h2>${charts.map((chart,index)=>reportChartHTML(chart,index,meta.session_id)).join('')}</section>`;
- const highlights=(draft.key_changes?.length?draft.key_changes:draft.observations||[]).slice(0,3);
- if(highlights.length)body+='<section class="report-takeaways"><h2>What matters</h2>'+claims(highlights)+'</section>';
- body+=reportDocumentsHTML(documents,meta.session_id,packet.review);
- if(draft.questions_to_watch?.length)body+='<section class="report-watch"><h2>What to watch next</h2><ul>'+draft.questions_to_watch.map(question=>'<li>'+esc(question)+'</li>').join('')+'</ul></section>';
- body+='<section class="report-limits"><h2>Limits to keep in mind</h2><ul>'+draft.limitations.map(limit=>'<li>'+esc(limit)+'</li>').join('')+'</ul></section>';
- body+='<details class="report-disclosure"><summary>Full analysis and supporting facts</summary><h2>Facts</h2>'+claims(draft.observations);
- if(draft.key_changes?.length)body+='<h2>Changes</h2>'+claims(draft.key_changes);
- if(draft.interpretations?.length)body+='<h2>Interpretation</h2>'+claims(draft.interpretations);
- if(draft.judgment_reason)body+='<h2>Research judgment</h2><p>'+esc(draft.judgment_reason)+'</p>';
- if(draft.forecasts?.length)body+='<h2>Conditional outlook</h2>'+draft.forecasts.map(forecast=>`<p>${esc(forecast.statement)} ${[...forecast.supporting_evidence_ids,...forecast.counter_evidence_ids].map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p><small>${esc(forecast.uncertainty)}</small>`).join('');
- if(draft.purchase_decision){
-  const purchase=draft.purchase_decision;body+='<h2>Decision context</h2>';
-  for(const [label,rows] of [['Conditions to investigate',purchase.conditions_to_consider],['Reasons to wait',purchase.reasons_to_wait]])body+=`<h3>${label}</h3>`+rows.map(row=>`<p>${esc(row.condition)} ${row.evidence_ids.map(rid=>sourceButton(rid,'View source ↗',meta.session_id)).join(' ')}</p>`).join('');
-  for(const [label,rows] of [['Invalidation conditions',purchase.invalidation_conditions],['Missing information',purchase.missing_information],['What to monitor',purchase.monitor],['Costs and execution assumptions',purchase.cost_and_execution_notes]])body+=`<h3>${label}</h3><ul>${rows.map(row=>'<li>'+esc(row)+'</li>').join('')}</ul>`;
- }
- body+=adviceHTML(draft.advice,claims,meta.session_id)+'</details>';
- body+='<details class="report-disclosure"><summary>Sources, review and downloads</summary><div class="report-evidence-links">'+ids.map(rid=>sourceButton(rid,'['+numbers[rid]+'] '+rid,meta.session_id)).join(' ')+'</div><h3>Claim-level review</h3>';
- for(const verdict of packet.review?.verdicts||[])body+=`<details class="review-item"><summary><span class="pill ${['contradicted','insufficient'].includes(verdict.status)?'warn':'neutral'}">${esc(verdict.status.replaceAll('_',' '))}</span> ${esc(verdict.claim_id)} · ${esc(verdict.reason)}</summary>${verdict.quotes.map(quote=>`<blockquote>${esc(quote.text)}</blockquote>${sourceButton(quote.record_id,'View source ↗',meta.session_id)}`).join('')}</details>`;
- body+=`<div class="report-actions"><a class="button" href="/api/sessions/${meta.session_id}/artifact?path=${encodeURIComponent('/reports/'+id+'.md')}" target="_blank">Original Markdown ↗</a></div><p class="card-note">Source checks assess support in the saved material. They do not guarantee publisher accuracy or future performance.</p></details>`;
- box.innerHTML=body;
+ box.innerHTML=reportReaderHTML(packet,id,meta.session_id);
  api('/api/sessions/'+meta.session_id+'/packages').then(packages=>{
   if(box.dataset.reportId!==id)return;
   const pack=packages.find(item=>item.package_id.startsWith(id+'-'));
@@ -455,10 +572,8 @@ function selectView(requested){
  document.dispatchEvent(new CustomEvent('aether:view',{detail:{view}}));
 }
 const marketReviewTitle='ETH market refresh';
-let marketReviewSession=null, startingMarketReview=false;
 async function sessions(){
  const rows=await api('/api/sessions');
- marketReviewSession=rows.find(s=>s.title===marketReviewTitle)?.session_id||null;
  state.sessions=rows.filter(s=>s.title!==marketReviewTitle);
  if(!state.sessions.some(s=>s.session_id===state.sid)){
   const saved=workspaceStorageGet('aether-session');
@@ -480,21 +595,29 @@ async function ask(prompt,deliverable='answer'){
 }
 function chatReportLinks(job){
  const kind=job.report_delivery_kind;
- const title=kind==='evidence_gap'?'Evidence gap saved':kind==='minimal'?'Your limited report is ready':'Your report is ready';
+ const title=kind==='evidence_gap'?'Evidence gap saved':'Your report is ready';
  const reviewer=reportReviewLabel(job.report_review_provider,job.report_review_model);
  return (job.published_reports||[]).flatMap(path=>{
   const match=/^\/reports\/(research-[a-f0-9]{12})\.md$/.exec(path);
   return match?[`<button class="chat-report-card" data-report="${match[1]}"><span class="chat-report-icon" aria-hidden="true">▤</span><span><strong>${title}</strong><small>Open the saved ${kind==='evidence_gap'?'notice':'report'}${jevOptionLabel(job.jev_assistance_requested)?' · '+jevOptionLabel(job.jev_assistance_requested):''}${reviewer&&kind!=='evidence_gap'?' · '+esc(reviewer):''}</small></span><span aria-hidden="true">↗</span></button>`]:[];
  }).join('');
 }
+function chatReportAnswer(job){
+ const text=job.answer||'';
+ if(!job.published_reports?.length||job.report_delivery_kind==='evidence_gap')return text;
+ const summary=text.replace(/^(?:Report|Limited report) published: \[[^\r\n]+\]\(\/api\/sessions\/[^\r\n]+\)(?:\r?\n){0,2}/,'');
+ const oldSummary='This reduced report contains only the observations listed below. Unresolved conclusions from the full draft have been omitted.';
+ return summary.trim()===oldSummary?'':summary;
+}
 function chatTurn(job){
  const continued=job.continued_from_job_id||job.prompt==='Continue the last unfinished research from saved sources and work. Reuse verified evidence and complete the requested answer or report.';
  const prompt=continued?'<div class="chat-resume-note">Continuing the previous request</div>':`<div class="chat-user"><div class="chat-message user">${esc(job.prompt)}</div></div>`;
  const reportLinks=chatReportLinks(job);
+ const answer=chatReportAnswer(job);
  let reply='';
- if(job.answer||reportLinks){
+ if(answer||reportLinks){
   const time=job.finished_at?new Intl.DateTimeFormat('en',{hour:'2-digit',minute:'2-digit',timeZone:'Asia/Shanghai'}).format(new Date(job.finished_at)):'';
-  reply=`<article class="chat-assistant"><div class="chat-assistant-heading"><span class="chat-avatar" aria-hidden="true">✦</span><span>Aether</span><time>${esc(time)}</time></div><div class="chat-message">${job.answer?markdown(job.answer,job.verified_answer):'<p>Your report has been saved.</p>'}</div>${job.verified_answer?'<div class="chat-response-meta">Sources checked</div>':''}${reportLinks}</article>`;
+  reply=`<article class="chat-assistant"><div class="chat-assistant-heading"><span class="chat-avatar" aria-hidden="true">✦</span><span>Aether</span><time>${esc(time)}</time></div>${answer?`<div class="chat-message">${markdown(answer,job.verified_answer)}</div>`:''}${job.verified_answer?'<div class="chat-response-meta">Sources checked</div>':''}${reportLinks}</article>`;
  }else if(['failed','cancelled','interrupted'].includes(job.state)){
   reply='<div class="chat-turn-note">'+({failed:'This request could not finish.',cancelled:'You stopped this request.',interrupted:'This request was interrupted.'})[job.state]+'</div>';
  }
@@ -522,7 +645,7 @@ function renderResearchProgress(job,progress=null,active=false,stopping=false){
  if(!job)return;
  const stage=progress?.job_id===job.job_id?progress.stage:null;
  const phase=researchStages[stage]||researchStages.working;
- const outcomes={completed:job.published_reports?.length?(job.report_delivery_kind==='evidence_gap'?'Evidence gap saved':job.report_delivery_kind==='minimal'?'Limited report ready':'Report ready'):'Answer ready',
+ const outcomes={completed:job.published_reports?.length?(job.report_delivery_kind==='evidence_gap'?'Evidence gap saved':'Report ready'):'Answer ready',
   failed:'Research could not finish',cancelled:'Research stopped',interrupted:'Research interrupted',
   waiting_for_conversation:'Waiting for a response'};
  const reviewer=reportReviewLabel(progress?.reviewer_provider||job.report_review_provider,progress?.reviewer_model||job.report_review_model);
@@ -539,6 +662,17 @@ function renderResearchProgress(job,progress=null,active=false,stopping=false){
  $('job-progress-label').textContent=label;
  link.setAttribute('aria-label',label+' — open chat');
 }
+function chatRecovery(job){
+ if(!job)return null;
+ if(job.state==='completed'&&job.report_retry_available===true&&job.report_delivery_kind==='evidence_gap')
+  return {label:'Retry report ↗',message:'An evidence gap was saved. Retry using the draft and sources already collected.'};
+ if(job.published_reports?.length)return null;
+ if(job.state==='completed'&&job.report_retry_available===true)
+  return {label:'Finish report ↗',message:'This request was answered in chat. You can finish and save the report.'};
+ if(['failed','cancelled','interrupted'].includes(job.state))
+  return {label:'Continue ↗',message:'Your progress is saved.'};
+ return null;
+}
 async function refreshSession(){
  if(!state.sid)return;
  const requestedSID=state.sid,snap=await api('/api/sessions/'+requestedSID);
@@ -551,18 +685,23 @@ async function refreshSession(){
  $('send-question').disabled=!state.modelConfigured;
  $('create-chat-report').disabled=state.busy||!state.modelConfigured;
  configureJevControl();
- const canContinue=job&&['failed','cancelled','interrupted'].includes(job.state);
- $('job-error').hidden=!canContinue||Boolean(latest?.chat_reply);
- $('job-error').textContent=canContinue?'Your progress is saved.':'';
- $('continue-job').hidden=!canContinue||state.busy;
- const key=requestedSID+':'+jobs.map(x=>x.job_id+':'+x.state+':'+(x.finished_at||'')).join('|');
+ const recovery=chatRecovery(job);
+ $('job-error').hidden=!recovery||state.busy||Boolean(latest?.chat_reply);
+ $('job-error').textContent=recovery?.message||'';
+ $('continue-job').hidden=!recovery||state.busy;
+ $('continue-job').textContent=recovery?.label||'Continue ↗';
+ const publications=jobs.flatMap(x=>x.published_reports||[]);
+ const publicationKey=requestedSID+':'+publications.join('|');
+ const newPublication=publications.length>0&&state.publicationKey!==publicationKey;
+ state.publicationKey=publicationKey;
+ const key=requestedSID+':'+jobs.map(x=>x.job_id+':'+x.state+':'+(x.finished_at||'')).join('|')+':'+publicationKey;
  if(key!==state.jobKey){
   const chat=$('chat'),follow=state.jobKey.split(':')[0]!==requestedSID||chat.scrollHeight-chat.clientHeight-chat.scrollTop<100;
   const scroll=chat.scrollTop;
   state.jobKey=key;
   chat.innerHTML=jobs.length?jobs.map(chatTurn).join(''):welcomeHTML;
   chat.scrollTop=follow?chat.scrollHeight:scroll;
-  if(latest?.state==='completed'&&!latest.chat_reply){loadReports().catch(()=>{});loadLatestNews().catch(()=>{})}
+  if(newPublication||(latest?.state==='completed'&&!latest.chat_reply)){loadReports().catch(()=>{});loadLatestNews().catch(()=>{})}
  }
  state.lastJob=job;
 }
@@ -585,60 +724,49 @@ document.addEventListener('click',async event=>{
   }
  }catch(error){control.disabled=false;toast(error.message)}
 });
-function showMarketReviewStatus(text, busy=false){
+let startingFresh=false;
+function freshStatus(fresh, refreshing, now=Date.now()){
+ if(fresh?.status==='running'||refreshing){
+  const started=Date.parse(fresh?.started_at);
+  if(Number.isFinite(started)&&now-started>65000)
+   return {text:'Sources are still being checked in the background. Saved data is available.',busy:false};
+  let text='Updating market data and checking publisher feeds…';
+  if(fresh?.market_done&&!fresh.news_done)text='Market data checked. Checking publisher feeds…';
+  if(fresh?.news_done&&!fresh.market_done)text='Publisher feeds checked. Updating market data…';
+  return {text,busy:true};
+ }
+ if(!['completed','partial','failed'].includes(fresh?.status))return null;
+ if(fresh.status==='failed')return {text:'The refresh failed. Earlier saved data is still available.',busy:false};
+ const details=[];
+ if(fresh.market_total)details.push(fresh.market_updated+' of '+fresh.market_total+' market sources');
+ if(fresh.feeds_total)details.push(fresh.feeds_updated+' of '+fresh.feeds_total+' publisher feeds');
+ const result=fresh.status==='partial'?'Some sources refreshed':'Refresh complete';
+ return {text:result+(details.length?' · '+details.join(' · '):'')+'.',busy:false};
+}
+function showFreshStatus(text, busy=false){
  const status=$('market-review-status'), button=$('refresh-data');
  status.textContent=text;
- status.hidden=!text;
- button.disabled=busy||!state.modelConfigured;
- button.textContent=busy?'↻ Reviewing…':'↻ Refresh';
+ status.hidden=!text||!['today','news'].includes(state.view);
+ button.disabled=busy;
+ button.textContent=busy?'↻ Updating…':'↻ Refresh';
 }
-async function checkMarketReview(){
- if(!marketReviewSession||startingMarketReview)return;
- const snapshot=await api('/api/sessions/'+marketReviewSession);
- const pending=workspaceStorageGet('aether-market-review')===marketReviewSession;
- if(snapshot.active_job_id){
-  workspaceStorageSet('aether-market-review',marketReviewSession);
-  showMarketReviewStatus('Reviewing ETH data and looking for new sources…',true);
-  return;
- }
- if(!pending)return;
- workspaceStorageRemove('aether-market-review');
- const job=snapshot.jobs.at(-1);
- if(job?.state==='completed'){
-  showMarketReviewStatus('Market review complete. Open Latest News or Library to see saved sources.');
-  await Promise.allSettled([loadData(),loadLatestNews(),...(state.view==='library'?[loadLibrary()]:[])]);
- }else{
-  showMarketReviewStatus('The market review did not finish. Any saved sources are still available.');
- }
-}
-async function requestMarketReview(){
- if(!state.modelConfigured||startingMarketReview)return;
- startingMarketReview=true;
- showMarketReviewStatus('Starting an ETH market review…',true);
+async function requestFresh(){
+ if(startingFresh)return;
+ startingFresh=true;
+ showFreshStatus('Starting a data refresh…',true);
  try{
-  if(!marketReviewSession){
-   const session=await api('/api/sessions','POST',{title:marketReviewTitle,research_mode:'current'});
-   marketReviewSession=session.session_id;
-  }
-  const path='/api/sessions/'+marketReviewSession;
-  const snapshot=await api(path);
-  if(!snapshot.active_job_id){
-   await api(path+'/messages','POST',{
-    deliverable:'answer',
-    purpose:'market_refresh',
-    prompt:'Refresh the Ethereum research library. Check the latest available ETH market data and source timestamps. Search for material Ethereum news and official announcements from the past seven days, compare with saved sources, and open the original public pages for relevant new material so the existing evidence tools save them in the searchable library. Skip duplicate material, distinguish confirmed events from plans, and cite saved evidence in a short status update. Report missing or inaccessible sources accurately. Focus on ETH. Do not publish a report or use personal portfolio details.',
-   });
-   api('/api/dashboard/refresh','POST',{}).catch(()=>{});
-  }
-  workspaceStorageSet('aether-market-review',marketReviewSession);
-  showMarketReviewStatus('Reviewing ETH data and looking for new sources…',true);
+  const response=await api('/api/dashboard/refresh','POST',{},AbortSignal.timeout?.(8000));
+  if(response.fresh?.status==='running')state.dashboard.fresh=response.fresh;
+  const status=freshStatus(response.fresh,!response.fresh);
+  if(status)showFreshStatus(status.text,status.busy);
  }catch{
-  showMarketReviewStatus('The review could not start. Please try again.');
+  showFreshStatus('Could not confirm the refresh. Try again if it does not start.');
  }finally{
-  startingMarketReview=false;
+  startingFresh=false;
  }
+ await loadData().catch(()=>{});
 }
-$('refresh-data').onclick=()=>requestMarketReview();
+$('refresh-data').onclick=requestFresh;
 $('open-research').onclick=showAnalyst;
 $('mobile-analyst').onclick=showAnalyst;
 $('close-analyst').onclick=()=>selectView('today');
@@ -685,7 +813,7 @@ $('stop-job').onclick=async()=>{
 };
 $('continue-job').onclick=async()=>{
  const sid=state.sid,job=state.lastJob;
- if(!sid||!job||state.busy)return;
+ if(!sid||!chatRecovery(job)||state.busy)return;
  $('continue-job').disabled=true;
  try{
   await api('/api/sessions/'+sid+'/jobs/'+job.job_id+'/continue','POST',{});
@@ -722,10 +850,10 @@ new ResizeObserver(()=>{if(state.view==='today')renderPriceChart()}).observe($('
   if(polling||document.hidden)return;
   polling=true;
   try{
-   await Promise.allSettled([refreshSession(),checkMarketReview(),...(state.view==='today'?[loadData()]:[])]);
+   const watchFresh=state.dashboard.refreshing||state.dashboard.fresh?.status==='running';
+   await Promise.allSettled([refreshSession(),...(state.view==='today'||watchFresh?[loadData()]:[])]);
   }finally{polling=false}
  },4000);
- setInterval(()=>{if(!document.hidden&&state.view==='today')loadData(true).catch(()=>{})},60000);
 }
 document.addEventListener('DOMContentLoaded',async()=>{
  try{
@@ -734,7 +862,6 @@ document.addEventListener('DOMContentLoaded',async()=>{
   state.modelConfigured=config.configured;
   $('send-question').disabled=!config.configured;
   $('create-chat-report').disabled=!config.configured;
-  $('refresh-data').disabled=!config.configured;
   $('new-report').disabled=!config.configured;
   configureJevControl();
   if(!config.configured)$('question').placeholder='The assistant is unavailable. Check Settings.';
@@ -742,8 +869,7 @@ document.addEventListener('DOMContentLoaded',async()=>{
   $('engine-status').textContent=config.configured?'Connected':'Unavailable';
   $('engine-details').innerHTML=metricRow('Assistant',config.configured?'Doubao':'Unavailable','Used for questions and reports')
    +metricRow('Web research',config.search_enabled?'Available':'Unavailable','Finds current public information');
-  await Promise.allSettled([loadData(),sessions().then(()=>Promise.allSettled([refreshSession(),checkMarketReview()]))]);
-  if(state.view==='today'&&(!state.dashboard.updated_at||Date.now()-Date.parse(state.dashboard.updated_at)>60000))await loadData(true);
+  await Promise.allSettled([loadData(),sessions().then(refreshSession)]);
  }catch{
   $('service-state').textContent='Connection needs attention';
   $('connection-banner').hidden=false;

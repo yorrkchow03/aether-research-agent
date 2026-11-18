@@ -14,6 +14,7 @@ from .host_review_facts import is_verified_host_target
 from .review import EvidenceReviewer, check_review, evidence_text, prepare_review_targets, review_targets
 
 REVIEW_VERSION = 'support-hybrid-minimal-v1'
+CHART_REVIEW_VERSION = 'support-hybrid-minimal-v2'
 
 
 def _digest(value):
@@ -23,6 +24,23 @@ def _digest(value):
 
 def _targets(draft):
     return prepare_review_targets(review_targets(draft,review_version=TARGET_VERSION),review_version=TARGET_VERSION)
+
+
+def _clock_evidence(text):
+    """The host needs source clocks even if no model-reviewed claim cites the chart."""
+    row = json.loads(text)
+    fields = {key: row[key] for key in ('record_id', 'retrieved_at', 'calculated_at', 'created_at') if key in row}
+    if isinstance(row.get('source'), dict) and 'retrieved_at' in row['source']:
+        fields['source'] = {'retrieved_at': row['source']['retrieved_at']}
+    return json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def _review_identity(version, body, targets, inner, process_context, research_cutoff, host_evidence):
+    payload = {'version': version, 'draft': body, 'targets': targets, 'model_review': inner,
+               'process_context': process_context, 'research_cutoff': research_cutoff}
+    if version == CHART_REVIEW_VERSION:
+        payload['host_only_evidence_text'] = host_evidence
+    return _digest(payload)
 
 
 def _combine(targets, model_review, host_ids):
@@ -79,12 +97,13 @@ class MinimalEvidenceReviewer:
         # all remaining summary sentences, factual claims and custom limits.
         model_review=self.inner.review_claims(normal,lookup,identity_payload=body,
             include_user_context=False,scope_critic=False,process_context=process_context)
-        identity=_digest({'version':REVIEW_VERSION,'draft':body,'targets':targets,
-                          'model_review':model_review,'process_context':process_context,
-                          'research_cutoff':self.research_cutoff})
+        host_evidence = {rid: _clock_evidence(context_texts[rid])
+                         for rid in sorted(source_ids - model_review['evidence_text'].keys())}
+        version = CHART_REVIEW_VERSION if host_evidence else REVIEW_VERSION
+        identity = _review_identity(version,body,targets,model_review,process_context,self.research_cutoff,host_evidence)
         if identity in self.cache:return self.cache[identity]
         result=_combine(targets,model_review,host_ids)
-        result.update(review_id='review-'+identity[:24],review_version=REVIEW_VERSION,
+        result.update(review_id='review-'+identity[:24],review_version=version,
             reviewed_at=utcnow(),reviewer_model=model_review['reviewer_model'],
             reviewer_provider='generation_model',requested_model=self.settings.model_id,
             draft_sha256=_digest(body),targets=targets,evidence_text=model_review['evidence_text'],
@@ -97,22 +116,43 @@ class MinimalEvidenceReviewer:
             request_budget={'max_requests':self.max_requests,'requests_used':self.calls,
                             'max_rounds':self.max_rounds,'rounds_used':self.rounds,'sdk_max_retries':0,
                             'scope':'One factual audit plus at most one format repair, without a scope critic or provider fallback.'})
+        if host_evidence:
+            result['host_only_evidence_text'] = host_evidence
         verify_saved_minimal_review(result,draft)
         self.cache[identity]=result
         return result
 
 
-def verify_saved_minimal_review(review,draft):
+def verify_saved_minimal_review(review,draft,lookup=None):
     from .reports import ReportDraft
     draft=draft if isinstance(draft,ReportDraft) else ReportDraft.model_validate(draft)
-    if review.get('review_version')!=REVIEW_VERSION or draft.delivery_kind!='minimal':
+    version = review.get('review_version')
+    if version not in (REVIEW_VERSION, CHART_REVIEW_VERSION) or draft.delivery_kind!='minimal':
         raise ValueError('Unsupported minimal-report review protocol')
     body=draft.model_dump();targets=_targets(draft)
     if review.get('draft_sha256')!=_digest(body) or review.get('targets')!=targets:
         raise ValueError('Saved minimal audit differs from the complete exact draft')
     if review.get('report_scope')!=body.get('scope'):
         raise ValueError('Saved minimal report scope differs from the draft')
-    host_ids=[t['claim_id'] for t in targets if is_verified_host_target(t,body,review.get('evidence_text',{}),review.get('process_context'))]
+    reviewed_texts = review.get('evidence_text')
+    host_evidence = review.get('host_only_evidence_text', {})
+    if not isinstance(reviewed_texts, dict) or not isinstance(host_evidence, dict):
+        raise ValueError('Saved minimal evidence is invalid')
+    if version == CHART_REVIEW_VERSION:
+        expected = {rid for target in targets for rid in target['evidence_ids']} - reviewed_texts.keys()
+        if (not expected or host_evidence.keys() != expected or
+            any(not isinstance(value, str) or _clock_evidence(value) != value
+                or json.loads(value).get('record_id') != rid for rid, value in host_evidence.items())):
+            raise ValueError('Saved minimal host-only clock records differ from exact target bindings')
+        if lookup is not None and any(
+            _clock_evidence(evidence_text(lookup(rid),targets=[t for t in targets if rid in t['evidence_ids']])) != value
+            for rid, value in host_evidence.items()
+        ):
+            raise ValueError('Saved minimal host-only clocks differ from the archived records')
+    elif 'host_only_evidence_text' in review:
+        raise ValueError('Unexpected host-only evidence in a legacy minimal receipt')
+    proof_texts = {**reviewed_texts, **host_evidence}
+    host_ids=[t['claim_id'] for t in targets if is_verified_host_target(t,body,proof_texts,review.get('process_context'))]
     if review.get('host_literal_target_ids')!=host_ids:
         raise ValueError('Saved minimal host-literal set differs from exact process text')
     normal=[t for t in targets if t['claim_id'] not in host_ids]
@@ -145,8 +185,7 @@ def verify_saved_minimal_review(review,draft):
         raise ValueError('Saved minimal audit physical-request budget is invalid')
     for key,default in (('usage',{}),('request_usages',[]),('format_repairs',0)):
         if review.get(key)!=inner.get(key,default):raise ValueError('Saved minimal usage or format accounting differs from inner audit')
-    identity=_digest({'version':REVIEW_VERSION,'draft':body,'targets':targets,
-                      'model_review':inner,'process_context':review.get('process_context'),
-                      'research_cutoff':review.get('research_cutoff')})
+    identity = _review_identity(version, body, targets, inner, review.get('process_context'),
+                                review.get('research_cutoff'), host_evidence)
     if review.get('review_id')!='review-'+identity[:24]:raise ValueError('Saved minimal input identity mismatch')
     return result

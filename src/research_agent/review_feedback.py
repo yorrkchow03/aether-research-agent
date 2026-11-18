@@ -48,9 +48,13 @@ def review_failure_feedback(review,draft,*,answer=False,source_navigation=None):
             item['edit_rule']='Replace this whole string; it has no nested evidence_ids field. Correct/remove the original unsupported premise; do not replace it with a new unbound external fact.'
             if not answer:item['source_binding_path']='/narrative_evidence_ids'
             removable=(path and (path.startswith('/questions_to_watch/') or path.startswith('/limitations/') and len(body.get('limitations',[]))>1))
+            if path and path.startswith('/limitations/'):
+                item['edit_rule']='Replace this limitation with a corrected statement. Narrow the specific unsupported premise while preserving independent evidence-coverage, timing, sampling and risk qualifications that still apply.'
             if removable:
                 item['remove_item_example']={'op':'remove','path':path}
-                item['remove_rule']='Optional item: you may remove it instead of substituting another factual premise. Keep at least one honest limitation; remove multiple list items in descending index order.'
+                item['remove_rule']=('Remove only if every applicable qualification is already preserved elsewhere. Keep at least one honest limitation.'
+                    if path.startswith('/limitations/') else
+                    'You may remove this optional follow-up instead of substituting another factual premise. Remove multiple indices in descending order.')
         elif kind=='claim':
             item['editable_fields']=[path+'/statement',path+'/evidence_ids']
             item['source_binding_path']=path+'/evidence_ids'

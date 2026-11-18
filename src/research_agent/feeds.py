@@ -1,5 +1,6 @@
 """Low-cost publisher feed checks; feed excerpts never masquerade as fetched articles."""
 import hashlib
+import re
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -10,9 +11,21 @@ from research_data.normalize import iso,timestamp
 
 ETH_FEED='https://blog.ethereum.org/feed.xml'
 
+PUBLISHERS = (
+    ('Ethereum Foundation', ETH_FEED, 'ETH', None),
+    ('Aave Governance', 'https://governance.aave.com/latest.rss', 'ETH', None),
+    ('Lido Research', 'https://research.lido.fi/latest.rss', 'ETH', None),
+    ('Ethereum Magicians', 'https://ethereum-magicians.org/latest.rss', 'ETH', None),
+    ('Federal Reserve', 'https://www.federalreserve.gov/feeds/press_all.xml', None,
+     re.compile(r'FOMC|Federal Open Market Committee|federal funds|monetary policy|stablecoin|digital asset', re.I)),
+    ('SEC', 'https://www.sec.gov/news/pressreleases.rss', None,
+     re.compile(r'Ethereum|Ether\b|stablecoin|digital asset|crypto|tokeniz', re.I)),
+)
 
-def scan_feed(store,url=ETH_FEED,*,publisher='Ethereum Foundation',asset=None,since=None,match=None):
-    fetched=fetch_page(url);root=ET.fromstring(fetched['raw']);now=utcnow()
+
+def scan_feed(store,url=ETH_FEED,*,publisher='Ethereum Foundation',asset=None,since=None,match=None,timeout=None):
+    fetched=fetch_page(url) if timeout is None else fetch_page(url, timeout=timeout)
+    root=ET.fromstring(fetched['raw']);now=utcnow()
     if root.tag.split('}')[-1] not in ('rss','feed','RDF'):
         raise ValueError('Publisher did not return an RSS or Atom document')
     digest=hashlib.sha256(fetched['raw']).hexdigest()

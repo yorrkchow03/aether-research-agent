@@ -17,6 +17,14 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer
 
+from .report_presentation import (
+    report_display_limits,
+    report_display_summary,
+    report_display_title,
+    report_timeline,
+    report_watch_items,
+)
+
 
 INK = colors.HexColor('#26334a')
 MUTED = colors.HexColor('#737b8b')
@@ -134,6 +142,13 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
         'h3': ParagraphStyle('h3', fontName='Helvetica-Bold', fontSize=11, leading=16, textColor=INK, spaceBefore=9, spaceAfter=7, keepWithNext=True),
         'small': ParagraphStyle('small', fontName='Helvetica', fontSize=8.5, leading=12, textColor=MUTED, spaceAfter=7),
     }
+    styles['event_date'] = ParagraphStyle('event_date', parent=styles['h3'], fontSize=9, leading=14,
+        textColor=ACCENT, backColor=colors.HexColor('#f2effa'), borderPadding=(3, 8, 3, 8),
+        spaceBefore=10, spaceAfter=10)
+    styles['event_body'] = ParagraphStyle('event_body', parent=styles['body'], leftIndent=10)
+    styles['event_detail'] = ParagraphStyle('event_detail', parent=styles['small'], leftIndent=10)
+    styles['event_source'] = ParagraphStyle('event_source', parent=styles['event_detail'],
+        fontName='Helvetica-Bold', textColor=INK, spaceBefore=3, keepWithNext=True)
     story = []
 
     def paragraph(text, style='body', suffix=''):
@@ -153,16 +168,23 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
             links.append(f'<link href="#evidence-{number}" color="#6b59b4">[{number}]</link>')
         return ' '+ ' '.join(links) if links else ''
 
-    def claims(rows):
+    def measurement(claim, style):
+        if claim and claim.get('metric'):
+            paragraph(f"{claim['metric']} = {claim.get('value', '')} {claim.get('unit', '')}", style)
+
+    def claims(rows, style='body', detail_style='small'):
         for claim in rows or []:
-            paragraph(claim.get('statement', claim.get('text', claim.get('condition', ''))), suffix=refs(claim.get('evidence_ids')))
+            paragraph(claim.get('statement', claim.get('text', claim.get('condition', ''))),
+                      style, suffix=refs(claim.get('evidence_ids')))
+            measurement(claim, detail_style)
 
     def bullets(rows):
         for row in rows or []:
             paragraph('- '+str(row))
 
-    paragraph('AETHER  /  RESEARCH REPORT', 'small')
-    heading(draft.get('title', 'Research report'), 'title')
+    title = report_display_title(draft)
+    paragraph('AETHER  /  REPORT', 'small')
+    heading(title, 'title')
     paragraph('Published '+_clock(packet.get('created_at'))+'  |  '+report_id, 'small')
     if overview.get('start') and overview.get('end'):
         paragraph('Research window  '+_clock(overview['start'])+' to '+_clock(overview['end'])+' (end exclusive)', 'small')
@@ -173,11 +195,13 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
     if notices:
         paragraph(f'{len(notices)} reader notice(s) are attached at the end of this report. Review them alongside the original text.', 'small')
     heading('Summary')
-    paragraph(draft.get('summary', ''))
+    paragraph(report_display_summary(draft) if not shared else draft.get('summary', ''))
 
     charts = presentation.get('charts') or []
-    if charts:
-        heading('Key data')
+    documents = presentation.get('documents') or []
+    heading('Key data charts')
+    if not charts:
+        paragraph('No saved charts for this report.', 'small')
     width = A4[0]-88
     for chart in charts:
         heading(f"{chart.get('asset', '')} {chart.get('title', '')}", 'h3')
@@ -192,31 +216,57 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
         if coverage.get('internal_gap_count') or coverage.get('starts_after_window') or coverage.get('ends_before_window'):
             paragraph('Coverage is incomplete within the research window. Lines are interrupted across saved gaps.', 'small')
 
-    if draft.get('key_changes'):
-        heading('What matters')
-        claims(draft['key_changes'])
-    if shared:
-        heading('Findings and evidence')
-        claims(draft.get('statements'))
+    observations = draft.get('observations') or []
+    metric_changes = [claim for claim in observations if claim.get('metric')]
+    heading('Key metric changes')
+    if metric_changes and not shared:
+        claims(metric_changes)
     else:
-        heading('Facts and interpretation')
-        claims(draft.get('observations'))
-        if draft.get('interpretations'):
-            heading('Interpretation', 'h3')
-            claims(draft['interpretations'])
-        if draft.get('judgment_reason'):
-            heading('Research judgment', 'h3')
-            paragraph(draft['judgment_reason'])
-    for document in presentation.get('documents') or []:
-        heading(document['title'])
-        role = {'primary': 'Main in-window evidence', 'background': 'Earlier background', 'later_update': 'Update after this window',
-                'correction': 'Correction', 'counterevidence': 'Counterevidence'}.get(document.get('role'), 'Saved original')
-        paragraph(document.get('publisher', '')+' | '+role, 'small', refs([document['evidence_id']]))
-        paragraph(document.get('relevance', ''))
-        paragraph('Quoted passage: '+document.get('quote', ''))
-        paragraph('Published '+_clock(document.get('published_at'))+'; captured '+_clock(document.get('retrieved_at')), 'small')
+        paragraph('No structured metrics for this report.', 'small')
+
+    heading('Key events')
+    timeline = report_timeline(draft, presentation, evidence_lookup)
+    if not timeline and shared and draft.get('statements'):
+        paragraph('Saved findings', 'event_date')
+        claims(draft['statements'], 'event_body', 'event_detail')
+    elif not timeline:
+        paragraph('No events with saved evidence for this report.', 'small')
+    for card in timeline:
+        date_label = card.get('date_label') or card.get('date')
+        if date_label and card.get('date_kind') == 'publication':
+            date_label = 'Published '+date_label
+        paragraph(date_label or 'Date unavailable', 'event_date')
+        statement = card.get('display_statement') or card.get('statement')
+        if statement:
+            paragraph(statement, 'event_body', refs(card.get('evidence_ids')))
+        measurement(card.get('measurement'), 'event_detail')
+        claims(card.get('facts'), 'event_body', 'event_detail')
+        for source_document in card.get('documents', []):
+            paragraph(source_document.get('title') or 'Saved original', 'event_source',
+                      refs([source_document['evidence_id']]))
+            role = {'primary': 'Main in-window evidence', 'background': 'Earlier background',
+                    'later_update': 'Update after this window', 'correction': 'Correction',
+                    'counterevidence': 'Counterevidence'}.get(source_document.get('role'), 'Saved original')
+            metadata = [source_document.get('publisher'), role]
+            for label, field in [('Published', 'published_at'), ('Captured', 'retrieved_at')]:
+                if source_document.get(field):
+                    metadata.append(label+' '+_clock(source_document[field]))
+            paragraph(' | '.join(part for part in metadata if part), 'event_detail')
+            if source_document.get('quote'):
+                paragraph('Quoted passage: '+source_document['quote'], 'event_body')
+            if source_document.get('relevance'):
+                paragraph(source_document['relevance'], 'event_detail')
+
+    heading('Research judgment')
+    if draft.get('judgment_reason'):
+        paragraph(draft['judgment_reason'])
+    elif not any(draft.get(field) for field in ('interpretations','explanations','forecasts','purchase_decision','advice')):
+        paragraph('No additional judgment for this report.', 'small')
+    if draft.get('interpretations'):
+        heading('Interpretation', 'h3')
+        claims(draft['interpretations'])
     for explanation in draft.get('explanations') or []:
-        heading(explanation['name'])
+        heading(explanation['name'], 'h3')
         paragraph('Horizon: '+explanation['horizon'], 'small')
         for label, rows in [('Observed basis', explanation['observed_basis']), ('Hypothesis', [explanation['hypothesis']]),
                             ('Applicability', explanation['applicability']), ('Alternative explanations', explanation.get('alternative_explanations')),
@@ -226,13 +276,13 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
                 claims(rows)
         bullets(explanation['uncertainties'])
     for forecast in draft.get('forecasts') or []:
-        heading('Conditional outlook')
+        heading('Conditional outlook', 'h3')
         paragraph(forecast['statement'], suffix=refs(forecast['supporting_evidence_ids']+forecast.get('counter_evidence_ids', [])))
         paragraph('Horizon: '+str(forecast['horizon_days'])+' days. '+forecast['uncertainty'], 'small')
         bullets(forecast.get('assumptions'))
     purchase = draft.get('purchase_decision')
     if purchase:
-        heading('Decision context')
+        heading('Decision context', 'h3')
         paragraph('Horizon: '+str(purchase['horizon_days'])+' days.', 'small')
         for label, key in [('Conditions to investigate', 'conditions_to_consider'), ('Reasons to wait', 'reasons_to_wait')]:
             heading(label, 'h3')
@@ -244,7 +294,7 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
         refs(purchase.get('simulation_evidence_ids'))
     advice = draft.get('advice')
     if advice:
-        heading('Conditional research suggestion')
+        heading('Conditional research suggestion', 'h3')
         paragraph(advice['summary'], suffix=refs(advice.get('context_evidence_ids')))
         for label, key in [('Reasoning', 'rationale'), ('Conditions', 'conditions'), ('Counterpoints', 'counterpoints'), ('Invalidation', 'invalidation')]:
             if advice.get(key):
@@ -260,14 +310,18 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
             if advice.get(key):
                 heading(label, 'h3')
                 bullets(advice[key])
-    if draft.get('questions_to_watch'):
-        heading('What to watch next')
-        bullets(draft['questions_to_watch'])
+    heading('What to watch next')
+    watch_items = report_watch_items(draft.get('questions_to_watch') or [])
+    if watch_items:
+        bullets(watch_items)
+    else:
+        paragraph('No follow-up items for this report.', 'small')
     heading('Limits to keep in mind')
-    bullets(draft.get('limitations'))
+    bullets(report_display_limits(draft) if not shared else draft.get('limitations'))
 
+    heading('Sources, review and downloads')
     if notices:
-        heading('Reader notices')
+        heading('Reader notices', 'h3')
     for notice in notices:
         paragraph(notice.get('note', ''))
         review = notice.get('latest_review') or {}
@@ -278,13 +332,13 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
         if resolution:
             paragraph('An updated report is available: '+resolution['replacement_report_id'], 'small')
 
-    heading('Evidence references')
+    heading('Evidence references', 'h3')
     source_urls = []
     for index, rid in enumerate(evidence_ids, 1):
         row = {}
         if evidence_lookup:
             try:
-                row = evidence_lookup(rid)
+                row = evidence_lookup(rid) or {}
             except (KeyError, ValueError, FileNotFoundError):
                 pass
         source = row.get('source') or {}
@@ -298,7 +352,7 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
         else:
             paragraph('Saved record or calculation. Publisher input sources are listed below.', 'small')
     publishers = packet.get('sources') or []
-    for item in [*publishers, *(source for chart in charts for source in chart.get('sources', [])), *(document.get('url') for document in presentation.get('documents', []))]:
+    for item in [*publishers, *(source for chart in charts for source in chart.get('sources', [])), *(document.get('url', '') for document in documents)]:
         url = _url(item if isinstance(item, str) else item.get('url'))
         if url and url not in source_urls:
             source_urls.append(url)
@@ -306,7 +360,7 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
             story.append(Paragraph('<link href="'+escape(url, quote=True)+'" color="#6b59b4">'+_markup(url)+'</link>', styles['small']))
     story.append(Spacer(1, 8))
     if overview.get('user_prompt'):
-        heading('Technical provenance')
+        heading('Technical provenance', 'h3')
         paragraph('Original task question: '+overview['user_prompt'], 'small')
         paragraph("A captured media publication remains that publisher's account; main in-window evidence does not imply an issuer's first-hand statement.", 'small')
     paragraph('Aether research support. Review the evidence and make your own investment decision.', 'small')
@@ -323,6 +377,6 @@ def _render_report_pdf(packet, report_id, *, evidence_lookup, notices):
 
     buffer = BytesIO()
     document = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=44, leftMargin=44, topMargin=40, bottomMargin=55,
-                                 title=_text(draft.get('title', 'Research report')), author='Aether', pageCompression=1)
+                                 title=_text(title), author='Aether', pageCompression=1)
     document.build(story, onFirstPage=page, onLaterPages=page)
     return buffer.getvalue()

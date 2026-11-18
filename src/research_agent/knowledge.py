@@ -527,6 +527,8 @@ class KnowledgeStore:
         return attach_report_notices(row,body,provider,cutoff=cutoff,report_lookup=self.report)
 
     def search_reports(self,query='',limit=5,cutoff=None,mode='observed'):
+        from .report_presentation import report_display_summary, report_display_title
+
         if not 1<=limit<=100:raise ValueError('Report recall limit must be 1..100')
         if mode not in ('observed','strict'):raise ValueError('Unknown output memory mode')
         cutoff=cutoff or utcnow();before=timestamp(cutoff)
@@ -538,9 +540,10 @@ class KnowledgeStore:
             body=json.loads(r['body']);draft=body.get('report',{})
             receipt=self._output_receipt(r['report_id'],body)
             if mode=='strict' and (not receipt or timestamp(receipt['known_at'])>before):continue
-            if terms and not any(t in (dumps(draft)+' '+str(body.get('initial_report_label',''))).lower() for t in terms):continue
-            row={'report_id':r['report_id'],'session_id':r['session_id'],'title':body.get('initial_report_label') or draft.get('title'),
-                'summary':draft.get('summary'),'created_at':r['created_at'],'review_status':body.get('review',{}).get('status'),'delivery_kind':draft.get('delivery_kind','full'),
+            title=body.get('initial_report_label') or report_display_title(draft)
+            if terms and not any(t in (dumps(draft)+' '+title).lower() for t in terms):continue
+            row={'report_id':r['report_id'],'session_id':r['session_id'],'title':title,
+                'summary':report_display_summary(draft),'created_at':r['created_at'],'review_status':body.get('review',{}).get('status'),'delivery_kind':draft.get('delivery_kind','full'),
                 'acquired_at':receipt['known_at'] if receipt else None,'availability_mode':mode,
                 'scope':'Earlier saved AI research, not a new factual source or current personal context; inspect original evidence and review notices.'}
             result.append(self._research_notice(row,body,cutoff))

@@ -7,8 +7,9 @@ import unittest
 from langchain_core.messages import HumanMessage
 
 from research_agent.conversation_context import ConversationWindowMiddleware
+from research_agent.chat_reply import requests_report
 from research_agent.model_context import context_policy
-from research_agent.research_policy import requests_research
+from research_agent.research_policy import recent_report_window, requests_research
 from research_agent.settings import Settings
 
 
@@ -17,6 +18,37 @@ class Request(SimpleNamespace):
 
 
 class ResearchContextPolicyTests(unittest.TestCase):
+    def test_implicit_chinese_report_authoring_is_distinct_from_report_lookup(self):
+        for prompt in ('给我近一个月的报告', '请给我 ETH 最近一个月的市场报告。',
+                       '给我近 30 天的 ETH 研究报告', '给我近两周的报告', '给我一份 ETH 报告',
+                       '来一份以太坊报告，附上图表。'):
+            self.assertTrue(requests_report(prompt),prompt)
+        for prompt in ('给我上次那份报告', '给我看近一个月的报告', '给我近一个月的报告的摘要',
+                       '这个报告是啥意思', '不用生成报告，只说近一个月涨跌',
+                       '「给我近一个月的报告」是什么意思？', '给我近一个月已发布的报告'):
+            self.assertFalse(requests_report(prompt),prompt)
+
+    def test_monthly_scope_uses_previous_month_day_and_all_completed_utc_days(self):
+        requested = '2026-11-18T21:25:37+08:00'
+        self.assertEqual(recent_report_window('给我近一个月的报告',requested),
+                         ('2026-10-18T00:00:00Z','2026-11-18T00:00:00Z'))
+        self.assertEqual(recent_report_window('给我近30天的报告',requested),
+                         ('2026-10-19T00:00:00Z','2026-11-18T00:00:00Z'))
+        self.assertEqual(recent_report_window('Give me a report for the past month','2024-03-31T18:00:00Z'),
+                         ('2024-02-29T00:00:00Z','2024-03-31T00:00:00Z'))
+
+    def test_recent_week_report_uses_completed_utc_days_from_request(self):
+        requested = '2026-11-18T19:26:05+08:00'
+        expected = ('2026-11-11T00:00:00Z', '2026-11-18T00:00:00Z')
+        for prompt in ('give me a report in a week.', 'Generate a report for the past seven days.',
+                       'Generate an ETH report for last week.',
+                       '请生成最近一周的 ETH 周报。'):
+            self.assertEqual(recent_report_window(prompt, requested), expected, prompt)
+        for prompt in ('Generate a report for 6–12 October 2026.',
+                       'Generate a report for Oct 13, comparing the past week.',
+                       'Generate a report for a calendar week.', '生成下周的报告'):
+            self.assertIsNone(recent_report_window(prompt, requested), prompt)
+
     def test_verified_million_context_uses_auto_headroom_and_all_old_summary_input(self):
         policy=context_policy(model_id='doubao-seed-2.1-pro')
         self.assertEqual(policy['capacity_tokens'],1024000)

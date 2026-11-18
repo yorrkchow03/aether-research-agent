@@ -1,4 +1,5 @@
 """Personal host shell or fail-closed confined OS sandbox, selected by the host."""
+from contextlib import ExitStack
 import os
 import json
 import shlex
@@ -56,9 +57,9 @@ class ResearchShell(LocalShellBackend):
                 path=root/(row['record_id']+'.json')
                 path.write_text(json.dumps(row,ensure_ascii=False));inputs.append(str(path))
             replay=ResearchShell(root,self.settings,self.cancel)
-            return replay.execute(shlex.join(['python','-I',str(recipe),*inputs]),timeout=60)
+            return replay.execute(shlex.join(['python','-I',str(recipe),*inputs]),timeout=60,separate_stderr=True)
 
-    def execute(self, command, *, timeout=None):
+    def execute(self, command, *, timeout=None, separate_stderr=False):
         """Run with Bash pipefail and the host-selected execution boundary.
 
         File-tool /data/... paths are virtual. Python/terminal code uses ./data/...
@@ -73,21 +74,28 @@ class ResearchShell(LocalShellBackend):
                 from .execution_safety import execution_context
                 with execution_context(self.cwd,command,self.settings,self._env,
                         sdk_socket=self._env.get('AETHER_RESEARCH_SOCKET')) as (argv,env,temporary):
-                    return self._run_command(command,argv,env,temporary,limit)
+                    return self._run_command(argv,env,temporary,limit,separate_stderr)
             except (OSError,ValueError) as exc:
                 return ExecuteResponse(output='Restricted execution failed; host fallback is disabled: '+self.settings.redact(str(exc)),exit_code=126,truncated=False)
-        return self._run_command(command,['/bin/bash','-o','pipefail','-c',command],self._env,None,limit)
+        return self._run_command(['/bin/bash','-o','pipefail','-c',command],self._env,None,limit,separate_stderr)
 
-    def _run_command(self,command,argv,env,capture_dir,limit):
-        with tempfile.TemporaryFile(dir=capture_dir) as capture:
+    def _run_command(self,argv,env,capture_dir,limit,separate_stderr):
+        with ExitStack() as files:
+            capture = files.enter_context(tempfile.TemporaryFile(dir=capture_dir))
+            diagnostics = files.enter_context(tempfile.TemporaryFile(dir=capture_dir)) if separate_stderr else None
             process = subprocess.Popen(argv, cwd=self.cwd, env=env,
-                                       stdin=subprocess.DEVNULL, stdout=capture, stderr=subprocess.STDOUT, start_new_session=True)
+                                       stdin=subprocess.DEVNULL, stdout=capture,
+                                       stderr=diagnostics if diagnostics is not None else subprocess.STDOUT,
+                                       start_new_session=True)
+
+            def output_size():
+                return os.fstat(capture.fileno()).st_size + (os.fstat(diagnostics.fileno()).st_size if diagnostics is not None else 0)
+
             start = time.monotonic(); reason = None
             while process.poll() is None:
-                capture.seek(0, os.SEEK_END)
                 if self.cancel and self.cancel.is_set():reason = "cancelled"
                 elif time.monotonic() - start > limit:reason = "timeout"
-                elif capture.tell() > 1_000_000:reason = "output limit exceeded"
+                elif output_size() > 1_000_000:reason = "output limit exceeded"
                 if reason:
                     try:os.killpg(process.pid, signal.SIGKILL)
                     except (ProcessLookupError,PermissionError):
@@ -98,7 +106,15 @@ class ResearchShell(LocalShellBackend):
             # Clean up background descendants of a command, too.
             try:os.killpg(process.pid, signal.SIGKILL)
             except (ProcessLookupError,PermissionError):pass
+            if reason is None and output_size() > 1_000_000:reason = "output limit exceeded"
             capture.seek(0); raw = capture.read(self._max_output_bytes + 1)
+            if diagnostics is not None and (process.returncode or reason):
+                diagnostics.seek(0)
+                error_output = diagnostics.read(self._max_output_bytes)
+                if error_output:
+                    # Failures need their traceback first. Successful recipes
+                    # return the stdout JSON unchanged even if stderr has logs.
+                    raw = error_output + (b'\n' + raw if raw else b'')
         output = self.settings.redact(raw[:self._max_output_bytes].decode("utf-8", errors="replace"))
         if reason:output += "\nExecution stopped: " + reason
         if not output and process.returncode:

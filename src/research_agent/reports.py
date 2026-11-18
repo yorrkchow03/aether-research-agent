@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from functools import cache
 from html import escape
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -11,7 +13,10 @@ from .advice import ResearchAdvice, advice_evidence_ids, validate_advice, render
 from .research_explanations import (ResearchExplanation, explanation_evidence_ids,
                                     validate_explanations, render_explanations)
 from .report_presentation import (FeaturedDocument, ReportChart, ReportScope,
-                                  presentation_evidence_ids, resolve_report_media)
+                                  presentation_evidence_ids, resolve_report_media,
+                                  report_display_limits, report_display_summary, report_display_title,
+                                  report_timeline, report_watch_items)
+from .etf_flow_validation import check_etf_flow_statement
 
 
 def distinct_sources(sources):
@@ -59,9 +64,10 @@ class ReportDraft(BaseModel):
         exclude_if=lambda value:not value,
         description="Optional saved source IDs for summary, questions, limitations and judgment only. Explicitly bind narrative-only facts here; IDs written inside plain strings do not bind. Other claims retain their own evidence_ids.")
     delivery_kind: Literal["full","minimal","evidence_gap"] = Field(default="full", exclude_if=lambda value:value=="full")
-    observations: list[Claim] = Field(min_length=0,max_length=30)
-    key_changes: list[Claim] = Field(default_factory=list,max_length=6,
-        description="Optional recent changes supported by original evidence. Compare actual dates/sources; do not invent a previous report or confirmed event. For dates/status/reasons use statement and evidence_ids only; omit metric/value/unit.")
+    observations: list[Claim] = Field(min_length=0,max_length=30,
+        description="Key indicators and other supporting facts. For a period report, describe meaningful changes with the comparison window, venue and units.")
+    key_changes: list[Claim] = Field(default_factory=list,max_length=12,
+        description="Key event summaries for the requested assets and window, separate from chart metrics and featured document cards. Give one concise, dated, source-bound entry per material event; merge duplicate reporting and keep important corrections or disputed status. Use statement and evidence_ids for qualitative events.")
     interpretations: list[Claim] = Field(default_factory=list,max_length=20)
     explanations: list[ResearchExplanation] = Field(default_factory=list, max_length=3,
         description='Optional compact explanations linking observations to a hypothesis, horizon, applicability, alternatives and invalidation. Use for substantive research when helpful; do not force competing views or forecasts.')
@@ -86,8 +92,10 @@ class ReportDraft(BaseModel):
     def judgment_has_reason(self):
         if self.judgment!='informational' and not self.judgment_reason.strip():
             raise ValueError('An explicit research judgment requires a nonblank reason')
-        if self.delivery_kind!='evidence_gap' and not self.observations:
+        if self.delivery_kind=='full' and not self.observations:
             raise ValueError('A research report requires at least one observation')
+        if self.delivery_kind=='minimal' and not (self.observations or self.key_changes):
+            raise ValueError('A limited report requires at least one observation or event')
         if self.delivery_kind=='evidence_gap':
             from .minimal_delivery import NOTICE_TITLE,NOTICE_SUMMARY,NOTICE_REASON,NOTICE_LIMIT
             if (self.title!=NOTICE_TITLE or self.summary!=NOTICE_SUMMARY or self.judgment_reason!=NOTICE_REASON
@@ -103,16 +111,19 @@ def report_claims(draft: ReportDraft) -> list[Claim]:
     return [*draft.observations,*draft.key_changes,*draft.interpretations]
 
 
-def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None):
+def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None, check_etf_flows=True):
     if draft.judgment!='informational' and not draft.judgment_reason.strip():
         raise ValueError('An explicit research judgment requires a nonblank reason')
+    lookup=cache(lookup)
     claim_paths=[f'/{field}/{index}' for field in ('observations','key_changes','interpretations')
                  for index, _ in enumerate(getattr(draft,field))]
-    checked,numeric=validate_claims(report_claims(draft),lookup,claim_paths=claim_paths)
+    claims=report_claims(draft)
+    checked,numeric=validate_claims(claims,lookup,claim_paths=claim_paths)
     for rid in draft.narrative_evidence_ids:lookup(rid);checked.add(rid)
     media=resolve_report_media(draft,lookup,evidence_as_of=as_of,raw_reader=raw_reader)
-    doc_checked,doc_numeric=validate_claims([item.relevance for item in draft.documents],lookup,
-        claim_paths=[f'/documents/{index}/relevance' for index, _ in enumerate(draft.documents)])
+    document_claims=[item.relevance for item in draft.documents]
+    document_paths=[f'/documents/{index}/relevance' for index, _ in enumerate(draft.documents)]
+    doc_checked,doc_numeric=validate_claims(document_claims,lookup,claim_paths=document_paths)
     checked.update(doc_checked);numeric+=doc_numeric
     checked.update(presentation_evidence_ids(draft))
     explanation_check=validate_explanations(draft.explanations,lookup,as_of)
@@ -130,6 +141,20 @@ def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None):
     result={"status":"passed","unique_evidence_records":len(checked),"numeric_claims_checked":numeric,
             "explanations_checked":explanation_check['explanations_checked'],
             "scope":"Citation eligibility and structured numeric fields; does not prove the prose, causation or forecasts."}
+    if check_etf_flows:
+        dated_totals = sum(
+            check_etf_flow_statement(claim.statement, claim.evidence_ids, lookup, path=path, raw_reader=raw_reader)
+            for claim, path in zip(claims + document_claims, claim_paths + document_paths)
+        )
+        narrative = [('/title', draft.title), ('/summary', draft.summary), ('/judgment_reason', draft.judgment_reason)]
+        narrative.extend((f'/limitations/{index}', text) for index, text in enumerate(draft.limitations))
+        narrative_ids = sorted(checked)
+        dated_totals += sum(
+            check_etf_flow_statement(text, narrative_ids, lookup, path=path, raw_reader=raw_reader)
+            for path, text in narrative
+        )
+        if dated_totals:
+            result['farside_dated_totals_checked'] = dated_totals
     if draft.scope is not None:
         result.update(charts_checked=len(media["charts"]),
                       chart_points_checked=sum(len(chart["points"]) for chart in media["charts"]),
@@ -153,13 +178,14 @@ def _numeric_note(claim):
     return lines
 
 
-def render_report(draft: ReportDraft, cutoff, validation, sources, online_through=None, review=None, presentation=None):
+def render_report(draft: ReportDraft, cutoff, validation, sources, online_through=None, review=None,
+                  presentation=None, *, lookup=None):
     labels={"informational":"Research context","consider":"Conditions worth investigating","wait":"Wait and monitor","avoid":"Caution under current conditions","insufficient_evidence":"Insufficient evidence"}
     ids=[]
     def include(references):
         for rid in references:
             if rid not in ids:ids.append(rid)
-    for claim in [*draft.key_changes,*draft.observations,*draft.interpretations]:include(claim.evidence_ids)
+    for claim in [*draft.observations,*draft.key_changes,*draft.interpretations]:include(claim.evidence_ids)
     include(explanation_evidence_ids(draft.explanations))
     for forecast in draft.forecasts:include([*forecast.supporting_evidence_ids,*forecast.counter_evidence_ids])
     if draft.purchase_decision:
@@ -169,19 +195,28 @@ def render_report(draft: ReportDraft, cutoff, validation, sources, online_throug
     include(presentation_evidence_ids(draft))
     numbers={rid:n+1 for n,rid in enumerate(ids)}
     def cite(references):return " ".join(f"[{numbers[rid]}](../records/{rid}.json)" for rid in references)
-    lines=["# "+draft.title,"",draft.summary]
+    factual = draft.delivery_kind != "evidence_gap"
+    lines=["# "+report_display_title(draft),"","## Summary","",report_display_summary(draft)]
+    def section(title,claims,level=2):
+        if not claims:return
+        lines.extend(['','#'*level+' '+title,''])
+        for claim in claims:
+            lines.append('- '+claim.statement+' '+cite(claim.evidence_ids))
+            lines.extend(_numeric_note(claim))
+
     if presentation:
         overview=presentation["overview"]
-        lines += ["", "## Report overview", "",
+        lines += ["",
                   "- Generated at " + overview["created_at"],
                   "- Assets " + ", ".join(overview["assets"]),
                   "- Research window " + overview["start"] + " to " + overview["end"] + " (exclusive end)",
                   "- Evidence cutoff " + overview["evidence_as_of"]]
-        if overview["document_ids"]:
-            lines += ["", "Key documents " + cite(overview["document_ids"])]
-        if presentation["charts"]:
-            lines += ["", "## Key data charts", ""]
-        for chart in presentation["charts"]:
+    charts = (presentation or {}).get("charts", [])
+    if factual:
+        lines += ["", "## Key data charts", ""]
+        if not charts:
+            lines.append("No price series was available for this report.")
+        for chart in charts:
             first,last=chart["points"][0],chart["points"][-1]
             lines += ["", "### " + escape(chart["asset"] + " " + chart["title"]), "",
                       f'{chart["provider"]} · {chart["frequency"]} · {chart["unit"]} · '
@@ -190,50 +225,66 @@ def render_report(draft: ReportDraft, cutoff, validation, sources, online_throug
             coverage=chart["coverage"]
             if coverage.get("starts_after_window") or coverage.get("ends_before_window") or coverage["internal_gap_count"]:
                 lines.append("Saved observations do not span the full window continuously.")
-        if presentation["documents"]:
-            lines += ["", "## Important documents", ""]
-        for item in presentation["documents"]:
-            role={'primary':'main in-window evidence'}.get(item['role'],item['role'].replace('_',' '))
-            lines += ["", "### " + escape(item["title"]), "",
-                      f'{escape(item["publisher"])} · {item["published_at"]} · {role}. '
-                      f'[Captured publication](<{item["url"]}>) ' + cite([item["evidence_id"]]),
-                      "", "<blockquote>" + escape(item["quote"]) + "</blockquote>", "",
-                      escape(item["relevance"])]
-    if online_through:lines += ['', 'Source captures through: '+online_through+'. Publication and event dates remain separate.']
-    def section(title,claims):
-        if not claims:return
-        lines.extend(['','## '+title,''])
-        for claim in claims:
-            lines.append('- '+claim.statement+' '+cite(claim.evidence_ids))
-            lines.extend(_numeric_note(claim))
-    section('Recent key changes',draft.key_changes)
-    section('Main facts',draft.observations)
-    section('Interpretation',draft.interpretations)
-    if draft.explanations:lines += ['',render_explanations(draft.explanations,cite)]
-    if draft.questions_to_watch:
-        lines += ['','## Questions to follow up','',
-            'These are proposed checks and open questions, not confirmed developments.']
-        lines.extend('- '+question for question in draft.questions_to_watch)
+        metrics = [claim for claim in draft.observations if claim.metric]
+        if metrics:
+            section('Key metric changes',metrics)
+        else:
+            lines += ["", "## Key metric changes", "", "No structured metrics were available for this report."]
+        cards = report_timeline(draft,presentation,lookup)
+        lines += ["", "## Key events", ""]
+        if not cards:
+            lines.append("The saved sources did not establish any key events for this report.")
+        for card in cards:
+            label = card["date_label"] or "Date not recorded"
+            if card["date_kind"] == "publication":
+                label = "Published " + label
+            lines += ["", "### " + escape(label), ""]
+            if card["display_statement"]:
+                lines.append(card["display_statement"] + " " + cite(card["evidence_ids"]))
+            if card["measurement"]:
+                lines.extend(_numeric_note(Claim.model_validate(card["measurement"])))
+            for fact in card["facts"]:
+                lines.append("- " + fact["statement"] + " " + cite(fact["evidence_ids"]))
+            for item in card["documents"]:
+                role = {"primary":"main in-window evidence"}.get(item["role"],item["role"].replace("_"," "))
+                lines += ["", "**" + escape(item["title"]) + "**",
+                          f'{escape(item["publisher"])} · Published {item["published_at"]} · {role}',
+                          f'[Captured publication](<{item["url"]}>) ' + cite([item["evidence_id"]]),
+                          "", "<blockquote>" + escape(item["quote"]) + "</blockquote>", "",
+                          escape(item["relevance"])]
+    if factual:
+        lines += ["", "## Research judgment", ""]
+        if draft.judgment_reason.strip():
+            lines.append(labels[draft.judgment]+". "+draft.judgment_reason)
+        elif not any((draft.interpretations,draft.explanations,draft.forecasts,draft.purchase_decision,draft.advice)):
+            lines.append("The saved sources did not support a separate research judgment.")
+    elif draft.judgment_reason.strip():
+        lines += ["", "## Research judgment", "", labels[draft.judgment]+". "+draft.judgment_reason]
+    section('Interpretation',draft.interpretations,level=3)
+    if draft.explanations:
+        lines += ['',re.sub(r"^(#{2,5}) ",r"#\1 ",render_explanations(draft.explanations,cite),flags=re.M)]
     if draft.forecasts:
-        lines += ['','## Conditional scenarios','']
+        lines += ['','### Conditional scenarios','']
         for f in draft.forecasts:
             lines += [f"- {f.horizon_days}-day horizon: {f.statement}","  Assumptions: "+"; ".join(f.assumptions),
                       "  Uncertainty: "+f.uncertainty,"  Supporting sources: "+cite(f.supporting_evidence_ids),
                       "  Contrary sources: "+(cite(f.counter_evidence_ids) or "No independent contrary source supplied")]
-    if draft.judgment!='informational' or draft.judgment_reason.strip():
-        lines += ["","## Research judgment","",labels[draft.judgment]+". "+draft.judgment_reason]
     if draft.purchase_decision:
-        d=draft.purchase_decision;lines += ["","## Decision context","",f"Research horizon: {d.horizon_days} days","","Conditions to investigate:"]
+        d=draft.purchase_decision;lines += ["","### Decision context","",f"Research horizon: {d.horizon_days} days","","Conditions to investigate:"]
         lines.extend("- "+c.condition+" "+cite(c.evidence_ids) for c in d.conditions_to_consider)
         lines.append("Reasons to wait / contrary evidence:")
         lines.extend("- "+c.condition+" "+cite(c.evidence_ids) for c in d.reasons_to_wait)
         for label,items in (("Invalidation conditions",d.invalidation_conditions),("Missing information",d.missing_information),("What to monitor",d.monitor),("Costs and execution assumptions",d.cost_and_execution_notes)):
             lines += ["",label+":",*["- "+item for item in items]]
         if d.simulation_evidence_ids:lines += ['','Supporting scenario evidence: '+cite(d.simulation_evidence_ids)]
-    if draft.advice:lines += ['',render_advice(draft.advice,cite)]
+    if draft.advice:lines += ['',re.sub(r"^(#{2,5}) ",r"#\1 ",render_advice(draft.advice,cite),flags=re.M)]
+    if factual:
+        lines += ['','## What to watch next','']
+        follow_ups = report_watch_items(draft.questions_to_watch)
+        lines.extend(['- '+question for question in follow_ups] or ["No specific follow-up was identified in the saved sources."])
     lines += ["","## Limits and unknowns",""]
-    lines.extend("- "+item for item in draft.limitations)
-    lines += ["","## Sources",""]
+    lines.extend("- "+item for item in report_display_limits(draft))
+    lines += ["","## Sources, review and downloads",""]
     for src in distinct_sources(sources):lines.append("- ["+src['name']+"]("+src['url']+") — retrieved "+src['retrieved_at'])
     lines += ['','Numbered citations open saved evidence in the downloadable bundle. Publisher/API links may show later content.',
         '', '<details>', '<summary>Source checks and technical provenance</summary>']

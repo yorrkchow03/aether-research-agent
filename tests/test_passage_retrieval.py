@@ -250,6 +250,30 @@ class PassageRetrievalTests(unittest.TestCase):
         self.assertEqual(encoder.calls,[])
         self.assertEqual(result['selection']['semantic_calls'],0)
 
+    def test_scoped_empty_query_preserves_day_and_publisher_breadth_before_repeat_origins(self):
+        latest=source('page-latest','Latest article '+('x '*1500),published='2026-11-05T12:00:00Z')
+        version=source('page-revision','An older version of the latest article.',published='2026-11-05T11:00:00Z')
+        version['source']={'url':latest['url']+'?utm_source=archive#top'}
+        del version['url']
+        same_host=source('page-same-host','Different article.',published='2026-11-05T10:00:00Z')
+        other_host=source('page-other-host','Another publisher.',published='2026-11-05T09:00:00Z')
+        other_host['url']='https://other.invalid/distinct'
+        first_day=source('page-first-day','Early update.',published='2026-11-01T01:00:00+01:00')
+        exclusive_end=source('page-exclusive','Outside window.',published='2026-11-06T00:00:00Z')
+        late_capture=source('page-late','Captured too late.',published='2026-11-05T13:00:00Z',known='2026-11-08T00:00:00Z')
+        sources=[latest,version,same_host,other_host,first_day,exclusive_end,late_capture]
+        window={'start':'2026-11-01T00:00:00Z','end':'2026-11-06T00:00:00Z','mode':'strict','cutoff':CUTOFF}
+
+        first=retrieve_passages(sources,' ',limit=3,**window)
+        self.assertEqual(first['source_ids'],['page-latest','page-first-day','page-other-host'])
+        self.assertEqual(first['coverage']['publication_day_counts'],{'2026-11-01':1,'2026-11-05':2})
+        self.assertEqual(first['coverage']['publisher_host_count'],2)
+        self.assertTrue(all(part['start']==0 for part in first['results']))
+        self.assertEqual({gap['reason'] for gap in first['gaps']},{'outside_publication_window','not_known_by_cutoff'})
+
+        expanded=retrieve_passages(reversed(sources),'',limit=5,**window)
+        self.assertEqual(expanded['source_ids'],[*first['source_ids'],'page-same-host','page-revision'])
+
     def test_same_url_different_versions_are_not_erased(self):
         a=source('page-old','ETH validator activation scheduled.')
         b=source('page-new','ETH validator activation postponed.')

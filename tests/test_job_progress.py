@@ -115,3 +115,12 @@ class JobProgressTests(unittest.TestCase):
                 runtime.active.pop(sid)
             status = client.post(path+'/messages', json={'prompt':'报告在哪看？'}, headers=headers).raise_for_status().json()
             self.assertIn('Analyst → Reports', status['answer'])
+
+            record.update(report_delivery_kind='evidence_gap')
+            (job_dir / 'status.json').write_text(json.dumps(record))
+            for prompt in ('这个报告是啥意思', '报告发布了吗？'):
+                status = client.post(path+'/messages', json={'prompt':prompt}, headers=headers).raise_for_status().json()
+                self.assertIn('证据缺口说明', status['answer'])
+                self.assertNotIn('报告已发布', status['answer'])
+                self.assertEqual(status['published_reports'], [])
+            run.assert_not_called()

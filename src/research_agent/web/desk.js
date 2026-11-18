@@ -57,7 +57,7 @@ expandedChat.addEventListener('close',()=>{
 $('retry-connection').onclick=async()=>{
  try{
   await api('/api/health');
-  await Promise.allSettled([loadData(),refreshSession(),checkMarketReview()]);
+  await Promise.allSettled([loadData(),refreshSession()]);
   toast('Workspace reconnected.');
  }catch{toast('Could not reconnect to the workspace.')}
 };

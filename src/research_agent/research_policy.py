@@ -3,7 +3,66 @@
 The recognizer is a display/prompt hint, not a capability or delegation gate.
 The agent chooses the needed depth from the actual question and evidence gaps.
 """
+from calendar import monthrange
+from datetime import timedelta
 import re
+
+from research_data.normalize import iso, timestamp
+
+
+_RECENT_WEEK = re.compile(
+    r'(?:最近|近|过去)\s*(?:[一1]\s*(?:周|星期)|[7七]\s*天)|'
+    r'\b(?:last|past|previous|recent)\s+(?:one\s+)?week\b|'
+    r'\b(?:last|past)\s+(?:7|seven)\s+(?:full\s+|complete(?:d)?\s+)?days\b',
+    re.I,
+)
+_RECENT_FORTNIGHT = re.compile(
+    r'(?:最近|近|过去)\s*(?:[两二2]\s*(?:周|星期)|(?:14|十四)\s*天)|'
+    r'\b(?:last|past|recent)\s+(?:(?:two|2)\s+weeks|(?:fourteen|14)\s+days)\b',
+    re.I,
+)
+_RECENT_MONTH = re.compile(
+    r'(?:最近|近|过去)\s*(?:[一1]\s*)?(?:个\s*)?月|'
+    r'\b(?:last|past|recent)\s+(?:one\s+|a\s+|1\s+)?month\b', re.I,
+)
+_RECENT_30_DAYS = re.compile(
+    r'(?:最近|近|过去)\s*(?:30|三十)\s*天|\b(?:last|past|recent)\s+(?:30|thirty)\s+days\b', re.I,
+)
+_SHORT_WEEKLY_REQUEST = re.compile(
+    r'(?:please\s+)?(?:give me|write|generate|create)\s+(?:a\s+)?report\s+in a week[.!?]?',
+    re.I,
+)
+_OTHER_TIME_SCOPE = re.compile(
+    r'\b(?:20\d{2}|yesterday|tomorrow|next week|calendar week)\b|'
+    r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|'
+    r'aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d|'
+    r'\d{1,2}\s*月\s*\d|\b\d{1,2}[/-]\d{1,2}\b|昨天|明天|下周|自然周|日历周',
+    re.I,
+)
+
+
+def has_recent_report_period(prompt):
+    return any(expression.search(prompt) for expression in
+               (_RECENT_WEEK, _RECENT_FORTNIGHT, _RECENT_MONTH, _RECENT_30_DAYS))
+
+
+def recent_report_window(prompt, created_at):
+    """Resolve a supported relative period against the saved UTC job clock."""
+    question = re.sub(r'```[\s\S]*?```|`[^`]*`|“[^”]*”|「[^」]*」|"[^"\n]*"', ' ', prompt).strip()
+    if _OTHER_TIME_SCOPE.search(question):
+        return None
+    end = timestamp(created_at).replace(hour=0, minute=0, second=0, microsecond=0)
+    starts = [end - timedelta(days=days) for expression, days in
+              ((_RECENT_WEEK, 7), (_RECENT_FORTNIGHT, 14), (_RECENT_30_DAYS, 30))
+              if expression.search(question)]
+    if _RECENT_MONTH.search(question):
+        year, month = (end.year, end.month - 1) if end.month > 1 else (end.year - 1, 12)
+        starts.append(end.replace(year=year, month=month, day=min(end.day, monthrange(year, month)[1])))
+    if not starts and _SHORT_WEEKLY_REQUEST.fullmatch(question):
+        starts.append(end - timedelta(days=7))
+    if len(starts) == 1:
+        return iso(starts[0]), iso(end)
+    return None
 
 
 def requests_research(prompt):
@@ -33,9 +92,12 @@ Newly collected facts and new calculations retain the normal source-review
 requirement. Publish a report only for an explicit user request.'''
 
 SAVED_RESEARCH_START_POLICY = '''When a report already has an asset/window and
-registered measurements, start the substantive evidence work with date-scoped
-news recall; read the named calculation or contract directly as needed. Do not
-rediscover the supplied scope or make mapping storage structures a plan stage.
+registered measurements, start with the supplied evidence. If it includes exact
+saved excerpts, canonical record IDs and the registered values for the required
+claims, use those inputs directly. Use date-scoped news recall when the supplied
+evidence leaves a material date or topic uncovered; reopen a record only for a
+specific missing detail. Do not rediscover the supplied scope or make mapping
+storage structures a plan stage.
 A source catalog is a locator for a needed ID, file or exact field, not a reading
 list or a prerequisite census of the corpus. Use retrieval coverage, dates,
 duplicate groups and gaps to decide the next focused question. Inspect additional
@@ -44,8 +106,9 @@ Do not enumerate every article, forum thread, provider or collection to establis
 coverage. If retrieval coverage is weak, refine the missing date/topic query or
 disclose the gap. Availability does not establish completeness.
 Use a short plan for remaining evidence questions, synthesis and source-checked
-delivery. Once acquired evidence supports the requested depth, compose the report
-and address concrete validation feedback rather than continuing general discovery.'''
+delivery. When the evidence supports the report, submit it with publish_report
+while the writing step is active. Successful publication completes the delivery
+step. Use publish_saved_report to repair a saved draft after concrete feedback.'''
 
 RESEARCH_READER_POLICY = '''For a multi-document report or investigation, separate
 source selection and synthesis from substantial original-document reading. Keep

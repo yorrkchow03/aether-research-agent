@@ -63,9 +63,70 @@ def _numeric_error(reason, claim, records, path, index):
         + 'Cited field checks=' + json.dumps(sources, ensure_ascii=False, separators=(',', ':')))
 
 
+def _numeric_issue(claim, records):
+    if (claim.metric is None) != (claim.value is None):
+        return 'Numeric claims require both metric and value'
+    if claim.unit is not None and claim.metric is None:
+        return 'A unit requires a metric and value'
+    if claim.metric is None:
+        return None
+    candidates = []
+    for record in records:
+        raw = record.get('values', {}).get(claim.metric)
+        if raw is None:
+            continue
+        try:
+            value = Decimal(str(raw))
+        except (InvalidOperation, ValueError):
+            continue
+        units = {unit for pattern, unit in record.get('units', {}).items() if fnmatchcase(claim.metric, pattern)}
+        if value.is_finite() and claim.unit in units:
+            candidates.append(value)
+    if claim.unit is None or not candidates:
+        return 'Numeric unit or cited field mismatch'
+    try:
+        actual = Decimal(claim.value)
+    except (InvalidOperation, ValueError):
+        return 'Numeric claim is not a decimal value'
+    if not actual.is_finite() or not any(
+        abs(actual - value) <= max(abs(value) * Decimal('1e-10'), Decimal('1e-12')) for value in candidates
+    ):
+        return 'Numeric value differs from saved evidence'
+    return None
+
+
+def _numeric_issues_error(errors):
+    if len(errors) == 1:
+        reason, claim, records, path, index = errors[0]
+        if claim.metric is None or claim.value is None:
+            return ValueError(reason)
+        return _numeric_error(reason, claim, records, path, index)
+
+    rows = []
+    text_only = []
+    for reason, claim, records, path, index in errors:
+        label = path or f'claim[{index}]'
+        rows.append(f'{label}: {reason}; metric={_diagnostic_scalar(claim.metric)}')
+        if (path and claim.metric is not None and claim.value is not None and claim.unit is not None
+                and all(rid.startswith('page-') and claim.metric not in record.get('values', {})
+                        for rid, record in zip(claim.evidence_ids, records))):
+            text_only.append(path)
+    message = f'{len(rows)} numeric annotations failed. '+' | '.join(rows)+'. '
+    message += 'For structured figures, use the exact saved values key/value/unit. '
+    if text_only:
+        # A saved-draft patch accepts 20 edits; one text-only annotation uses three.
+        edits = [{'path':path+'/'+key, 'op':'remove'} for path in text_only[:6] for key in ('metric','value','unit')]
+        message += ('For figures independently found in the cited page text, keep statement + evidence_ids for source review. '
+                    'Example publish_saved_report edits='+json.dumps(edits, separators=(',',':'))+'.')
+        if len(text_only) > 6:
+            message += ' Apply the same three removals for the remaining verified text figures in groups of up to six claims: '+', '.join(text_only[6:])+'.'
+    return ValueError(message)
+
+
 def validate_claims(claims, lookup, *, claim_paths=None):
     checked = set()
     numeric = 0
+    errors = []
     records_by_id = {}
     for index, claim in enumerate(claims):
         path = claim_paths[index] if claim_paths is not None else None
@@ -76,31 +137,11 @@ def validate_claims(claims, lookup, *, claim_paths=None):
             if rid not in records_by_id:records_by_id[rid]=lookup(rid)
         records = [records_by_id[rid] for rid in claim.evidence_ids]
         checked.update(claim.evidence_ids)
-        if (claim.metric is None) != (claim.value is None):
-            raise ValueError("Numeric claims require both metric and value")
-        if claim.unit is not None and claim.metric is None:
-            raise ValueError("A unit requires a metric and value")
-        if claim.metric is not None:
-            candidates = []
-            for record in records:
-                raw = record.get('values', {}).get(claim.metric)
-                if raw is None:
-                    continue
-                try:value = Decimal(str(raw))
-                except (InvalidOperation, ValueError):continue
-                units = {unit for pattern, unit in record.get('units', {}).items()
-                         if fnmatchcase(claim.metric, pattern)}
-                if value.is_finite() and claim.unit in units:
-                    candidates.append(value)
-            if claim.unit is None or not candidates:
-                raise _numeric_error("Numeric unit or cited field mismatch", claim, records, path, index)
-            try:actual = Decimal(claim.value)
-            except (InvalidOperation, ValueError):
-                raise _numeric_error('Numeric claim is not a decimal value', claim, records, path, index) from None
-            if not actual.is_finite() or not any(
-                abs(actual - value) <= max(abs(value) * Decimal('1e-10'), Decimal('1e-12'))
-                for value in candidates
-            ):
-                raise _numeric_error("Numeric value differs from saved evidence", claim, records, path, index)
+        reason = _numeric_issue(claim, records)
+        if reason:
+            errors.append((reason, claim, records, path, index))
+        elif claim.metric is not None:
             numeric += 1
+    if errors:
+        raise _numeric_issues_error(errors)
     return checked, numeric

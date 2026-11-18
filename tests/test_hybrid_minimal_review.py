@@ -105,6 +105,31 @@ class MinimalReviewTests(unittest.TestCase):
         changed['evidence_text']['page-fixture']=changed['evidence_text']['page-fixture'].replace(clock,'2026-11-09T00:00:00Z')
         with self.assertRaises(ValueError):verify_saved_minimal_review(changed,draft)
 
+    def test_chart_only_clock_is_proved_without_sending_it_to_model(self):
+        from research_agent.host_review_facts import BOUND_RECORDS_PREFIX,BOUND_RECORDS_SUFFIX
+
+        chart_id='live-'+'1'*24
+        clock='2026-11-08T00:00:00Z'
+        body=self.draft.model_dump()
+        body.update(scope={'assets':['ETH'],'start':'2026-11-01T00:00:00Z','end':clock},
+                    charts=[{'evidence_id':chart_id,'metric':'close_usd'}],
+                    limitations=[MINIMAL_LIMIT,BOUND_RECORDS_PREFIX+clock+BOUND_RECORDS_SUFFIX])
+        draft=ReportDraft.model_validate(body)
+        rows={'page-fixture':{**self.row,'retrieved_at':'2026-11-07T00:00:00Z'},
+              chart_id:{'record_id':chart_id,'retrieved_at':clock}}
+        model=StubModel();reviewer=MinimalEvidenceReviewer(Settings())
+        with patch('research_agent.review.EvidenceReviewer.build_model',return_value=model):
+            result=reviewer.review(draft,rows.__getitem__)
+        self.assertEqual(result['review_version'],'support-hybrid-minimal-v2')
+        self.assertEqual([t['claim_id'] for t in model.payloads[0]['targets']],['O1'])
+        self.assertEqual(set(result['host_only_evidence_text']),{chart_id})
+        self.assertIn('L2',result['host_literal_target_ids'])
+        self.assertNotIn(chart_id,result['evidence_text'])
+        verify_saved_minimal_review(result,draft,rows.__getitem__)
+        rows[chart_id]['retrieved_at']='2026-11-09T00:00:00Z'
+        with self.assertRaisesRegex(ValueError,'differ from the archived records'):
+            verify_saved_minimal_review(result,draft,rows.__getitem__)
+
     def test_literal_minimal_claim_is_not_host_true_when_other_material_remains(self):
         draft=self.draft.model_copy(update={'interpretations':[self.draft.observations[0]]})
         result,_,model=self.run_review(draft)

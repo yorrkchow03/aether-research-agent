@@ -92,6 +92,18 @@ class WorkingMemoryV2Tests(unittest.TestCase):
         self.assertEqual(view['status'],'error')
         self.assertEqual(json.loads(self.store.read_artifact('job-a',view['artifact']['artifact_id'])['text'])['error'],'x'*6000)
 
+    def test_restricted_execute_returns_output_preview_and_direct_file_route(self):
+        store = WorkingMemory(self.root/'memory/task-state')
+        store.begin('job-a','Weekly report','2026-01-05T00:00:00Z')
+        output = 'first line\n' + 'x'*8000 + '\nlast line\n'
+        payload = {'output': output, 'exit_code': 0, 'truncated': False}
+        view = json.loads(store.progressive_tool_view('job-a','execute',payload,max_chars=1800))
+        self.assertTrue(view['artifact']['read_file_path'].startswith('/memory/task-state/artifacts/job-a/'))
+        self.assertIn('read_file',view['next_action'])
+        navigation = next(item for item in view['navigation'] if item['pointer']=='/output')
+        self.assertEqual([line['text'] for line in navigation['lines']], ['first line\n','last line\n'])
+        self.assertEqual(json.loads(store.read_artifact('job-a',view['artifact']['artifact_id'])['text']),payload)
+
     def test_oversized_first_failure_cannot_hide_later_review_targets(self):
         self.store.observe_tool('job-a','publish_report',{'error':'old issue '*600},status='error')
         ids=['O5','S1','M3','M4','L3','L4','L5','DOC3']
