@@ -54,6 +54,17 @@ def next_due(config,now=None,first=False):
     return iso(candidate.astimezone(timezone.utc))
 
 
+def scheduled_report_request(config, scheduled_for, *, retry=False):
+    end = timestamp(scheduled_for).astimezone(ZoneInfo(config['timezone']))
+    start = end - timedelta(days={'daily': 1, 'weekly': 7}[config['cadence']])
+    scope = (f"English {config['asset']} {config['cadence']} report for UTC "
+             f'{iso(start.astimezone(timezone.utc))} (inclusive) to '
+             f'{iso(end.astimezone(timezone.utc))} (exclusive).')
+    if retry:
+        return f'Continue preparing and publish the unfinished {scope}'
+    return f'Create and publish a concise {scope}'
+
+
 class Scheduler:
     def __init__(self,runtime,root,feed_scanner=scan_feed):
         self.runtime=runtime;self.path=Path(root)/'scheduler.sqlite';self.path.parent.mkdir(parents=True,exist_ok=True)
@@ -124,7 +135,8 @@ class Scheduler:
             except (ValueError,KeyError,FileNotFoundError,StopIteration):job={'error':'Saved job is unavailable after restart'};state='interrupted'
             if state not in ('completed','failed','cancelled','interrupted'):continue
             with self.db() as c:
-                c.execute('UPDATE runs SET state=?,finished_at=?,error=? WHERE id=?',(state,utcnow(),job.get('error'),row['id']))
+                c.execute('UPDATE runs SET state=?,job_id=?,finished_at=?,error=? WHERE id=?',
+                          (state,row['job_id'] or job.get('job_id'),utcnow(),job.get('error'),row['id']))
                 sub=c.execute('SELECT * FROM subscriptions WHERE id=?',(row['subscription_id'],)).fetchone()
                 if not sub:continue
                 config=json.loads(sub['config']);failures=0 if state=='completed' else sub['failures']+1
@@ -151,10 +163,15 @@ class Scheduler:
             for sub in due:
                 config=json.loads(sub['config'])
                 if not config['enabled'] and not (sub['last_status'] or '').startswith('manual_'):continue
+                periodic = config['cadence'] in ('daily', 'weekly')
                 with self.runtime.lock:busy=bool(self.runtime.active)
                 if busy:
                     status='waiting_for_current_research' if config['enabled'] else 'manual_waiting_for_current_research'
-                    with self.db() as c:c.execute('UPDATE subscriptions SET next_run=?,last_status=? WHERE id=?',(iso(timestamp(now)+timedelta(minutes=1)),status,sub['id']))
+                    if not periodic or sub['last_status'] != status:
+                        due_at = sub['next_run'] if periodic else iso(timestamp(now) + timedelta(minutes=1))
+                        with self.db() as c:
+                            c.execute('UPDATE subscriptions SET next_run=?,last_status=? WHERE id=?',
+                                      (due_at,status,sub['id']))
                     continue
                 baseline=json.loads(sub['baseline'] or '{}');reason='Scheduled research brief'
                 if config['mode']=='monitor' and not baseline.get('retry_session_id'):
@@ -181,15 +198,28 @@ class Scheduler:
                 try:
                     retry_sid=baseline.pop('retry_session_id',None)
                     session={'session_id':retry_sid} if retry_sid else self.runtime.create_session(title=config['name'],research_mode='current',preferences='Scheduled personal research. No order execution.',external_run_id=run_id)
-                    with self.db() as c:c.execute('UPDATE runs SET session_id=? WHERE id=?',(session['session_id'],run_id))
-                    prompt=(f'{reason}. Create and publish a concise English ETH research brief with fresh actual data and material recent news. '
-                            'Recall previous research and source versions to explain what changed. Choose relevant metrics, tools and calculations yourself. '
-                            'Read important original announcements when accessible; note gaps and continue. Distinguish facts, cautious interpretations, planned '
-                            'events and confirmed events. Record meaningful source-backed events when useful. Avoid unsupported price forecasts or invented user holdings. '
-                            'Prefer 3–5 important observations and at most two careful interpretations; do not expand a routine brief into a broad survey. '
-                            'Save a short source-reviewed report with publish_report; no paper simulation or purchasing decision is required for a routine brief.')
-                    if retry_sid:prompt=('Continue the unfinished scheduled brief in this session from saved work and the most recent draft. Correct the last source-check errors, remove unsupported assertions, and publish a concise source-reviewed report. Do not repeat the full search or recalculate unchanged inputs; refresh only if required for an explicit current claim. Preserve data timestamps. '+prompt)
-                    job=self.runtime.start(session['session_id'],prompt,'report',schedule_run_id=run_id)
+                    with self.db() as c:
+                        prior_runs = c.execute(
+                            'SELECT scheduled_for,job_id FROM runs WHERE subscription_id=? AND session_id=? AND id<>? '
+                            'ORDER BY rowid', (sub['id'], retry_sid, run_id),
+                        ).fetchall() if periodic and retry_sid else []
+                        c.execute('UPDATE runs SET session_id=? WHERE id=?',(session['session_id'],run_id))
+                    start_options = {'schedule_run_id': run_id}
+                    if periodic:
+                        scheduled_for = prior_runs[0]['scheduled_for'] if prior_runs else sub['next_run']
+                        prior_job_id = next((run['job_id'] for run in reversed(prior_runs) if run['job_id']), None)
+                        if prior_job_id:
+                            start_options['continued_from'] = prior_job_id
+                        prompt = scheduled_report_request(config, scheduled_for, retry=bool(prior_job_id))
+                    else:
+                        prompt=(f'{reason}. Create and publish a concise English ETH research brief with fresh actual data and material recent news. '
+                                'Recall previous research and source versions to explain what changed. Choose relevant metrics, tools and calculations yourself. '
+                                'Read important original announcements when accessible; note gaps and continue. Distinguish facts, cautious interpretations, planned '
+                                'events and confirmed events. Record meaningful source-backed events when useful. Avoid unsupported price forecasts or invented user holdings. '
+                                'Prefer 3–5 important observations and at most two careful interpretations; do not expand a routine brief into a broad survey. '
+                                'Save a short source-reviewed report with publish_report; no paper simulation or purchasing decision is required for a routine brief.')
+                        if retry_sid:prompt=('Continue the unfinished scheduled brief in this session from saved work and the most recent draft. Correct the last source-check errors, remove unsupported assertions, and publish a concise source-reviewed report. Do not repeat the full search or recalculate unchanged inputs; refresh only if required for an explicit current claim. Preserve data timestamps. '+prompt)
+                    job=self.runtime.start(session['session_id'],prompt,'report',**start_options)
                     with self.db() as c:c.execute("UPDATE runs SET state='running',session_id=?,job_id=? WHERE id=?",(session['session_id'],job['job_id'],run_id))
                 except Exception as exc:
                     with self.db() as c:

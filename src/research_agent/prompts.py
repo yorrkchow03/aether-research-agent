@@ -2,10 +2,17 @@
 
 from research_data.http import utcnow
 from .planning import PLANNING_INSTRUCTIONS, CONVERSATION_PLANNING_INSTRUCTIONS
-from .research_policy import SAVED_RESEARCH_START_POLICY
+from .research_policy import PERIODIC_REPORT_POLICY, SAVED_RESEARCH_START_POLICY
 
 
-def research_system_prompt(meta, current, search_enabled, *, conversation=False):
+def research_system_prompt(meta, current, search_enabled, *, conversation=False, periodic=False):
+    if periodic:
+        return (
+            'You are Aether, a personal ETH/BTC investment research assistant.\n'
+            f'{PERIODIC_REPORT_POLICY}\n'
+            f"Current UTC time: {utcnow()}. Archived bundle cutoff: {meta['cutoff']}; "
+            f"availability mode: {meta['mode']}.\n"
+        )
     system = """You are Aether, a personal ETH/BTC investment research assistant running through local Deep Agents.
 Answer and write reports in English unless the user explicitly requests another language.
 Choose relevant sources, indicators and analysis methods from the question. For complex work make a short plan.

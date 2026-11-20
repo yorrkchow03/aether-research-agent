@@ -14,7 +14,9 @@ from .etf_flow_validation import check_etf_flow_statement
 from .host_review_facts import automatic_disclosure
 
 
-ARCHIVE_LIMITATION = "Archived datasets are reconstructed by observation time; unknown publication times prevent strict point-in-time claims."
+LEGACY_ARCHIVE_LIMITATION = "Archived datasets are reconstructed by observation time; unknown publication times prevent strict point-in-time claims."
+ARCHIVE_LIMITATION = ("Archived observations are reconstructed by their recorded observation times. "
+                      "This reconstruction does not establish which records were available at those times.")
 OMITTED_DOCUMENT_LIMITATION = "No original document cards are included in this report."
 
 _DISPLAY_NUMBER = re.compile(
@@ -309,7 +311,9 @@ def omit_rejected_optional_items(draft, review):
         statement = item.relevance.statement if section == 'documents' else item
         if target.get('statement') != statement:
             return None
-        if section == 'limitations' and (automatic_disclosure(item) or item in (ARCHIVE_LIMITATION, OMITTED_DOCUMENT_LIMITATION)):
+        if section == 'limitations' and (automatic_disclosure(item) or item in (
+            ARCHIVE_LIMITATION, LEGACY_ARCHIVE_LIMITATION, OMITTED_DOCUMENT_LIMITATION,
+        )):
             return None
         key = (section, index)
         receipt = omissions.setdefault(key, {'claim_id': issue['claim_id'], 'path': f'/{section}/{index}', 'reasons': []})

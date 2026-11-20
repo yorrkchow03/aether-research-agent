@@ -165,11 +165,32 @@ def derive_observation(tool_name, payload, *, status='success', artifact_id,
                 body['status'] = 'unresolved'
                 body['evidence_ids'] = _ids(gap.get('evidence_ids', []))
                 result['unknowns'].append(_item('retrieval_gap', body, artifact_id, observation_id))
+        memory = obj.get('memory_bundles')
+        source_relationships = set()
+        if ((tool_name == 'recall_memory' or sdk_name == 'memory-news')
+                and obj.get('retrieval_unit') == 'passage' and isinstance(memory, dict)):
+            selected = {value['evidence_id'] for value in result['sources']}
+            links = memory.get('relations')
+            for link in links[:24] if isinstance(links, list) else []:
+                if not isinstance(link, dict) or link.get('predicate') not in (
+                        'corrects', 'supersedes', 'contradicts', 'unresolved_conflict', 'content_revision_of'):
+                    continue
+                subject, target = link.get('subject'), link.get('object')
+                ids = _ids([subject, target])
+                if len(ids) != 2 or not set(ids) <= selected:
+                    continue
+                source_relationships.add(frozenset(ids))
+                result['conflicts'].append(_item('source_relationship', {
+                    'evidence_ids': ids, 'subject': subject, 'object': target,
+                    'relation': link['predicate'], 'known_at': _text(link.get('known_at'), 80),
+                    'status': 'requires_source_check',
+                    'scope': 'Saved source link; read originals for exact scope and qualifications.',
+                }, artifact_id, observation_id))
         for conflict in obj.get('conflicts', [])[:80] if isinstance(obj.get('conflicts'), list) else []:
             if not isinstance(conflict, dict):
                 continue
             ids = _ids(conflict.get('evidence_ids', []))
-            if len(ids) < 2:
+            if len(ids) < 2 or frozenset(ids) in source_relationships:
                 continue
             body = {'evidence_ids': ids, 'status': 'unresolved',
                 'relation': _text(conflict.get('relation') or 'unresolved'),

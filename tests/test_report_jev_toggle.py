@@ -88,8 +88,9 @@ class ReportJevToggleTests(unittest.TestCase):
             self.assertEqual(response.status_code,200,response.text)
             self.assertTrue(response.json()['jev_assistance_requested'])
 
-    def run_report(self,enabled):
-        status=self.start_without_thread(jev_assistance=enabled)
+    def run_report(self,enabled,*,prompt='Generate an ETH report'):
+        with patch('research_agent.runtime.utcnow',return_value='2026-11-20T00:00:00Z'):
+            status=self.start_without_thread(jev_assistance=enabled,prompt=prompt)
         job_dir=self.directory/'jobs'/status['job_id'];services=[];packets=[]
         build=self.runtime.build_research_tools
         def make_service(*args,**kwargs):
@@ -112,6 +113,7 @@ class ReportJevToggleTests(unittest.TestCase):
              patch.object(self.runtime,'build_judgment_service',side_effect=AssertionError('Legacy optional sidecar forbidden on reports')), \
              patch.object(self.runtime,'build_research_tools',side_effect=make_service), \
              patch.object(self.runtime,'user_research_context',return_value=''), \
+             patch.object(self.runtime,'_user_research_lookup',return_value={}), \
              patch('research_agent.runtime.ResearchSDKServer',return_value=fake_server), \
              patch('research_agent.runtime.create_deep_agent',return_value=fake_graph), \
              patch('research_agent.evidence_judgments.EvidenceJudgmentService',return_value=judgment) as constructor:
@@ -147,6 +149,16 @@ class ReportJevToggleTests(unittest.TestCase):
         self.assertEqual(packet['selection']['policy'],'passage_hybrid_jev_rank')
         self.assertEqual(packet['selection']['semantic_scores_used'],1)
         self.assertTrue(service.run_metadata['jev_assistance_requested'])
+
+    def test_periodic_reranking_receives_host_report_scope_and_separate_retrieval_bounds(self):
+        _,_,judgment,_,_=self.run_report(
+            True,prompt='Generate an ETH research report for 2026-09-29 to 2026-10-08 UTC.')
+        scope=judgment.assess.call_args.kwargs['research_task']
+        self.assertEqual(scope['report_scope_source'],'host_structured_scope')
+        self.assertEqual(scope['asset'],'ETH')
+        self.assertEqual(scope['report_start_inclusive'],'2026-09-29T00:00:00Z')
+        self.assertEqual(scope['report_end_exclusive'],'2026-10-08T00:00:00Z')
+        self.assertEqual(scope['retrieval_window']['start_inclusive'],'2026-10-01T00:00:00Z')
 
 
 if __name__=='__main__':unittest.main()

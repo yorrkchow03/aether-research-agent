@@ -18,7 +18,8 @@ from typing import Annotated, Literal
 from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware
 from langchain.agents.middleware.types import ModelResponse
-from langchain.agents.structured_output import ToolStrategy
+from langchain.agents.structured_output import StructuredOutputValidationError, ToolStrategy
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, message_to_dict
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import tool
@@ -51,7 +52,7 @@ class _ReaderFindingEnvelope(ReaderFinding):
 
 class _ReaderEnvelope(ReaderResult):
     """Bounded parser allowance, not a larger parent-context contract."""
-    findings:list[_ReaderFindingEnvelope]=Field(default_factory=list,max_length=6)
+    findings:list[_ReaderFindingEnvelope]=Field(default_factory=list,max_length=12)
     conflicts:list[Annotated[str,Field(max_length=2000)]]=Field(default_factory=list,max_length=4)
     gaps:list[Annotated[str,Field(max_length=2000)]]=Field(default_factory=list,max_length=6)
 
@@ -65,13 +66,17 @@ def project_reader_result(payload,service,read_ids):
     and long conflict/gap details; no source prose is truncated or paraphrased.
     """
     raw=_ReaderEnvelope.model_validate(payload).model_dump()
-    selected=[];omitted=[];rejected=[]
+    selected=[];omitted=[];rejected=[];overflow=0
     for i,finding in enumerate(raw['findings']):
         try:
             for offset in range(0,len(finding['citations']),3):
                 validate_reader_result({'findings':[{**finding,'citations':finding['citations'][offset:offset+3]}]},service,read_ids)
         except ValueError as exc:
             rejected.append({'path':f'/findings/{i}','reason':str(exc)[:200]})
+            continue
+        if len(selected) >= 6:
+            overflow += 1
+            omitted.append(f'/findings/{i}')
             continue
         selected.append({**finding,'citations':finding['citations'][:3]})
         omitted.extend(f'/findings/{i}/citations/{j}' for j in range(3,len(finding['citations'])))
@@ -89,11 +94,30 @@ def project_reader_result(payload,service,read_ids):
         result['rejected_findings']=rejected
         if len(result['gaps'])<6:result['gaps'].append('Some proposed findings failed exact opened-source checks and were excluded. Details remain in the debug trace; the returned findings are partial coverage.')
     if omitted:result['details_in_artifact']=omitted
+    if overflow:result['schema_omitted_finding_count']=overflow
     return result
 
 
 class _ProjectedReaderResult(Exception):
     def __init__(self,result,ai_message=None):self.result,self.ai_message=result,ai_message
+
+
+class _ReaderResponseCapture(BaseCallbackHandler):
+    """Bind fallback payloads to the current worker model request."""
+    def begin_attempt(self):
+        self.run_id = None
+        self.message = None
+
+    def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs):
+        self.run_id = run_id
+
+    def on_llm_end(self, response, *, run_id, **kwargs):
+        if run_id != self.run_id:
+            return
+        generations = response.generations
+        generation = generations[0][0] if generations and generations[0] else None
+        message = getattr(generation, 'message', None)
+        self.message = message if isinstance(message, AIMessage) else None
 
 
 def _reader_paths(workspace,identifier):
@@ -155,6 +179,20 @@ def _raw_reader_payloads(records):
     return payloads
 
 
+def _raw_payload_index(records, checked_payload):
+    # Typed LangChain responses can supply schema defaults absent on the wire.
+    bounded = _ReaderEnvelope.model_validate(checked_payload).model_dump()
+    payloads = _raw_reader_payloads(records)
+    for index in range(len(payloads)-1, -1, -1):
+        try:
+            canonical = _ReaderEnvelope.model_validate(payloads[index]).model_dump()
+        except ValueError:
+            continue
+        if canonical == bounded:
+            return index
+    return None
+
+
 def write_reader_artifacts(workspace,identifier,receipt,redact=str):
     """Separate parent-facing validated results/ranges from complete diagnostics.
 
@@ -181,10 +219,6 @@ def write_reader_artifacts(workspace,identifier,receipt,redact=str):
     result.update(artifact=result_path,navigation_artifact=navigation_path,debug_trace=trace_path,
         next_read={'file_path':result_path,'limit':1000,
             'scope':'Complete bounded validated findings; intermediate tool/model trace is excluded.'})
-    if (result.get('details_in_artifact') or result.get('rejected_findings')) and trace['raw_result_payloads']:
-        result['details_artifact']={'path':trace_path,
-            'json_pointer':'/raw_result_payloads/'+str(len(trace['raw_result_payloads'])-1),
-            'scope':'details_in_artifact and rejected_findings paths are relative to this raw model payload; omitted/rejected content is not a validated finding.'}
     for name,payload in (('validated-result',result),('navigation',navigation),('trace',trace)):
         path=paths[name];temporary=path.with_suffix('.tmp')
         temporary.write_text(redact(json.dumps(payload,ensure_ascii=False,indent=2)))
@@ -227,11 +261,14 @@ do not turn the parent's checklist into a long dossier. Retrieve enough distinct
 sources for the delegated topic. Each finding has at most THREE citations;
 conflicts are at most four strings of 400 characters each, gaps at most six strings
 of 400 characters. Prefer fewer findings and quotes to repeating the same facts.
-Do not summarize each passage separately. Reuse
-the exact relevant passages and open surrounding original context where needed.
-Do not quote omitted text or
-cite a source you have not opened with read_evidence. The main author must still
-verify originals through the existing publication gate.'''
+Do not summarize each passage separately. Open surrounding original context when needed.
+Each citation quote must be one short contiguous string copied exactly from a slice
+returned by read_evidence, in its original language and punctuation. Never add
+ellipsis characters (... or …), surrounding quotation marks, translations or joined
+fragments. When two separate phrases are needed, use separate citations. If a quote
+is too long, choose a shorter contiguous substring. A short exact quote is better
+than a rewritten sentence. Cite only originals opened with read_evidence. The
+main author must still verify originals through the existing publication gate.'''
 
 
 def validate_reader_result(payload,service,read_ids):
@@ -270,13 +307,21 @@ class ReaderAccessError(ValueError):
     """Access failures terminate the worker; argument errors may be repaired."""
 
 
+class ReaderNoProgressError(RuntimeError):
+    """The worker retried a call that it had already been told to skip."""
+
+
 class _ReaderBudget(AgentMiddleware):
-    def __init__(self,emit,cancel,identifier,persist=lambda:None):
+    def __init__(self,emit,cancel,identifier,persist=lambda:None,*,working=None,job_id=None,question_id=None,response_capture=None):
         self.emit,self.cancel,self.identifier=emit,cancel,identifier
+        self.response_capture=response_capture
         self.calls=0;self.source_calls=0;self.start=perf_counter()
         self.records=[];self.messages=[];self.model_requests={}
         self.transport_retries=0;self.request_count=0
         self.persist=persist;self.lock=RLock()
+        self.working,self.job_id,self.question_id=working,job_id,question_id
+        self.attempted_signatures=set()
+        self.blocked_signatures=set()
 
     def record(self,value,*,messages=None,append_messages=None):
         with self.lock:
@@ -317,6 +362,8 @@ class _ReaderBudget(AgentMiddleware):
             self.record({'kind':'model_requested','round':round_number,'request_id':request_id,'attempt':attempt},messages=list(messages))
             self.emit('reader_model_started',{'reader_id':self.identifier,'round':round_number,
                 'request_id':request_id,'transport_retry':attempt>1})
+            if self.response_capture is not None:
+                self.response_capture.begin_attempt()
             try:result=handler(request)
             except Exception as exc:
                 # Structured-output handling can reject/project a complete AI
@@ -365,23 +412,78 @@ class _ReaderBudget(AgentMiddleware):
         if deferred_error is not None:raise deferred_error
         return result
 
+    def _check_repeated_source_call(self, call):
+        if not self.question_id:
+            return None
+        from .question_progress import describe_attempt, repeat_decision
+        attempt=describe_attempt(call['name'],call.get('args',{}))
+        if attempt is None:
+            return None
+        signature=attempt['signature']
+        # A Reader may cite only spans returned to this worker. A previous
+        # branch's read receipt must never prevent this worker opening its own.
+        with self.lock:
+            first_read=call['name']=='read_evidence' and signature not in self.attempted_signatures
+        if first_read:
+            return attempt
+        try:
+            question=self.working.get_question(self.job_id,self.question_id)
+            decision=repeat_decision(attempt,question.get('attempts',[]))
+        except Exception as exc:
+            self.emit('reader_question_tracking_error',{'reader_id':self.identifier,'error_type':type(exc).__name__})
+            return attempt
+        if decision is None:
+            return attempt
+        self.record({'kind':'tool_declined','call_id':call['id'],**decision})
+        self.emit('reader_no_progress',{'reader_id':self.identifier,'question_id':self.question_id,**decision})
+        with self.lock:
+            if signature in self.blocked_signatures:
+                raise ReaderNoProgressError('Reader repeated a declined evidence call; preserve the opened ranges and the unresolved gap')
+            self.blocked_signatures.add(signature)
+        return ToolMessage(name=call['name'],tool_call_id=call['id'],status='error',
+            content=json.dumps(decision,ensure_ascii=False))
+
+    def _record_source_outcome(self, call, attempt, payload, status):
+        if attempt is None:
+            return
+        with self.lock:
+            self.attempted_signatures.add(attempt['signature'])
+        try:
+            if call['name']=='recall_memory' and isinstance(payload,str):
+                view=json.loads(payload)
+                if isinstance(view,dict) and view.get('view') in ('passage-tool-view-v1','progressive-tool-view-v3'):
+                    receipt=self.working.read_artifact(self.job_id,view['artifact']['artifact_id'])
+                    payload=receipt['text']
+            self.working.record_question_result(self.job_id,self.question_id,call['name'],call.get('args',{}),
+                payload,status=status,tool_call_id=f'reader-{self.identifier}:{call["id"]}')
+        except Exception as exc:
+            self.emit('reader_question_tracking_error',{'reader_id':self.identifier,'error_type':type(exc).__name__})
+
     def wrap_tool_call(self,request,handler):
         self.check()
+        call=request.tool_call
+        attempt=self._check_repeated_source_call(call)
+        if isinstance(attempt,ToolMessage):
+            return attempt
         with self.lock:
             if self.source_calls>=48:raise RuntimeError('Evidence reading source-call budget reached')
             self.source_calls+=1
-        self.record({'kind':'tool_requested','call':request.tool_call})
+        self.record({'kind':'tool_requested','call':call})
         try:
             result=handler(request)
         except (ValueError,KeyError,FileNotFoundError) as exc:
-            if isinstance(exc,ReaderAccessError):raise
-            result=ToolMessage(name=request.tool_call['name'],tool_call_id=request.tool_call['id'],
+            if isinstance(exc,ReaderAccessError):
+                self._record_source_outcome(call,attempt,{'error':str(exc)},'error')
+                raise
+            result=ToolMessage(name=call['name'],tool_call_id=call['id'],
                 status='error',content=json.dumps({'status':'error','error':str(exc)[:900],
                 'repair':'Correct the arguments and retry. Use query OR full_text=True, never both. Failed reads authorize no citations; inaccessible material remains a gap.'}))
         serialized=[message_to_dict(result)] if isinstance(result,ToolMessage) else []
-        self.record({'kind':'tool_result','call_id':request.tool_call['id'],
-            'status':getattr(result,'status','success'),
-            'content':getattr(result,'content',str(result))},append_messages=serialized)
+        status=getattr(result,'status','success')
+        payload=getattr(result,'content',str(result))
+        self.record({'kind':'tool_result','call_id':call['id'],
+            'status':status,'content':payload},append_messages=serialized)
+        self._record_source_outcome(call,attempt,payload,status)
         return result
 
 
@@ -425,6 +527,20 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
             invocations+=1
             if invocations>3:
                 return {'messages':[AIMessage(content='{"findings":[],"gaps":["Reader delegation limit reached; reuse saved evidence."]}') ]}
+        working=getattr(service,'working_memory',None)
+        job_id=getattr(service,'job_id',None)
+        question_id=None
+        if working and job_id and hasattr(working,'get_question'):
+            from .question_tracking import question_tag
+            question_id=question_tag(state['messages'][0].content)
+            if question_id:
+                try:
+                    working.get_question(job_id,question_id)
+                except KeyError:
+                    question_id=None
+                except Exception as exc:
+                    emit('reader_question_tracking_error',{'error_type':type(exc).__name__})
+                    question_id=None
         identifier=uuid4().hex;started=perf_counter();read_ids={}
         _reader_paths(workspace,identifier)
         result_path=_reader_virtual_path(identifier,'validated-result')
@@ -456,13 +572,16 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
         @tool('recall_memory')
         def recall(query:str,start:str|None=None,end:str|None=None,max_results:int|None=None,
                    kind:Literal['news']='news',asset:Literal['ETH']='ETH',original_only:bool=True,
-                   as_of:str|None=None)->str:
-            """Search saved public ETH news. For a weekly/monthly review supply explicit UTC start/end. Returned excerpts are navigation; open originals before citing."""
-            if not public_text(query):raise ReaderAccessError('Reader search must describe public research only')
+                   as_of:str|None=None,facet_queries:list[str]|None=None)->str:
+            """Search saved public ETH news. Use facet_queries to group several distinct public questions within the assigned topic. For a weekly/monthly review supply explicit UTC start/end. Returned excerpts are navigation; open originals before citing."""
+            from .facet_memory import normalize_facets
+            facets=normalize_facets(facet_queries)
+            if not public_text(query) or any(not public_text(facet) for facet in facets):
+                raise ReaderAccessError('Reader search must describe public research only')
             if max_results is not None and (isinstance(max_results,bool) or not 1<=max_results<=64):
                 raise ValueError('max_results must be 1..64 or omitted for an adaptive passage count')
             packet=service.news_pack(query=query,asset=asset,cutoff=as_of,start=start,end=end,
-                limit=max_results,material_only=True,original_only=original_only)
+                limit=max_results,material_only=True,original_only=original_only,facet_queries=facets)
             working=getattr(service,'working_memory',None)
             text=json.dumps(packet,ensure_ascii=False)
             if working:
@@ -491,7 +610,9 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
                     'sha256':s['sha256'],'text':text[s['start']:s['end']]} for s in view['source_slices'])
             return json.dumps(view,ensure_ascii=False)
 
-        budget=_ReaderBudget(emit,cancel,identifier,persist=persist)
+        capture=_ReaderResponseCapture()
+        budget=_ReaderBudget(emit,cancel,identifier,persist=persist,working=working,job_id=job_id,
+                             question_id=question_id,response_capture=capture)
         reader_model=model
         if getattr(model,'root_client',None) is not None:
             client=model.root_client.with_options(timeout=40,max_retries=0)
@@ -503,10 +624,13 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
         emit('reader_started',{'reader_id':identifier,'artifact':result_path,'debug_trace':trace_path})
         persist()
         result_repairs=0
+        checked_payload=None
         def checked_output(payload):
+            nonlocal checked_payload
             value=project_reader_result(payload,service,read_ids)
             if not value.get('findings') and not read_ids and budget.source_calls==0:
                 raise ValueError('No source inspection was performed. First read the supplied canonical originals or search for a concrete missing source; if inaccessible, explain the actual failure. Pending source reads are not completed work. Do not invent findings.')
+            checked_payload=payload
             return value
 
         def completion_status(value):
@@ -528,19 +652,26 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
             if not read_ids and budget.source_calls==0:
                 return ('No source tool has run. Call read_evidence now on a supplied canonical ID, '
                     'or recall_memory for a concrete missing source. Do not return another promise or empty final result. ')
-            return 'Correct the result using already opened originals; do not repeat a read unless a specific missing quote is essential. '
+            return ('Reuse the already opened originals. Copy one short continuous quote exactly as shown in each opened slice. '
+                    'Do not add ellipses or quotation marks, join fragments, or translate the quote. '
+                    'Only reopen an original if a specific quote is missing. ')
 
         def repair_schema(exc):
             nonlocal result_repairs
             message=getattr(exc,'ai_message',None)
-            calls=[call for call in getattr(message,'tool_calls',[]) if call['name']=='ReaderResult']
-            if len(calls)==1:
+            if message is None and isinstance(exc,StructuredOutputValidationError) and exc.tool_name=='ReaderResult':
+                message=capture.message
+            calls=getattr(message,'tool_calls',[])
+            validation_error=exc
+            if (len(calls)==1 and calls[0]['name']=='ReaderResult' and not getattr(message,'invalid_tool_calls',[])
+                    and message.response_metadata.get('finish_reason')!='length'):
                 try:projected=checked_output(calls[0]['args'])
-                except ValueError:pass
+                except ValueError as projection_error:
+                    validation_error=projection_error
                 else:raise _ProjectedReaderResult(projected,message)
-            if result_repairs>=1:raise exc
+            if result_repairs>=1:raise validation_error
             result_repairs+=1
-            error=redact(str(exc))[:2400]
+            error=redact(str(validation_error))[:2400]
             budget.record({'kind':'result_repair','error':error})
             emit('reader_result_repair',{'reader_id':identifier,'attempt':1,'error':error})
             return 'Correct the strict ReaderResult schema once. '+source_repair_instruction()+'Prefer 2-3 key findings; at most 6 findings, 3 exact citations per finding; conflict/gap strings <=400 characters. '+error
@@ -549,7 +680,7 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
                 response_format=ToolStrategy(ReaderResult,handle_errors=repair_schema))
             messages=state['messages']
             for repair in range(2):
-                try:result=agent.invoke({'messages':messages},config={'recursion_limit':24})
+                try:result=agent.invoke({'messages':messages},config={'recursion_limit':24,'callbacks':[capture]})
                 except _ProjectedReaderResult as projected:
                     output=projected.result
                     break
@@ -586,10 +717,11 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
                 opened_source_catalog={'file_path':result_path,'json_pointer':'/opened_source_catalog',
                     'scope':'Opened-source metadata only; relevance is not validated.'},
                 review_scope='Finding quotes are identity-checked, not semantically reviewed. Conflicts and gaps are unbound model notes; verify originals.')
-            raw_payloads=_raw_reader_payloads(budget.records)
-            if (output.get('details_in_artifact') or output.get('rejected_findings')) and raw_payloads:
-                output['details_artifact']={'path':trace_path,'json_pointer':'/raw_result_payloads/'+str(len(raw_payloads)-1),
-                    'scope':'Omitted/rejected schema paths refer to this raw payload; it is debug-only, not validated findings.'}
+            if output.get('details_in_artifact') or output.get('rejected_findings'):
+                index=_raw_payload_index(budget.records,checked_payload)
+                if index is not None:
+                    output['details_artifact']={'path':trace_path,'json_pointer':'/raw_result_payloads/'+str(index),
+                        'scope':'Omitted/rejected schema paths refer to this raw payload; it is debug-only, not delivered findings.'}
             full_validated_output=json.loads(json.dumps(output,ensure_ascii=False))
             _compact_reader_output(output)
         except Exception as exc:
@@ -607,10 +739,11 @@ def build_evidence_reader(model,service,workspace,emit=lambda *_:None,cancel=Non
             budget.record({'kind':'worker_failure','error_type':type(exc).__name__,'error':str(exc)[:1800]})
         counts={'opened_source_count':len(read_ids),
             'validated_finding_count':len((full_validated_output or {}).get('findings',[])),
-            'omitted_finding_count':output.get('omitted_findings',0)}
+            'omitted_finding_count':output.get('omitted_findings',0)+output.get('schema_omitted_finding_count',0)}
         output.update(counts)
         if full_validated_output is not None:
-            full_validated_output.update(counts,omitted_finding_count=0)
+            full_validated_output.update(counts,
+                omitted_finding_count=full_validated_output.get('schema_omitted_finding_count',0))
         receipt=persist()
         emit('reader_finished',{k:receipt[k] for k in ('model_calls','tool_calls','latency_seconds',
             'transport_retries','unknown_usage_attempts')}|{'reader_id':identifier,'status':output['status'],

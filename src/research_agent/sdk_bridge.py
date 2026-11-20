@@ -9,6 +9,9 @@ import threading
 import uuid
 from pathlib import Path
 
+from .question_tracking import guard_question_call
+from .research_state import SOURCE_SDK
+
 
 class ResearchSDKServer:
     """Own one local connection point for a job; never expose LLM credentials.
@@ -27,6 +30,37 @@ class ResearchSDKServer:
         self.directory = tempfile.TemporaryDirectory(prefix='aether-sdk-', dir='/tmp')
         self.path = str(Path(self.directory.name) / 'research.sock')
 
+    def _question_for(self, operation, question_id, working, job_id):
+        if operation not in SOURCE_SDK:
+            raise ValueError('question_id can be used only with SDK source operations')
+        if not isinstance(question_id, str):
+            raise ValueError('Supply a saved question_id, or omit it for an unscoped lookup')
+        if question_id == 'shared':
+            return None
+        if not working or not job_id:
+            raise ValueError('Task research questions are unavailable in this SDK session')
+        return working.get_question(job_id, question_id)
+
+    def _observe_result(self, working, job_id, event, arguments, payload, status):
+        if not working or not job_id:
+            return
+        try:
+            working.observe_tool(job_id, event['name'], payload, status=status, tool_call_id=event['call_id'])
+        except Exception as exc:
+            if self.service.event_sink:
+                self.service.event_sink('working_memory_error', {'stage': 'sdk_result', 'error_type': type(exc).__name__})
+        if 'question_id' in event:
+            try:
+                receipt = working.record_question_result(job_id, event['question_id'], event['name'], arguments,
+                    payload, status=status, tool_call_id=event['call_id'])
+            except Exception as exc:
+                if self.service.event_sink:
+                    self.service.event_sink('working_memory_error', {'stage': 'sdk_question_result', 'error_type': type(exc).__name__})
+            else:
+                if self.service.event_sink:
+                    self.service.event_sink('research_question_recorded', {**event, 'tool': event['name'],
+                        'question_status': receipt['question_status']})
+
     def start(self):
         owner = self
 
@@ -34,6 +68,9 @@ class ResearchSDKServer:
             def handle(self):
                 self.connection.settimeout(115)
                 event = {'name': 'research_sdk', 'call_id': 'sdk-' + uuid.uuid4().hex}
+                working = getattr(owner.service, 'working_memory', None)
+                job_id = getattr(owner.service, 'job_id', None)
+                arguments = {}
                 try:
                     body = self.rfile.readline(65537)
                     if len(body) > 65536 or not body.endswith(b'\n'):
@@ -49,21 +86,28 @@ class ResearchSDKServer:
                     if owner.service.event_sink:
                         owner.service.event_sink('tool_started', {**event,
                             'arguments_preview': owner.settings.redact(json.dumps(arguments))[:2500]})
-                    result = owner.service.sdk_call(operation, arguments)
-                    working=getattr(owner.service,'working_memory',None);job_id=getattr(owner.service,'job_id',None)
-                    if working and job_id:
-                        try:working.observe_tool(job_id,event['name'],result,tool_call_id=event['call_id'])
-                        except Exception as exc:
-                            if owner.service.event_sink:owner.service.event_sink('working_memory_error',{'stage':'sdk_result','error_type':type(exc).__name__})
+                    arguments = dict(arguments)
+                    question = (owner._question_for(operation, arguments.pop('question_id'), working, job_id)
+                                if 'question_id' in arguments else None)
+                    blocked = None
+                    if question:
+                        event['question_id'] = question['question_id']
+                        blocked = guard_question_call(question, {**event, 'args': arguments})
+                    if blocked:
+                        if owner.service.event_sink:
+                            owner.service.event_sink('question_no_progress', {**event, **blocked})
+                        result, status = blocked, 'skipped'
+                    else:
+                        result = owner.service.sdk_call(operation, arguments)
+                        status = 'success'
+                        owner._observe_result(working, job_id, event, arguments, result, status)
                     packet = {'ok': True, 'result': result}
                     if owner.service.event_sink:
-                        owner.service.event_sink('tool_finished', {**event, 'status': 'success'})
+                        owner.service.event_sink('tool_finished', {**event, 'status': status})
                 except Exception as exc:
-                    error = owner.settings.redact(str(exc))[:2000]
-                    working=getattr(owner.service,'working_memory',None);job_id=getattr(owner.service,'job_id',None)
-                    if working and job_id:
-                        try:working.observe_tool(job_id,event['name'],{'status':'error','error':owner.settings.redact(str(exc))},status='error',tool_call_id=event['call_id'])
-                        except Exception:pass
+                    safe_error = owner.settings.redact(str(exc))
+                    error = safe_error[:2000]
+                    owner._observe_result(working, job_id, event, arguments, {'status': 'error', 'error': safe_error}, 'error')
                     packet = {'ok': False, 'error': error}
                     if owner.service.event_sink:
                         owner.service.event_sink('tool_failed', {**event, 'error': error})

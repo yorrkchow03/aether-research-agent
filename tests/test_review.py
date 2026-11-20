@@ -6,11 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 from research_agent.review import check_review, evidence_text, review_targets,exact_source_quote,quote_index,hydrate_review
-from research_agent.reports import ReportDraft
+from research_agent.reports import ReportDraft, validate_report
 from research_agent.runtime import AgentRuntime
 from research_agent.tools import ResearchTools
 from research_agent.settings import Settings
-from research_agent.review import EvidenceReviewer
+from research_agent.review import EvidenceReviewer, _review_calendar
 
 class ReviewTests(unittest.TestCase):
  def setUp(self):
@@ -59,6 +59,21 @@ class ReviewTests(unittest.TestCase):
  def test_saved_evidence_context_preserves_units_and_dates(self):
   text=evidence_text({'record_id':'r','values':{'rate_fraction':'0.01'},'units':{'rate_fraction':'fraction'},'observed_at':'2026-10-14T00:00:00Z','retrieved_at':'2026-10-15T00:00:00Z','series':list(range(30))})
   obj=json.loads(text);self.assertEqual(obj['units']['rate_fraction'],'fraction');self.assertEqual(len(obj['series_latest_observations']),10)
+ def test_review_calendar_verifies_weekdays_and_ignores_invalid_dates(self):
+  calendar=_review_calendar([{'statement':'Announced on 2026-09-16; saved URL /2026/09/17/. 2026-02-29 is invalid.'}])
+  self.assertEqual(calendar,{'2026-09-15':'Tuesday','2026-09-16':'Wednesday',
+    '2026-09-17':'Thursday','2026-09-18':'Friday'})
+  self.assertEqual(_review_calendar([{'statement':'Wednesday and later.'}]),{})
+ def test_review_has_a_third_round_only_with_enough_physical_requests(self):
+  expected={2:1,3:2,4:2,5:2,6:3,8:3,12:3}
+  self.assertEqual({n:EvidenceReviewer(Settings(),max_requests=n).max_rounds for n in expected},expected)
+ def test_explicit_weekday_label_must_match_before_source_review(self):
+  self.draft.observations[0].statement='2026-09-17 (Wednesday) — The committee raised rates.'
+  with self.assertRaisesRegex(ValueError,'/observations/0/statement.*2026-09-17 falls on Thursday'):
+   validate_report(self.draft,lambda _:self.fail('Fail fast on a contradictory calendar label'))
+  self.draft.observations[0].statement='2026-09-16 (Wednesday) — The committee raised rates.'
+  result=validate_report(self.draft,lambda _:{})
+  self.assertEqual(result['calendar_labels_checked'],1)
  def test_actual_multiline_source_quote_is_not_confused_with_json_escaping(self):
   s=json.dumps({'text':'升级状态\n在开发网上进行测试\n日期尚未确认'},ensure_ascii=False)
   self.assertTrue(exact_source_quote('在开发网上进行测试\n日期尚未确认',s))

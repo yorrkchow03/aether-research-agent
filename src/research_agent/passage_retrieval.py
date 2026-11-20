@@ -6,6 +6,7 @@ evidence IDs remain source IDs; passage IDs only identify offsets within them.
 """
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import closing
 import hashlib
 import math
@@ -13,8 +14,10 @@ import re
 import sqlite3
 
 from research_data.http import utcnow
+from research_data.library.relations import normalized_text
 from research_data.library.time import timestamp
 from .knowledge import _diverse_news, canonical_url, identify_assets, news_coverage, source_content_fingerprint
+from .facet_memory import LINEAGE_RELATIONS, UPDATE_RELATIONS, choose_facets, normalize_facets, source_origins
 
 
 VERSION = 'exact-passage-bm25-potion-rrf-v1'
@@ -59,8 +62,8 @@ def _han_terms(text):
     return ' '.join(term for term in _terms(text) if re.search(r'[\u3400-\u9fff]', term))
 
 
-def _keyword(passages, query):
-    terms = _terms(query)[:80]
+def _keyword(passages, query, *, terms=None):
+    terms = (_terms(query) if terms is None else terms)[:80]
     if not terms:
         return []
     with closing(sqlite3.connect(':memory:')) as db:
@@ -72,6 +75,21 @@ def _keyword(passages, query):
         return [(pid,float(score)) for pid,score in db.execute(
             'SELECT passage_id,bm25(passages,0,2,1,1) FROM passages WHERE passages MATCH ? '
             'ORDER BY bm25(passages,0,2,1,1),passage_id',(match,))]
+
+
+def _facet_rankings(passages, facets):
+    terms_by_facet=[_terms(facet) for facet in facets]
+    counts=Counter(term for terms in terms_by_facet for term in terms)
+    rankings=[]
+    for facet,terms in zip(facets,terms_by_facet):
+        distinctive=[term for term in terms if counts[term]==1]
+        qualifying=set(pid for pid,_ in _keyword(passages,facet,terms=distinctive)) if distinctive else set()
+        # Shared words can affect order, but cannot establish a distinct
+        # facet candidate when only the shared vocabulary matched.
+        ranking=[pid for pid,_ in _keyword(passages,facet)
+                 if not distinctive or pid in qualifying]
+        rankings.append(ranking)
+    return rankings
 
 
 def _source_catalog(row):
@@ -282,7 +300,9 @@ def _rerank(order, by_id, query, judge, max_judgments, start, end, research_task
 
 def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_chars=None,
                       judge=None, max_judgments=32, cutoff=None, mode='observed',
-                      start=None,end=None,dependencies=None,relations=None,asset='ALL',research_task=None,acquisition_cutoff=None):
+                      start=None,end=None,dependencies=None,relations=None,asset='ALL',research_task=None,
+                      acquisition_cutoff=None,facet_queries=None,prioritize_facet_relations=True,
+                      include_scout_catalog=False):
     """Rank independent exact passages; preserve canonical citation provenance.
 
     ``sources`` are reopened canonical originals, including independent dense
@@ -294,6 +314,7 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
         raise ValueError('Invalid passage availability/asset mode')
     if not isinstance(query,str) or len(query)>2000 or isinstance(max_judgments,bool) or not isinstance(max_judgments,int) or not 0<=max_judgments<=64:
         raise ValueError('Invalid passage query/judgment bounds')
+    facets=normalize_facets(facet_queries)
     cutoff=cutoff or utcnow()
     if start and end and timestamp(start)>=timestamp(end):raise ValueError('Passage start must precede end')
     if end and timestamp(end)>timestamp(cutoff):raise ValueError('Passage end cannot exceed cutoff')
@@ -339,8 +360,9 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
     # Source-level relationship closure preserves one best exact passage for
     # every endpoint, without pretending that a relationship is proved by it.
     links={rid:set(ids) for rid,ids in (dependencies or {}).items()}
+    visible=[];eligible_source_ids={row['record_id'] for row in sources}
     for relation in relations or []:
-        if relation.get('predicate') not in _RELATIONS:continue
+        if relation.get('predicate') not in _RELATIONS | LINEAGE_RELATIONS:continue
         if acquisition_cutoff:
             try:
                 if not relation.get('known_at') or timestamp(relation['known_at'])>timestamp(acquisition_cutoff):continue
@@ -350,7 +372,9 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
                 if not relation.get('known_at') or timestamp(relation['known_at'])>timestamp(cutoff):continue
             except (ValueError,TypeError,OverflowError):continue
         left,right=relation.get('subject'),relation.get('object')
-        if left and right:
+        if left in eligible_source_ids and right in eligible_source_ids:
+            visible.append({key:relation[key] for key in ('subject','predicate','object','known_at') if key in relation})
+        if left and right and relation.get('predicate') in _RELATIONS:
             links.setdefault(left,set()).add(right);links.setdefault(right,set()).add(left)
     for rid,partners in list(links.items()):
         for other in partners:links.setdefault(other,set()).add(rid)
@@ -359,24 +383,63 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
     # Dependency endpoints that had no query hit remain available as explicitly
     # linked contrary/correcting context, never as claimed independent matches.
     for p in passages:best.setdefault(p['record_id'],p['passage_id'])
-    selected=[];seen=set();body_chars=0;protected_groups=[]
-    for pid in ordered:
-        if pid in seen:continue
+    def bundle(pid):
         rid=by_id[pid]['record_id'];group={rid};pending=[rid]
         while pending:
             for other in links.get(pending.pop(),set()):
                 if other not in group:group.add(other);pending.append(other)
+        related=sorted(group)
         if group-set(best):
-            gaps.append({'reason':'related_evidence_endpoint_unavailable','evidence_ids':sorted(group)});continue
-        addition=[pid]+[best[other] for other in sorted(group-{rid})]
-        addition=list(dict.fromkeys(p for p in addition if p not in seen))
-        cost=sum(len(by_id[p]['excerpt']) for p in addition)
-        if len(selected)+len(addition)>limit or body_chars+cost>budget_chars:
-            if len(group)>1:gaps.append({'reason':'related_evidence_group_exceeds_context','evidence_ids':sorted(group)})
-            continue
-        selected.extend(addition);seen.update(addition);body_chars+=cost
-        if len(group)>1 and sorted(group) not in protected_groups:protected_groups.append(sorted(group))
-        if len(selected)>=limit:break
+            return related,[]
+        return related,list(dict.fromkeys([pid]+[best[other] for other in sorted(group-{rid})]))
+
+    memory_bundles=None
+    if facets:
+        candidate_rows=[by_id[pid] for pid in ordered]
+        facet_orders=_facet_rankings(candidate_rows,facets)
+        identities=[]
+        for row in sources:
+            text=normalized_text(row['text'])
+            identities.append({**_source_catalog(row), 'document_id':row.get('document_id'),
+                               'source_body_sha256':_sha(text) if len(text)>=500 else None})
+        origins=source_origins(identities,visible)
+        updates=[link for link in visible if link['predicate'] in UPDATE_RELATIONS]
+        pairs=[(link['subject'],link['object']) for link in updates]
+        selected,body_chars,protected_groups,memberships,misses=choose_facets(
+            ordered,by_id,facet_orders,origins,bundle,limit=limit,budget_chars=budget_chars,
+            relation_pairs=pairs,prioritize_updates=prioritize_facet_relations)
+        for group,reason in misses:
+            if list(group) not in protected_groups:
+                gaps.append({'reason':reason,'evidence_ids':list(group)})
+        seen=set(selected)
+        chosen_sources={by_id[pid]['record_id'] for pid in selected}
+        memory_bundles={
+            'facets':[{'question':facet,'passage_ids':memberships[i],
+                       'state':'candidate_evidence' if memberships[i] else 'no_candidate_selected'}
+                      for i,facet in enumerate(facets)],
+            'source_origins':{rid:origins[rid] for rid in sorted(chosen_sources)},
+            'relations':[link for link in visible
+                         if link['subject'] in chosen_sources and link['object'] in chosen_sources
+                         and link['predicate'] in _RELATIONS] if prioritize_facet_relations else [],
+            'scope':'Facet matches and known source links guide writing. A linked source may need a focused '
+                    'original read to locate the exact qualification. A correction affects only the claim '
+                    'and scope it addresses. Retain unresolved differences.'
+        }
+    else:
+        selected=[];seen=set();body_chars=0;protected_groups=[]
+        for pid in ordered:
+            if pid in seen:continue
+            group,members=bundle(pid)
+            if not members:
+                gaps.append({'reason':'related_evidence_endpoint_unavailable','evidence_ids':group});continue
+            addition=[candidate for candidate in members if candidate not in seen]
+            cost=sum(len(by_id[p]['excerpt']) for p in addition)
+            if len(selected)+len(addition)>limit or body_chars+cost>budget_chars:
+                if len(group)>1:gaps.append({'reason':'related_evidence_group_exceeds_context','evidence_ids':group})
+                continue
+            selected.extend(addition);seen.update(addition);body_chars+=cost
+            if len(group)>1 and group not in protected_groups:protected_groups.append(group)
+            if len(selected)>=limit:break
     result=[by_id[pid] for pid in selected];source_ids=list(dict.fromkeys(p['record_id'] for p in result))
     irrelevant_selected=sum(p.get('relevance_hint',{}).get('status')=='ok' and
         p.get('relevance_hint',{}).get('label') in ('irrelevant','unrelated') for p in result)
@@ -403,7 +466,11 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
             'mode':mode,'window_clock':'published_at; acquisition time never substitutes for missing publication time',
             'retrospective':mode=='observed'},
         'scope':SCOPE}
-    return {'retrieval_unit':'passage','results':result,'source_ids':source_ids,'passage_ids':selected,
+    if memory_bundles is not None:
+        selection['policy']='facet_groups_with_relations' if prioritize_facet_relations else 'facet_groups'
+    return {**({'memory_bundles':memory_bundles} if memory_bundles is not None else {}),
+        **({'scout_candidate_catalog': [_source_catalog(row) for row in sources]} if include_scout_catalog else {}),
+        'retrieval_unit':'passage','results':result,'source_ids':source_ids,'passage_ids':selected,
         'source_catalog':{row['record_id']:_source_catalog(row) for row in sources if row['record_id'] in source_ids},
         'selection':selection,'gaps':gaps,'as_of':cutoff,'mode':mode,'scope':SCOPE,
         'hybrid_retrieval':{'retrieval_mode':'passage_hybrid_rrf' if dense_status=='ok' else 'passage_keyword_only',
@@ -412,5 +479,7 @@ def retrieve_passages(sources, query='', *, hybrid=None, limit=None, budget_char
         'coverage':news_coverage([row for row in sources if row['record_id'] in source_ids],start=start,end=end),
         'candidate_coverage':news_coverage(sources,start=start,end=end,pool_truncated=at_limit),
         'conflicts':[{'evidence_ids':group,'basis':'explicit_source_or_reviewed_relation','all_endpoints_selected':True,
-            'scope':'Originals/qualifications still require reading; selection is not confirmation.'} for group in protected_groups],
+            'scope':'Both or all source IDs were selected. The exact qualifying span may require an original read.'
+                    if facets else 'Originals/qualifications still require reading; selection is not confirmation.'}
+            for group in protected_groups],
         'judgment_receipts':receipts}

@@ -1,6 +1,7 @@
 """Persistent local Deep Agents sessions with API and conversation model modes."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import sqlite3
 import threading
@@ -37,6 +38,11 @@ from .bootstrap import archive_directory
 from .skill_library import install_skills
 from .prompts import research_system_prompt
 from .sdk_bridge import ResearchSDKServer
+from .question_progress import ToolChoiceProgress
+from .question_tracking import (QUESTION_INSTRUCTIONS, FileReadProgress, active_question_scope, bind_question, guard_question_call,
+    question_result_payload, question_tag, question_tool, register_plan_questions, tool_selection_name)
+from .periodic_workflow import (PeriodicWorkflow, PERIOD_PLAN_INSTRUCTIONS, PERIOD_TODO_DESCRIPTION,
+    explicit_archive_scope, period_assets, periodic_report_window, requests_periodic_report)
 from .planning import (ResearchPlanningMiddleware, PLANNING_INSTRUCTIONS, PLAN_TOOL_DESCRIPTION,
                        CONVERSATION_PLANNING_INSTRUCTIONS)
 from .chat_reply import asks_about_report_notice, chat_answer, chat_intent, requests_report
@@ -44,9 +50,14 @@ from .conversation_context import saved_chat_context, validate_chat_links
 from .research_policy import recent_report_window, requests_research, CHAT_EXECUTION_POLICY, RESEARCH_READER_POLICY
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LOCAL_REPORT_MODEL = 'codex-conversation'
 register_harness_profile("local_bridge:conversation-bridge", HarnessProfile(
     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
     excluded_tools=frozenset({"execute", "task", "delete"}),
+))
+register_harness_profile("local_bridge:"+LOCAL_REPORT_MODEL, HarnessProfile(
+    general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+    excluded_tools=frozenset({"delete"}),
 ))
 
 
@@ -112,17 +123,41 @@ def freeze_software(root,state_dir):
 
 
 class TraceMiddleware(AgentMiddleware):
-    def __init__(self, emit, cancel=None, settings=None, working_memory=None, job_id=None, experience_context='',context_accounting=None,workspace_root=None):
+    def __init__(self, emit, cancel=None, settings=None, working_memory=None, job_id=None, experience_context='',context_accounting=None,workspace_root=None, file_backend=None, previous_job_id=None, periodic_workflow=None):
         self.emit=emit;self.cancel=cancel;self.settings=settings;self.model_calls=0
         self.working_memory=working_memory;self.job_id=job_id
         self.experience_context=experience_context;self.context_accounting=context_accounting
         self.workspace_root=workspace_root
+        self.periodic_workflow=periodic_workflow
+        self.file_reads = (FileReadProgress(file_backend, workspace_root, working_memory, job_id, previous_job_id)
+                           if file_backend is not None and workspace_root is not None else None)
+        self.tool_choices = ToolChoiceProgress()
+
+    def _change_tool_strategy(self, request, choice):
+        tool, scope = choice
+        active = active_question_scope(request.state)
+        if (active and active != scope) or tool_selection_name(request.tool_choice) == tool:
+            return request
+        remaining = [candidate for candidate in request.tools if tool_selection_name(candidate) != tool]
+        if not remaining or len(remaining) == len(request.tools):
+            return request
+        original = request.system_message or SystemMessage(content='')
+        content = list(original.content) if isinstance(original.content, list) else [{'type': 'text', 'text': original.content}]
+        route = ('Use the exact saved artifact path, list its directory, or use the recorded evidence ID.'
+                 if tool == 'read_file' else 'Reuse the saved evidence or choose a different source or method.')
+        content.append({'type': 'text', 'text': (f'{tool} is paused for this response after repeated no-progress results. '
+            f'{route} If the task is ready for delivery, use the available submission tool. The paused tool returns next turn.')})
+        self.emit('question_strategy_changed', {'tool': tool, 'question_id': scope,
+            'reason': 'consecutive_no_progress', 'round': self.model_calls, 'model_choices': 1,
+            'remaining_tools': [name for candidate in remaining if (name := tool_selection_name(candidate))]})
+        return request.override(tools=remaining, system_message=original.model_copy(update={'content': content}))
 
     def wrap_model_call(self, request, handler):
         if self.cancel and self.cancel.is_set():raise RuntimeError("用户已停止任务")
         self.model_calls+=1
         if self.settings and self.model_calls>self.settings.max_model_calls:raise RuntimeError("达到单个任务模型调用上限，请缩小问题或继续会话")
         self.emit("model_started",{"round":self.model_calls})
+        choice = self.tool_choices.next_choice()
         if request is not None and self.settings and self.settings.max_model_calls-self.model_calls<4:
             remaining=self.settings.max_model_calls-self.model_calls+1
             original=request.system_message or SystemMessage(content='')
@@ -146,11 +181,12 @@ class TraceMiddleware(AgentMiddleware):
                 request=request.override(system_message=original.model_copy(update={'content':content}))
             except Exception as exc:self.emit('working_memory_error',{'stage':'context','error_type':type(exc).__name__})
         for repair in range(3):
+            actual_request = self._change_tool_strategy(request, choice) if repair == 0 and request is not None and choice else request
             measured=None
-            if self.context_accounting and request is not None:
-                measured=self.context_accounting.estimate([request.system_message,*request.messages],request.tools)
+            if self.context_accounting and actual_request is not None:
+                measured=self.context_accounting.estimate([actual_request.system_message,*actual_request.messages],actual_request.tools)
                 self.emit('context_measured',measured)
-            result=handler(request)
+            result=handler(actual_request)
             messages=getattr(result,"result",[])
             from .model_usage import response_usage
             usage=response_usage(messages[-1]) if messages else None
@@ -180,7 +216,38 @@ class TraceMiddleware(AgentMiddleware):
         call=request.tool_call
         if self.cancel and self.cancel.is_set():raise RuntimeError("用户已停止任务")
         self.emit("tool_started", {"name":call["name"],"call_id":call["id"],"arguments_preview":json.dumps(call.get("args",{}),ensure_ascii=False)[:2500]})
+        qid=None
+        question_result_saved=False
+        state = getattr(request,'state',{}) or {}
+        file_reads = self.file_reads if call['name'] == 'read_file' else None
         try:
+            if file_reads:
+                try:
+                    blocked = file_reads.before(call, state)
+                except Exception as exc:
+                    blocked = None
+                    self.emit('working_memory_error', {'stage': 'file_read_check', 'error_type': type(exc).__name__})
+                if blocked:
+                    self.tool_choices.observe(call['name'], blocked.get('question_id'), skipped=True)
+                    self.emit('file_read_no_progress', {'call_id': call['id'], **blocked})
+                    self.emit('tool_finished', {'name': 'read_file', 'call_id': call['id'], 'status': 'skipped'})
+                    return ToolMessage(content=json.dumps(blocked, ensure_ascii=False), name='read_file',
+                                       tool_call_id=call['id'], status='error')
+            if self.working_memory is not None and hasattr(self.working_memory, 'put_question') and self.job_id:
+                row=bind_question(self.working_memory,self.job_id,call,state,
+                                  separate_questions=self.periodic_workflow is not None)
+                if row is not None:
+                    qid=row['question_id']
+                    blocked=guard_question_call(row,call)
+                    if blocked:
+                        self.tool_choices.observe(call['name'], qid, skipped=True)
+                        self.emit('question_no_progress',{'question_id':qid,'call_id':call['id'],**blocked})
+                        self.emit('tool_finished',{'name':call['name'],'call_id':call['id'],'status':'skipped','question_id':qid})
+                        return ToolMessage(content=json.dumps(blocked,ensure_ascii=False),name=call['name'],
+                                           tool_call_id=call['id'],status='error')
+                    if call['name']=='task' and not question_tag(call['args'].get('description')):
+                        args={**call['args'],'description':'['+qid+'] '+call['args']['description']}
+                        request=request.override(tool_call={**call,'args':args})
             result=handler(request)
             exit_code=None
             if call['name']=='execute' and isinstance(getattr(result,'artifact',None),dict):
@@ -188,12 +255,29 @@ class TraceMiddleware(AgentMiddleware):
                 if isinstance(value,int) and not isinstance(value,bool):exit_code=value
                 if exit_code not in (None,0) and isinstance(result,ToolMessage):
                     result=result.model_copy(update={'status':'error'})
+            file_read_repair = None
+            if file_reads:
+                try:
+                    file_read_repair = file_reads.after(call, state, result)
+                except Exception as exc:
+                    self.emit('working_memory_error', {'stage': 'file_read_receipt', 'error_type': type(exc).__name__})
+            self.tool_choices.observe(call['name'], file_read_repair.get('question_id') if file_read_repair else qid,
+                                      stable_failure=bool(file_read_repair))
             if self.working_memory and self.job_id:
                 try:
                     payload=getattr(result,'content',None) or getattr(result,'update',None) or str(result)
+                    if qid:
+                        try:
+                            recorded=self.working_memory.record_question_result(self.job_id,qid,call['name'],call.get('args',{}),
+                                question_result_payload(call,result),status=getattr(result,'status','success'),tool_call_id=call['id'])
+                            question_result_saved=True
+                            self.emit('research_question_recorded',{'question_id':qid,'call_id':call['id'],'tool':call['name'],
+                                'question_status':recorded['question_status']})
+                        except Exception as exc:
+                            self.emit('working_memory_error',{'stage':'question_result','error_type':type(exc).__name__})
                     ids=list(dict.fromkeys(re.findall(r'(?:live|page|web|series|calc)-[a-f0-9]{12,64}',str(payload))))[:80]
                     if hasattr(self.working_memory,'observe_tool'):
-                        self.working_memory.observe_tool(self.job_id,call['name'],payload,status=getattr(result,'status','success'),tool_call_id=call['id'])
+                        observation=self.working_memory.observe_tool(self.job_id,call['name'],payload,status=getattr(result,'status','success'),tool_call_id=call['id'])
                         if isinstance(result,ToolMessage):
                             budget=6000
                             if call['name']=='read_evidence':
@@ -208,10 +292,25 @@ class TraceMiddleware(AgentMiddleware):
                                 receipt=self.working_memory.record_tool(self.job_id,call['name'],payload)
                                 view=schema_error_view(call['name'],errors,receipt,max_chars=budget,root=self.working_memory.root,workspace_root=self.workspace_root)
                             else:
-                                view=self.working_memory.progressive_tool_view(self.job_id,call['name'],payload,status=getattr(result,'status','success'),max_chars=budget)
+                                view = None
+                                if (self.periodic_workflow and call['name'] == 'recall_memory'
+                                        and call.get('args', {}).get('kind') == 'news' and result.status == 'success'):
+                                    view = self.periodic_workflow.parent_news_view(
+                                        payload, observation['artifact'], self.workspace_root)
+                                    if view is not None:
+                                        self.emit('periodic_parent_retrieval_view', {
+                                            'call_id': call['id'], 'question_id': qid,
+                                            'raw_characters': len(str(payload)), 'visible_characters': len(view),
+                                            'artifact_id': observation['artifact']['artifact_id']})
+                                if view is None:
+                                    view=self.working_memory.progressive_tool_view(self.job_id,call['name'],payload,status=getattr(result,'status','success'),max_chars=budget)
                             if view!=payload:result=result.model_copy(update={'content':view})
                     else:self.working_memory.record_tool(self.job_id,call['name'],payload,evidence_ids=ids)
                 except Exception as exc:self.emit('working_memory_error',{'stage':'tool_artifact','error_type':type(exc).__name__})
+            if file_read_repair:
+                self.emit('file_read_repair', {'call_id': call['id'], 'reason': file_read_repair['reason'],
+                    'saved_api_candidate_count': len(file_read_repair.get('saved_api_candidates', []))})
+                result = result.model_copy(update={'content': json.dumps(file_read_repair, ensure_ascii=False)})
             if self.cancel and self.cancel.is_set():raise RuntimeError("用户已停止任务")
             status=getattr(result,"status","success")
             self.emit("tool_finished", {"name":call["name"],"call_id":call["id"],"status":status,
@@ -219,6 +318,7 @@ class TraceMiddleware(AgentMiddleware):
                       "output_preview":str(getattr(result,"content",""))[:1800] if call["name"] in ("execute","register_calculation") else None})
             return result
         except Exception as exc:
+            self.tool_choices.observe(call['name'], qid)
             if isinstance(exc,ReviewNeedsRevisionError) and not (self.cancel and self.cancel.is_set()):
                 payload=json.loads(self.settings.redact(json.dumps(exc.feedback,ensure_ascii=False))) if self.settings else exc.feedback
                 artifact=None
@@ -233,6 +333,12 @@ class TraceMiddleware(AgentMiddleware):
                     'error':str(exc)})
                 return ToolMessage(content=json.dumps(view,ensure_ascii=False),name=call['name'],tool_call_id=call['id'],status='error')
             error=self.settings.redact(exc) if self.settings else str(exc)
+            if qid and not question_result_saved:
+                try:
+                    self.working_memory.record_question_result(self.job_id,qid,call['name'],call.get('args',{}),
+                        {'status':'error','error':error},status='error',tool_call_id=call['id'])
+                except Exception as memory_error:
+                    self.emit('working_memory_error',{'stage':'question_failure','error_type':type(memory_error).__name__})
             if self.working_memory and self.job_id and hasattr(self.working_memory,'observe_tool'):
                 try:self.working_memory.observe_tool(self.job_id,call['name'],{'status':'error','error':error},status='error',tool_call_id=call['id'])
                 except Exception:pass
@@ -299,8 +405,11 @@ class AgentRuntime:
             'scope':'Attributed origin-report feedback; reopen sources and any reviewed update before reusing the case.'}
             for row in rows[-12:]]
 
-    def __init__(self, root=PROJECT_ROOT, state_dir=None, model_mode=None, review_request_limit=4):
+    def __init__(self, root=PROJECT_ROOT, state_dir=None, model_mode=None, review_request_limit=4,
+                 *, enable_local_report_bridge=False, enable_scout_candidate_catalog=False):
         self.root=Path(root).resolve()
+        self.enable_local_report_bridge=enable_local_report_bridge
+        self.enable_scout_candidate_catalog=enable_scout_candidate_catalog
         self.settings=Settings.load(self.root)
         if not 1<=review_request_limit<=12:raise ValueError('Source review request budget must be 1..12')
         self.review_request_limit=review_request_limit
@@ -355,22 +464,26 @@ class AgentRuntime:
             except Exception as exc:
                 self.memory_startup_issues.append({'component':'user_research_memory','error_type':type(exc).__name__})
 
-    def user_research_context(self, prompt, status, settings, emit, cancel):
-        """Recall scoped preferences before the planner sees a new user turn."""
+    def _user_research_lookup(self, prompt, status, settings, emit, cancel, *, scheduled=False):
+        """Process an actual user turn once, then return scoped recall arguments."""
         memory=getattr(self,'user_research_memory',None)
-        if not memory or status.get('request_purpose')!='chat' or cancel.is_set():
-            return ''
-        from .user_research_memory import MemoryIntent,apply_intent,extract_intent,prompt_context,requested_task
+        authored = status.get('request_purpose') == 'chat'
+        if not memory or not (authored or scheduled) or cancel.is_set():
+            return {}
+        from .user_research_memory import MemoryIntent,apply_intent,extract_intent,requested_task
         owner='local-owner'
         as_of=status['created_at']
         overrides=()
         query_topic=None
-        if len(prompt.strip())>=12 and not status.get('continued_from_job_id'):
+        # Local report jobs can read saved preferences without sending this turn
+        # to the Ark user-memory extractor.
+        if (authored and settings.model_id != LOCAL_REPORT_MODEL and len(prompt.strip()) >= 12
+                and not status.get('continued_from_job_id')):
             slots=[]
             try:
                 slots=memory.active_slots(owner,as_of)
                 intent,metadata=extract_intent(settings,prompt,as_of,slots)
-                if cancel.is_set():return ''
+                if cancel.is_set():return {}
                 overrides,created=apply_intent(memory,owner,status['session_id'],status['job_id'],
                     prompt,as_of,intent,slots)
                 if intent.interest and intent.interest.quote in prompt:
@@ -380,18 +493,39 @@ class AgentRuntime:
                 emit('user_memory_ingestion_unavailable',{'error_type':type(exc).__name__})
                 overrides,_=apply_intent(memory,owner,status['session_id'],status['job_id'],
                     prompt,as_of,MemoryIntent(),slots)
+        assets = period_assets(prompt)
+        return {'user_memory': memory, 'user_id': owner, 'as_of': as_of,
+                'asset': assets[0] if len(assets) == 1 else 'ALL',
+                'task': requested_task(prompt, status['deliverable']),
+                'overrides': overrides, 'query_topic': query_topic}
+
+    def user_research_context(self, prompt, status, settings, emit, cancel):
+        lookup = self._user_research_lookup(prompt, status, settings, emit, cancel)
+        if not lookup:
+            return ''
+        from .user_research_memory import prompt_context
+        memory, owner = lookup.pop('user_memory'), lookup.pop('user_id')
         try:
-            btc=bool(re.search(r'\b(?:BTC|Bitcoin)\b|比特币',prompt,re.I))
-            eth=bool(re.search(r'\b(?:ETH|Ethereum)\b|以太坊',prompt,re.I))
-            asset='BTC' if btc and not eth else 'ALL' if btc and eth else 'ETH'
-            task=requested_task(prompt,status['deliverable'])
-            rows=memory.recall(owner,prompt=prompt,as_of=as_of,asset=asset,task=task,
-                overrides=overrides,query_topic=query_topic)
-            emit('user_memory_recalled',{'count':len(rows),'event_ids':[row['event_id'] for row in rows]})
+            rows = memory.recall(owner, prompt=prompt, **lookup)
+            emit('user_memory_recalled', {'count':len(rows), 'event_ids':[row['event_id'] for row in rows]})
             return prompt_context(rows)
         except Exception as exc:
-            emit('user_memory_recall_unavailable',{'error_type':type(exc).__name__})
+            emit('user_memory_recall_unavailable', {'error_type': type(exc).__name__})
             return ''
+
+    def _research_series(self, run_id):
+        if not run_id:
+            return None
+        path = self.state_dir / 'scheduler.sqlite'
+        if not path.is_file():
+            return None
+        try:
+            from contextlib import closing
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+                row = conn.execute('SELECT subscription_id FROM runs WHERE id=?', (run_id,)).fetchone()
+            return row[0] if row else None
+        except sqlite3.Error:
+            return None
 
     def bootstrap_knowledge(self):
         """Import saved source snapshots, not model conversation summaries as facts."""
@@ -467,8 +601,12 @@ class AgentRuntime:
         preferences=preferences or self.decision_profile().get('preference','')
         (workspace/"memory/preferences.md").write_text("# User preferences (user-supplied data)\n"+preferences[:4000]+"\n")
         install_skills(workspace)
+        local_bridge=(chosen_model==BRIDGE_MODE and research_mode=='current'
+                      and self.enable_local_report_bridge)
+        model_id=(self.settings.model_id if chosen_model=='ark_plan' else
+                  LOCAL_REPORT_MODEL if local_bridge else 'conversation-bridge')
         meta={"session_id":sid,"title":title[:200],"cutoff":selected,"mode":mode,"data_run":str(run.resolve()),
-              "model_mode":chosen_model,"model_id":self.settings.model_id if chosen_model=="ark_plan" else "conversation-bridge",
+              "model_mode":chosen_model,"model_id":model_id,
               "research_mode":research_mode,"created_at":utcnow(),"preferences":preferences[:4000]}
         meta["decision_profile"]=self.decision_profile()
         if external_run_id:meta['external_run_id']=external_run_id
@@ -544,14 +682,26 @@ class AgentRuntime:
             if request_purpose:status['request_purpose']=request_purpose
             if report_from_chat:status['report_from_chat']=True
             if continued_from:status['continued_from_job_id']=continued_from
-            if request_purpose=='chat' and deliverable=='report' and meta.get('research_mode')=='current':
+            if deliverable=='report' and meta.get('research_mode')=='current':
                 reference = status['created_at']
+                previous = None
                 if continued_from:
                     previous = json.loads((directory/'jobs'/continued_from/'status.json').read_text())
                     reference = previous.get('report_window_reference_at', previous['created_at'])
-                if window := recent_report_window(prompt, reference):
+                prior_scope = previous.get('periodic_scope') if previous and previous['deliverable']=='report' else None
+                if prior_scope:
+                    status['periodic_scope'] = prior_scope
+                    status['required_report_window'] = previous.get('required_report_window') or [prior_scope['start'], prior_scope['end']]
                     status['report_window_reference_at'] = reference
-                    status['required_report_window'] = list(window)
+                elif window := recent_report_window(prompt, reference):
+                    if request_purpose=='chat':
+                        status['report_window_reference_at'] = reference
+                        status['required_report_window'] = list(window)
+                if not continued_from and self.settings.memory_enabled and requests_periodic_report(prompt):
+                    if window := periodic_report_window(prompt, reference):
+                        status['periodic_scope'] = {'assets': list(period_assets(prompt)), 'start': window[0], 'end': window[1]}
+                        status['required_report_window'] = list(window)
+                        status['report_window_reference_at'] = reference
             if schedule_run_id or meta.get('external_run_id'):status['schedule_run_id']=schedule_run_id or meta['external_run_id']
             write_json(job_dir/"status.json",status)
             cancel=threading.Event();self.active[sid]=(job_id,cancel)
@@ -626,23 +776,41 @@ class AgentRuntime:
                     status['research_escalated']=True
                 write_json(job_dir/"status.json",status)
                 if working and kind in ('plan_saved','plan_updated'):
-                    try:working.update(status['job_id'],plan=data.get('todos',[]),todos=data.get('todos',[]))
-                    except Exception:pass
+                    try:
+                        todos=data.get('todos',[])
+                        working.update(status['job_id'],plan=todos,todos=todos)
+                        register_plan_questions(working,status['job_id'],todos)
+                    except Exception as exc:
+                        emit('working_memory_error',{'stage':'plan_questions','error_type':type(exc).__name__})
         conn=None;model=None;sdk_server=None;service=None;graph=None;config=None
+        periodic_workflow=None
         try:
             workspace=directory/"workspace"
-            if meta["model_mode"]=="ark_plan":
+            ark_plan=meta['model_mode']=='ark_plan'
+            local_bridge=(meta['model_mode']==BRIDGE_MODE and meta['model_id']==LOCAL_REPORT_MODEL)
+            if local_bridge and (not self.enable_local_report_bridge or status['deliverable']!='report'):
+                raise ValueError('The local current-research bridge requires an enabled report session')
+            active_settings=replace(self.settings,model_id=meta['model_id'])
+
+            def local_model(role, *, max_calls, max_output_tokens):
+                return ConversationModel(bridge_directory=job_dir/'bridge',job_id=status['job_id'],
+                    model_name=LOCAL_REPORT_MODEL,role=role,cancel_event=cancel,event_sink=emit,
+                    max_model_calls=max_calls,max_tokens=max_output_tokens)
+
+            if ark_plan:
                 has_shell=meta.get("research_mode")=="current"
                 register_harness_profile("ark_plan:"+meta["model_id"],HarnessProfile(
                     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),excluded_tools=frozenset({"delete"} if has_shell else {"execute","task","delete"})))
-                from dataclasses import replace
-                active_settings=replace(self.settings,model_id=meta["model_id"])
                 model=self.build_author_model(active_settings,status.get('deliverable'))
+            elif local_bridge:
+                model=local_model('author',max_calls=self.settings.max_model_calls,max_output_tokens=8192)
             else:
                 model=ConversationModel(bridge_directory=job_dir/"bridge",job_id=status["job_id"],cancel_event=cancel,event_sink=emit)
-            current=meta.get("research_mode")=="current" and meta["model_mode"]=="ark_plan"
+            current=meta.get('research_mode')=='current' and (ark_plan or local_bridge)
             conversation=current and status.get('response_mode')=='conversation'
-            live=current and self.settings.search_enabled
+            periodic_scope=status.get('periodic_scope') if current and status['deliverable']=='report' else None
+            archive_only=bool(periodic_scope and explicit_archive_scope(prompt))
+            live=ark_plan and current and self.settings.search_enabled and not archive_only
             shell=self.build_shell(workspace,cancel) if current else None
             memory=None;retrieval_judgments=None;report_judgments=None;experience_context=''
             if current and self.settings.memory_enabled:
@@ -651,12 +819,22 @@ class AgentRuntime:
                 try:
                     working=WorkingMemory(workspace/'memory/task-state',redact=self.settings.redact,evidence_lookup=self.knowledge.get)
                     working.begin(status['job_id'],prompt,meta['cutoff'],mode=meta['mode'])
+                    if status.get('continued_from_job_id'):
+                        previous=status['continued_from_job_id']
+                        try:
+                            working.carry_questions(previous,status['job_id'])
+                        except KeyError:
+                            # Older jobs can predate working memory.
+                            pass
+                        except ValueError as exc:
+                            # Keep the new task usable when the research scope has changed.
+                            emit('question_carry_skipped', {'reason': self.settings.redact(str(exc))})
                 except Exception as exc:
                     working=None
                     emit('working_memory_unavailable',{'error_type':type(exc).__name__,
                         'scope':'Optional derived task notes unavailable; original checkpoints and source research continue.'})
                 try:
-                    if self.experience and not conversation:
+                    if self.experience and not conversation and not periodic_scope:
                         experience=self.experience.recall(prompt,cutoff=meta['cutoff'] if meta['mode']=='strict' else None,budget_chars=2200)
                         experience_context=experience['prompt_context']
                         (workspace/'memory/research-experience.md').write_text(experience_context)
@@ -686,13 +864,18 @@ class AgentRuntime:
                 elif minimal and status.get('deliverable')=='report':
                     from .hybrid_minimal_review import MinimalEvidenceReviewer
                     instance=MinimalEvidenceReviewer(active_settings,**kwargs)
-                else:instance=EvidenceReviewer(active_settings,**kwargs)
+                    if local_bridge:
+                        instance.inner.model_factory=lambda: local_model('reviewer',max_calls=limit,max_output_tokens=6000)
+                else:
+                    instance=EvidenceReviewer(active_settings,**kwargs)
+                    if local_bridge:
+                        instance.model_factory=lambda: local_model('reviewer',max_calls=limit,max_output_tokens=6000)
                 instance.report_user_prompt=prompt
                 return instance
             service=self.build_research_tools(Path(meta["data_run"]),workspace,meta["cutoff"],meta["mode"],emit,
                                   web_search=ArkWebSearch(active_settings) if live else None,allow_live=current,
                                   live_data=self.live_data if current else None,shell=shell,
-                                  reviewer=make_report_reviewer(getattr(self,'review_request_limit',4) if status.get('deliverable')=='report' else 4) if meta["model_mode"]=="ark_plan" else None,
+                                  reviewer=make_report_reviewer(getattr(self,'review_request_limit',4) if status.get('deliverable')=='report' else 4) if ark_plan or local_bridge else None,
                                   decision_profile=meta.get("decision_profile",{}),audit_builder=self.audit_builder,
                                   run_metadata={"session_id":meta['session_id'],"job_id":status['job_id'],"requested_model":meta['model_id'],"harness":"deepagents==0.7.23","software_fingerprint":self.software_fingerprint,
                                                 'jev_assistance_requested':status.get('jev_assistance_requested',False),'jev_role':'Optional source reranking and separately selected report support review; neither certifies source truth.',
@@ -702,7 +885,11 @@ class AgentRuntime:
                                   retrieval_judgments=retrieval_judgments,report_judgments=report_judgments,
                                   judgment_mode=self.settings.judgment_mode)
             service.working_memory=working;service.job_id=status['job_id'];service.cancel=cancel
-            service.minimal_reviewer_factory=lambda remaining=2:make_report_reviewer(remaining,final=True)
+            series_id=self._research_series(status.get('schedule_run_id'))
+            if series_id:
+                service.run_metadata['series_id']=series_id
+            if ark_plan or local_bridge:
+                service.minimal_reviewer_factory=lambda remaining=2:make_report_reviewer(remaining,final=True)
             recovered_unsaved_draft = False
             retry_candidate = None
             retry_feedback = ''
@@ -755,12 +942,20 @@ class AgentRuntime:
             # or by start() recognizing the original user message. Keep the
             # extra publication guard when report tools are visible in chat.
             service.report_request_prompt=prompt if purpose=='chat' and status['deliverable']=='answer' else None
-            service.require_report_scope=current and purpose=='chat'
+            service.require_report_scope=current and (purpose=='chat' or bool(periodic_scope))
             service.required_report_window=status.get('required_report_window')
+            service.required_report_assets=periodic_scope['assets'] if periodic_scope else None
             service.report_user_prompt=self.settings.redact(prompt)
             # A task-scoped public research question, never the whole chat
             # history, is passed through the public-query eligibility checks.
             service.research_request_prompt=self.settings.redact(prompt)
+            if periodic_scope:
+                assets = periodic_scope['assets']
+                service.research_scope = {
+                    'asset': assets[0] if len(assets) == 1 else 'ALL',
+                    'start': periodic_scope['start'],
+                    'end': periodic_scope['end'],
+                }
             service.case_memory=getattr(self,'case_memory',None)
             if working:working.evidence_lookup=service.lookup
             service.memory_index=getattr(self,'memory_index',None);service.memory_retriever=getattr(self,'memory_retriever',None)
@@ -786,9 +981,34 @@ class AgentRuntime:
                 shell.attach_research_sdk(sdk_server.start())
             conn=sqlite3.connect(directory/"checkpoints.sqlite",check_same_thread=False)
             saver=SqliteSaver(conn)
-            system=research_system_prompt(meta,current,live,conversation=conversation)
+            if periodic_scope and working:
+                from .research_leads import build_research_leads, research_leads_tool
+                prior_id=status.get('continued_from_job_id')
+                prior_workflow=None
+                if prior_id:
+                    try: prior_workflow=working.state(prior_id).get('periodic_workflow')
+                    except KeyError: pass
+                lead_snapshot=prior_workflow.get('leads') if prior_workflow else None
+                if lead_snapshot is None:
+                    lead_args=self._user_research_lookup(prompt,status,active_settings,emit,cancel,
+                                                         scheduled=bool(status.get('schedule_run_id')))
+                    lead_args.setdefault('as_of',status['report_window_reference_at'])
+                    lead_args.setdefault('asset',periodic_scope['assets'][0] if len(periodic_scope['assets'])==1 else 'ALL')
+                    lead_snapshot=build_research_leads(
+                        knowledge=self.knowledge,prompt=prompt,session_id=meta['session_id'],broad_report=True,
+                        window_start=periodic_scope['start'],window_end=periodic_scope['end'],
+                        series_id=series_id,**lead_args)
+                periodic_workflow=PeriodicWorkflow(working,status['job_id'],periodic_scope,prompt,emit,
+                    leads=lead_snapshot,continued_from=prior_id,archive_only=archive_only,
+                    scout_available=self.settings.evidence_reader_enabled)
+                service.periodic_scope=periodic_scope
+                if getattr(service, 'latest_report_draft_id', None) and periodic_workflow.phase() in ('draft','review'):
+                    periodic_workflow.recover_draft()
+                emit('periodic_workflow_configured', {'scope':periodic_scope,'archive_only':archive_only,
+                    'web_enabled':bool(live),'phase':periodic_workflow.phase()})
+            system=research_system_prompt(meta,current,live,conversation=conversation,periodic=periodic_workflow is not None)
             if conversation:system=system.replace(CONVERSATION_PLANNING_INSTRUCTIONS,CHAT_EXECUTION_POLICY)
-            if current:
+            if current and not periodic_workflow:
                 system+=self.user_research_context(prompt,status,active_settings,emit,cancel)
             if not service.report_allowed:
                 system+='\nThis market refresh saves relevant sources and returns a status update. It cannot publish a report.\n'
@@ -796,8 +1016,9 @@ class AgentRuntime:
                 system+='\nIn chat, publish a new report only when the latest user message expressly asks you to create one. Pass a verbatim excerpt of that request as user_request. Questions, requests to find or summarize an existing report, and negated or quoted requests do not authorize publication. For other requests, answer in chat.\n'
                 if status['deliverable']=='answer':
                     system+='Treat any previous report request, unfinished draft or publication tool result as past context. If asked what a saved report or evidence availability notice means, explain that artifact and its limits directly. If a publication call is rejected because the latest message did not request one, answer in chat without retrying the call.\n'
-            if purpose=='chat' and status['deliverable']=='report':
-                system+='\nThe user explicitly requested a report. Treat the user message as its scope and publish the source-checked report.\n'
+            if status['deliverable']=='report' and (purpose=='chat' or periodic_workflow):
+                if purpose=='chat':
+                    system+='\nThe user explicitly requested a report. Treat the user message as its scope and publish the source-checked report.\n'
                 if service.required_report_window:
                     start, end = service.required_report_window
                     system+=f'Use the completed UTC dates for this report, from {start} inclusive to {end} exclusive. State the dates to the reader. Use these exact bounds for evidence selection, calculations, chart scope and the draft. The archived bundle cutoff only dates archive inputs and cannot determine this current report window.\n'
@@ -807,27 +1028,42 @@ class AgentRuntime:
                 system+='The recovered draft was authored for this request and was never published. Inspect this draft and use publish_saved_report with exact edits. If a completed UTC end date applies, remove or explicitly set aside any after-window market snapshot. Keep independently supported events, resolve conflicting claims with their saved evidence, and use the registered calculation and price series where their window agrees. Do not start the source collection over.\n'
             if retry_feedback:
                 system+='The retained draft has already been resubmitted without new research. Correct only the following publication feedback or read the saved review receipt: '+retry_feedback+'\n'
-            if working:
+            if working and not periodic_workflow:
+                system+='\n'+QUESTION_INSTRUCTIONS+'\n'
                 system+='\nTask working notes and source-backed process corrections are available under /memory/task-state/ and /memory/research-experience.md. These are derived guidance, not market evidence. Read originals before asserting facts.\n'
             from .context_accounting import ContextAccounting
             context_accounting=ContextAccounting(emit)
+            restricted=bool(self.settings.restricted_execution_root)
+            if restricted:
+                from .execution_safety import RestrictedFilesystemBackend
+                backend=RestrictedFilesystemBackend(root_dir=workspace,virtual_mode=True)
+            else:backend=shell or FilesystemBackend(root_dir=workspace,virtual_mode=True)
             plan_instructions=CHAT_EXECUTION_POLICY if conversation else PLANNING_INSTRUCTIONS
             plan_description=CHAT_EXECUTION_POLICY if conversation else PLAN_TOOL_DESCRIPTION
+            if periodic_workflow:
+                plan_instructions,plan_description=PERIOD_PLAN_INSTRUCTIONS,PERIOD_TODO_DESCRIPTION
             middleware=[TodoListMiddleware(system_prompt=plan_instructions,tool_description=plan_description) if current else TodoListMiddleware(),
-                        TraceMiddleware(emit,cancel,self.settings,working,status['job_id'],experience_context=experience_context,context_accounting=context_accounting,workspace_root=workspace)]
+                        TraceMiddleware(emit,cancel,self.settings,working,status['job_id'],experience_context=experience_context,context_accounting=context_accounting,workspace_root=workspace,
+                                        file_backend=backend,previous_job_id=status.get('continued_from_job_id'),periodic_workflow=periodic_workflow)]
             if current and status['deliverable']=='report':
                 from .report_context import ReportContextMiddleware
                 plan_job_ids = () if conversation else (status['job_id'], status.get('continued_from_job_id'))
                 middleware.insert(1,ReportContextMiddleware(emit,service,max_model_calls=self.settings.max_model_calls,
-                    plan_job_ids=tuple(job_id for job_id in plan_job_ids if job_id)))
+                    plan_job_ids=tuple(job_id for job_id in plan_job_ids if job_id),
+                    periodic_workflow=periodic_workflow))
             completion=self.build_finalization_middleware(service,emit)
             if completion is not None:middleware.insert(0,completion)
             if current:
+                if periodic_workflow:middleware.append(periodic_workflow)
                 if not conversation:middleware.append(ResearchPlanningMiddleware(status['job_id'],emit,allow_saved_context=True,continued_from=status.get('continued_from_job_id')))
                 if working:
                     from .context_runtime import make_context_middleware
                     middleware.append(make_context_middleware(model,shell,emit,trigger_tokens=self.settings.context_trigger_tokens,token_counter=context_accounting.counter))
             tools=service.as_tools()
+            if working:
+                tools.append(question_tool(working,status['job_id'],periodic_workflow=periodic_workflow))
+            if periodic_workflow:
+                tools.append(research_leads_tool(periodic_workflow.leads))
             if status['deliverable']=='report':
                 tools=[tool for tool in tools if tool.name!='submit_research_answer']
                 if current:
@@ -836,14 +1072,16 @@ class AgentRuntime:
             subagents=[]
             if current and self.settings.evidence_reader_enabled:
                 from .evidence_reader import build_evidence_reader
-                subagents=[build_evidence_reader(model.model_copy(update={'max_tokens':4096}) if hasattr(model,'model_copy') else model,
-                    service,workspace,emit,cancel,self.settings.redact)]
-                system+='\n'+RESEARCH_READER_POLICY+'\n'
-            restricted=bool(self.settings.restricted_execution_root)
-            if restricted:
-                from .execution_safety import RestrictedFilesystemBackend
-                backend=RestrictedFilesystemBackend(root_dir=workspace,virtual_mode=True)
-            else:backend=shell or FilesystemBackend(root_dir=workspace,virtual_mode=True)
+                reader_model=(local_model('reader',max_calls=36,max_output_tokens=4096) if local_bridge else
+                    model.model_copy(update={'max_tokens':4096}) if hasattr(model,'model_copy') else model)
+                subagents=[build_evidence_reader(reader_model,service,workspace,emit,cancel,self.settings.redact)]
+                if periodic_workflow:
+                    from .research_scout import build_research_scout
+                    subagents.append(build_research_scout(service,workspace,emit=emit,cancel=cancel,redact=self.settings.redact,
+                        scope=periodic_scope,allow_web=not archive_only,on_complete=periodic_workflow.record_discovery,
+                        include_candidate_catalog=local_bridge and self.enable_scout_candidate_catalog))
+                else:
+                    system+='\n'+RESEARCH_READER_POLICY+'\n'
             permissions=self.build_fs_permissions(bool(shell))
             if shell and restricted:
                 from .execution_safety import restricted_execute_tool
@@ -855,7 +1093,7 @@ class AgentRuntime:
             middleware.append(self.build_filesystem_middleware(backend,permissions))
             graph=create_deep_agent(model,tools=tools,system_prompt=system,
                 backend=backend,permissions=permissions,
-                memory=["/memory/preferences.md"],skills=["/skills/"],
+                memory=[] if periodic_workflow else ["/memory/preferences.md"],skills=["/skills/"],
                 middleware=middleware,subagents=subagents,checkpointer=saver,name="eth-research-local")
             thread_id = status['job_id'] if recovered_unsaved_draft else meta['session_id']
             config={"configurable":{"thread_id":thread_id},"recursion_limit":200,"max_concurrency":4}

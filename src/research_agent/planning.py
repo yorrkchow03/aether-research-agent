@@ -80,7 +80,7 @@ class ResearchPlanningMiddleware(AgentMiddleware):
 
     @staticmethod
     def _preparation(call):
-        if call["name"] in {"get_research_context", "list_data_sources"}:
+        if call["name"] in {"get_research_context", "list_data_sources", "get_research_leads"}:
             return True
         if call["name"] == "read_file":
             file_path = call.get("args", {}).get("file_path", "")

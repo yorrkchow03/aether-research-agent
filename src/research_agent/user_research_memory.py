@@ -241,7 +241,7 @@ class UserResearchMemory:
                 (' OR '.join(f'"{term}"' for term in terms),))]
 
     def recall(self, user_id, *, prompt, as_of, asset='ETH', task='answer', overrides=(),
-               policy='temporal', limit=3, query_topic=None):
+               policy='temporal', limit=3, query_topic=None, broad_report=False):
         if policy not in ('temporal','hybrid','recent','none') or not 1<=limit<=12:
             raise ValueError('Invalid user-memory recall policy or limit')
         if policy=='none':
@@ -269,6 +269,13 @@ class UserResearchMemory:
                 elif dense.get(rid,0.0)<0.52:
                     scores.pop(rid,None)
         ordered = sorted(scores,key=lambda rid:(-scores[rid],rid))
+        if broad_report and task=='report' and policy=='temporal':
+            # A general brief supplies no topical search terms. Keep explicit
+            # scoped instructions in their latest-first order before interests
+            # inferred from repeated activity. Narrow research keeps normal recall.
+            explicit = [r['event_id'] for r in rows if not r['event_id'].endswith(':interest')]
+            ordered = list(dict.fromkeys([*(rid for rid in ordered if rid in explicit),
+                                          *explicit, *ordered]))
         return [by_id[rid] for rid in ordered[:limit]]
 
 

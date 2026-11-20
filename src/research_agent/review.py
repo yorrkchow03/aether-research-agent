@@ -6,6 +6,7 @@ import json
 import math
 import re
 from collections import defaultdict
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Literal
 from dataclasses import replace
@@ -19,7 +20,7 @@ from .model_usage import completion_usage, response_usage
 from .model import create_ark_model
 from .advice import advice_evidence_ids, advice_targets
 from .host_review_facts import ONLINE_PREFIXES, automatic_disclosure, is_verified_host_target
-from .reports import report_claims
+from .reports import GREGORIAN_WEEKDAYS, report_claims
 from .research_explanations import explanation_evidence_ids, explanation_targets
 
 REVIEW_VERSION='support-v14-adjudicated-scope-review'
@@ -45,6 +46,27 @@ def _focus_statements(focus=None,targets=None):
                 if target.get(k) is not None)
             if text.strip():statements.append(text[:4000])
     return list(dict.fromkeys(statements))[:90]
+
+
+def _review_calendar(targets):
+    """Gregorian weekdays for explicit draft dates and their neighbors."""
+    days=set()
+    for statement in _focus_statements(targets=targets):
+        for year,month,day in re.findall(r'(?<!\d)(\d{4})[-/](\d{2})[-/](\d{2})(?!\d)',statement):
+            try:
+                parsed=date(int(year),int(month),int(day))
+            except ValueError:
+                continue
+            days.add(parsed)
+            if parsed>date.min:
+                days.add(parsed-timedelta(days=1))
+            if parsed<date.max:
+                days.add(parsed+timedelta(days=1))
+            if len(days)>=120:
+                break
+        if len(days)>=120:
+            break
+    return {day.isoformat():GREGORIAN_WEEKDAYS[day.weekday()] for day in sorted(days)[:120]}
 
 
 def _merge_ranges(ranges):
@@ -957,11 +979,17 @@ the exact unsupported predicate and actual source basis; disclose missing contex
 
 class EvidenceReviewer:
     supports_process_context=True
+    model_factory=None
+
     def build_model(self):
+        if self.model_factory is not None:
+            return self.model_factory()
         return create_ark_model(replace(self.settings,thinking='disabled'))
 
     def __init__(self, settings, event_sink=None, user_context_id=None, diagnostic_dir=None, cancel=None, research_cutoff=None, max_requests=4):
-        self.settings=settings; self.emit=event_sink; self.cache={}; self.calls=0; self.rounds=0;self.max_rounds=1 if max_requests<=2 else 2; self.user_context_id=user_context_id
+        self.settings=settings; self.emit=event_sink; self.cache={}; self.calls=0; self.rounds=0
+        self.max_rounds=1 if max_requests<=2 else 3 if max_requests>=6 else 2
+        self.user_context_id=user_context_id
         self.diagnostic_dir=Path(diagnostic_dir) if diagnostic_dir else None
         self.cancel=cancel;self.research_cutoff=research_cutoff
         if not 1<=max_requests<=12:raise ValueError('Source review request budget must be 1..12')
@@ -1022,6 +1050,14 @@ class EvidenceReviewer:
                  "summary_context":summary_context,
                  "summary_quote_refs":{aliases[rid]:list(index[aliases[rid]]) for rid in next((t['evidence_ids'] for t in targets if t.get('summary_span')),[])},
                  "instruction":"Return verdicts only, with short reasons and at most 12 quotes per target. Each quote has source_id (R1...) and excerpt_id (Q12...). For positive support select excerpt IDs from quote_index under THAT target's evidence_ids. Counterevidence and negative verdicts may quote any source in this request's quote_index; use purpose=counterevidence for counterquotes, which never count as positive support. A real supplied source omitted from the author's claim is citation_missing, not permission to invent or add sources. Do not copy long record hashes or write quote text. Return scope_alignment explicitly and compare literal claim scope with source scope in reason. For premise_check_required targets return premise_assessment explicitly; unsupported/conflicting factual premises require insufficient or contradicted, never conditional. Quotes must cover the actual premise. Pure future inquiry or declared process limits may use none+conditional without a quote. If eligible sources cannot support the whole claim, mark insufficient with no invented quote."}
+        calendar=_review_calendar(semantic_targets)
+        if calendar:
+            payload['calendar_reference']={
+                'weekdays':calendar,
+                'instruction':'Use these host-computed Gregorian weekdays to check a reported day of week. '
+                              'An article date, table date, URL date or capture time does not by itself establish an event date. '
+                              'Keep conflicting dates qualified unless supplied evidence resolves them.',
+            }
         if self.settings.base_url!=PLAN_BASE_URL:raise ValueError("Only the authorized Plan endpoint is supported")
         self.rounds+=1
         diagnostics=[]
@@ -1093,8 +1129,14 @@ class EvidenceReviewer:
                     diagnostic.update(status='invalid_response',error=str(exc)[:500]);retain_diagnostic(diagnostic);diagnostics.append(diagnostic)
                     if self.emit:self.emit('review_invalid',{'review_id':diagnostic['review_id'],'error':str(exc)[:500],'usage':usage,'stage':stage})
                     if repair==1:raise ValueError('证据审核返回无效结果，未计为通过：'+str(exc)[:500]) from None
-                    instruction=('Return findings only, using exact target claim_text and known source/excerpt IDs. Do not invent positive verdicts or drop a genuine objection merely to repair format. '
-                        if stage=='scope_critic' else '必须覆盖全部target，source_id用R1等别名，阳性支持只来自该target绑定的来源；负判/明确反证可用本次提供的全局来源。未知source/excerpt或非原文须纠正；不要为了通过格式检查改成无依据的肯定判定；若允许来源不足，标insufficient。')
+                    instruction=(
+                        'Return findings only. Copy claim_text directly from the named target statement, preserving case and punctuation. '
+                        'If needed, copy the entire target statement. Keep real objections and use supplied source/excerpt IDs.'
+                        if stage=='scope_critic' else
+                        'Cover every target and critic finding. Each quote needs both source_id (R...) and excerpt_id (Q...). '
+                        'Copy exact target_text from the finding or named target for literal_target and declared_process adjudication. '
+                        'Positive support uses only the target-bound sources. If they cannot substantiate the claim, mark insufficient.'
+                    )
                     messages.extend([AIMessage(content=content),HumanMessage(content='审核输出有格式或引用指向错误。请纠正后重新输出完整JSON；'+instruction+'具体错误：'+str(exc)[:500])])
                     continue
                 diagnostic['status']=result['status'];retain_diagnostic(diagnostic);diagnostics.append(diagnostic)
@@ -1107,7 +1149,7 @@ class EvidenceReviewer:
                 critic_payload={k:v for k,v in payload.items() if k not in ('required_json_schema','instruction')}
                 if adjudicated:critic_payload['process_context']=process_context
                 critic_payload.update(stage='scope_critic',required_json_schema=critic_schema,
-                    instruction='Find concrete time, comparative, attribution or event-status problems only. Return {"findings": [...]} with exact target claim_text and supplied source/excerpt witnesses. No positive verdicts; an empty findings list does not approve any target.')
+                    instruction='Find concrete time, comparative, attribution or event-status problems only. Return {"findings": [...]} with exact claim_text copied from the affected target statement, preserving its case and punctuation. Copy the whole target statement if needed. Use supplied source/excerpt witnesses. No positive verdicts; an empty findings list does not approve any target.')
                 critic,actual,usage=stage_request('scope_critic',SCOPE_CRITIC_SYSTEM,critic_payload,
                     lambda value:check_scope_critic(value,semantic_targets,texts,index,source_ids,review_version=version))
                 critic.update(context_sha256=scope_critic_context_hash(targets,texts,summary_context,payload['report_scope'],self.research_cutoff,
@@ -1143,7 +1185,9 @@ class EvidenceReviewer:
                             result.update(host_disclosure_target_id=host_disclosure_id,raw_full_response=value)
                         return result
                 review,actual,usage=stage_request('full_review',full_system,full_payload,validate_full)
-        finally:model.http_client.close()
+        finally:
+            if client := getattr(model,'http_client',None):
+                client.close()
         review.update(review_id="review-"+identity[:24],review_version=version,reviewed_at=utcnow(),
                       reviewer_model=actual,usage=usage,evidence_text=texts,targets=targets,summary_context=summary_context,
                       request_usages=[d['usage'] for d in diagnostics],format_repairs=sum(d['status']=='invalid_response' for d in diagnostics))

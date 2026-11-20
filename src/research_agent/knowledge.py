@@ -290,7 +290,7 @@ class KnowledgeStore:
     def search_news(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False):
         return self._news_candidates(query,asset,cutoff,limit,original_only,material_only)
 
-    def _news_candidates(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False,ceiling=30,availability_mode='strict',start=None,end=None,diversify=False,acquisition_cutoff=None):
+    def _news_candidates(self,query='',asset='ETH',cutoff=None,limit=8,original_only=False,material_only=False,ceiling=30,availability_mode='strict',start=None,end=None,diversify=False,acquisition_cutoff=None,source_url=None):
         if asset not in ('ETH','BTC','ALL'):raise ValueError('Supported assets are ETH, BTC, ALL')
         if not 1<=limit<=ceiling:raise ValueError('Limit must be 1..'+str(ceiling))
         if availability_mode not in ('observed','strict'):raise ValueError('Unknown memory availability mode')
@@ -308,6 +308,9 @@ class KnowledgeStore:
         if asset!='ALL':where.append('v.assets LIKE ?');params.append('%"'+asset+'"%')
         if original_only:where.append("d.kind='page'")
         if material_only:where.append("d.kind IN ('page','feed_item')")
+        if source_url:
+            where.append('d.doc_id=?')
+            params.append(hashlib.sha256(('page|'+source_url).encode()).hexdigest()[:24])
         # Select the newest eligible version per URL/source kind, not its future revision.
         where.append('NOT EXISTS (SELECT 1 FROM versions later JOIN evidence le ON le.record_id=later.record_id WHERE later.doc_id=v.doc_id AND (instant_us(later.first_seen_at)>instant_us(v.first_seen_at) OR (instant_us(later.first_seen_at)=instant_us(v.first_seen_at) AND later.rowid>v.rowid)) AND instant_us(later.first_seen_at)<=instant_us(?) AND (later.published_at IS NULL OR instant_us(later.published_at)<=instant_us(?)) AND capture_us(le.body)<=instant_us(?))');params.extend([known_by,cutoff,known_by])
         sql='SELECT v.*,d.url,d.kind FROM versions v JOIN documents d ON d.doc_id=v.doc_id JOIN evidence e ON e.record_id=v.record_id WHERE '+ ' AND '.join(where)+' ORDER BY instant_us(coalesce(v.published_at,v.first_seen_at)) DESC,v.version_id'
@@ -330,6 +333,23 @@ class KnowledgeStore:
         originals={r['record_id']:r for r in rows}
         for row in selected:row['source_content_sha256']=source_content_fingerprint(dict(originals[row['record_id']]))
         return selected
+
+    def news_originals_by_url(self,url,*,cutoff,acquisition_cutoff,start=None,end=None):
+        """Find saved original IDs without fuzzy retrieval or a network request."""
+        normalized=canonical_url(url)
+        local=self._news_candidates(asset='ALL',cutoff=cutoff,original_only=True,
+            availability_mode='observed',acquisition_cutoff=acquisition_cutoff,
+            start=start,end=end,source_url=normalized,limit=1)
+        library=getattr(self,'library',None)
+        archived=[]
+        if library:
+            lower=max(timestamp(start or library.window_start),timestamp(library.window_start))
+            upper=min(timestamp(end or cutoff),timestamp(cutoff),timestamp(library.window_end))
+            if lower<upper:
+                urls=tuple(dict.fromkeys((url,normalized))) if not urlsplit(url).fragment else (url,)
+                archived=library.search_documents(start=lower,end=upper,mode='strict',
+                    known_by=acquisition_cutoff,exact_urls=urls,limit=8)['results']
+        return list(dict.fromkeys(row['record_id'] for row in [*local,*archived]))
 
     def event_history(self,asset='ETH',cutoff=None,limit=120):
         if asset not in ('ETH','BTC','ALL'):raise ValueError('Supported assets are ETH, BTC, ALL')
@@ -555,6 +575,53 @@ class KnowledgeStore:
             row=c.execute('SELECT body FROM reports WHERE report_id=?',(report_id,)).fetchone()
         if not row:raise ValueError('Saved report not found')
         return json.loads(row['body'])
+
+    def previous_report_for_leads(self, *, asset, session_id, as_of, window_start=None,
+                                  window_end=None, series_id=None, series_report_ids=(), mode='observed'):
+        """Select a saved, reviewed earlier period within this knowledge store."""
+        if mode not in ('observed', 'strict') or asset not in ('ETH', 'BTC', 'ALL'):
+            raise ValueError('Invalid report lead scope')
+        assets = ['BTC', 'ETH'] if asset == 'ALL' else [asset]
+        params = dict(session=session_id, series=series_id or None, series_reports=dumps(list(series_report_ids)),
+                      assets=dumps(assets), asset_count=len(assets), cutoff=as_of,
+                      start=window_start, end=window_end, strict=mode == 'strict')
+        with self.connect() as db:
+            row = db.execute("""
+                WITH candidates AS (
+                    SELECT r.report_id, r.session_id, r.created_at, r.body,
+                           json_extract(r.body, '$.report.scope.assets') AS assets,
+                           instant_us(json_extract(r.body, '$.report.scope.start')) AS period_start,
+                           instant_us(json_extract(r.body, '$.report.scope.end')) AS period_end,
+                           CASE
+                             WHEN r.report_id IN (SELECT value FROM json_each(:series_reports))
+                               OR :series IN (json_extract(r.body,'$.run_metadata.series_id'),
+                                              json_extract(r.body,'$.run_metadata.subscription_id'))
+                             THEN 0 WHEN r.session_id=:session THEN 1 ELSE 2
+                           END AS priority
+                    FROM reports r LEFT JOIN memory_output_receipts receipt
+                       ON receipt.output_id=r.report_id AND receipt.kind='report'
+                    WHERE json_extract(r.body,'$.review.status')='reviewed'
+                      AND coalesce(json_extract(r.body,'$.report.delivery_kind'),'full') IN ('full','minimal')
+                      AND instant_us(r.created_at)<=instant_us(:cutoff)
+                      AND (NOT :strict OR instant_us(receipt.known_at)<=instant_us(:cutoff))
+                )
+                SELECT * FROM candidates
+                WHERE period_start < period_end AND period_end <= instant_us(:cutoff)
+                  AND (:start IS NULL OR period_start < instant_us(:start))
+                  AND (:end IS NULL OR period_end < instant_us(:end))
+                  AND json_array_length(assets)=:asset_count
+                  AND (SELECT count(DISTINCT value) FROM json_each(assets)
+                        WHERE value IN (SELECT value FROM json_each(:assets)))=:asset_count
+                ORDER BY priority, period_end DESC, instant_us(created_at) DESC, report_id
+                LIMIT 1
+            """, params).fetchone()
+        if row is None:
+            return None
+        body = json.loads(row['body'])
+        self._output_receipt(row['report_id'], body)
+        return {'report_id': row['report_id'], 'session_id': row['session_id'],
+                'created_at': row['created_at'], 'body': body,
+                'selection_basis': ('same_series', 'same_session', 'workspace_asset')[row['priority']]}
 
     def retain_answer(self,answer_id,session_id,body):
         if body.get('review',{}).get('status')!='reviewed':

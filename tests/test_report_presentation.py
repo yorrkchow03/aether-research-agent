@@ -19,7 +19,8 @@ from research_agent.report_presentation import (
     build_report_presentation, document_review_targets, presentation_evidence_ids, report_timeline,
     report_watch_items,
 )
-from research_agent.report_recovery import ARCHIVE_LIMITATION, omit_rejected_optional_items, prepare_report_documents
+from research_agent.report_recovery import (ARCHIVE_LIMITATION, LEGACY_ARCHIVE_LIMITATION,
+                                           omit_rejected_optional_items, prepare_report_documents)
 from research_agent.review import review_targets
 from research_agent.reports import ReportDraft, render_report, validate_report
 from research_agent.tools import ResearchTools
@@ -128,6 +129,20 @@ class ReportPresentationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'case-sensitive.*close_usd.*publish_saved_report'):
                 self.present(payload)
         self.assertEqual(self.present()['charts'][0]['metric'], 'close_usd')
+
+    def test_markdown_without_chart_preserves_cited_market_metrics(self):
+        projection=self.present()
+        projection['charts']=[]
+        payload=deepcopy(self.payload)
+        metric_claim={'statement':'The saved close was 2200 USD.',
+            'evidence_ids':[SERIES],'metric':'close_usd','value':'2200','unit':'USD'}
+        payload['observations']=[metric_claim]
+        draft=self.draft(payload)
+        markdown=render_report(draft,END,{},[],presentation=projection)
+        self.assertIn('## Key metric changes',markdown)
+        self.assertIn(draft.observations[0].statement,markdown)
+        self.assertNotIn('No price series was available',markdown)
+        self.assertNotIn('## Key data charts',markdown)
 
     def test_original_task_is_preserved_only_inside_collapsed_provenance(self):
         projection=self.present()
@@ -389,6 +404,20 @@ class ReportPresentationTests(unittest.TestCase):
         only_limit = {'claim_id': 'L1', 'reason': 'Synthetic issue.'}
         self.assertIsNone(omit_rejected_optional_items(draft, {**review, 'targets': review_targets(draft),
                                                                'revision_required': [only_limit]}))
+
+    def test_republished_archive_disclosure_targets_observation_availability(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            service=ResearchTools(fixture_run(root/'project'),root/'workspace',AS_OF,
+                                  allow_live=True,mode='observed')
+            service.lookup=self.records.__getitem__
+            draft=self.draft()
+            draft.limitations=[LEGACY_ARCHIVE_LIMITATION, 'The report uses the selected market venue.']
+            prepared=service._delivery_disclosures(draft)
+        self.assertNotIn(LEGACY_ARCHIVE_LIMITATION,prepared.limitations)
+        self.assertEqual(prepared.limitations.count(ARCHIVE_LIMITATION),1)
+        self.assertIn('The report uses the selected market venue.',prepared.limitations)
+        self.assertNotIn('publication times',ARCHIVE_LIMITATION)
 
     def test_single_disputed_clause_cannot_erase_a_material_caveat(self):
         from research_agent.review_feedback import review_failure_feedback

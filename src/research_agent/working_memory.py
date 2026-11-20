@@ -89,6 +89,7 @@ class WorkingMemory:
             'created_at': utcnow(), 'updated_at': utcnow(),
             'scope': 'Derived task state. Evidence-linked notes require original-source checks; tool output is not automatically a fact.'}
         with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
             prior = c.execute('SELECT body FROM tasks WHERE job_id=?', (job_id,)).fetchone()
             if prior:
                 existing = json.loads(prior['body'])
@@ -108,7 +109,7 @@ class WorkingMemory:
 
     def update(self, job_id, **fields):
         self._job(job_id)
-        allowed = {'plan', 'todos', 'facts', 'unknowns', 'conflicts', 'active_artifacts', 'deferred_checks', 'status'}
+        allowed = {'plan', 'todos', 'facts', 'unknowns', 'conflicts', 'active_artifacts', 'deferred_checks', 'status', 'periodic_workflow'}
         if set(fields) - allowed:
             raise ValueError('Unsupported working-memory fields')
         for fact in fields.get('facts', []):
@@ -198,9 +199,192 @@ class WorkingMemory:
             c.execute('UPDATE tasks SET body=?,revision=? WHERE job_id=?',(dumps(state,sort_keys=True),row['revision']+1,job_id))
         return {**note,'duplicate':False,'research_state_revision':row['revision']+1}
 
+    @staticmethod
+    def _question_rows(state):
+        return state['research_state'].setdefault('questions', [])
+
+    @staticmethod
+    def _load_task(connection, job_id):
+        row = connection.execute('SELECT body,revision FROM tasks WHERE job_id=?', (job_id,)).fetchone()
+        if not row:
+            raise KeyError('Unknown working-memory task')
+        return json.loads(row['body']), row['revision']
+
+    @staticmethod
+    def _save_task(connection, job_id, state, revision):
+        state['updated_at'] = utcnow()
+        connection.execute('UPDATE tasks SET body=?,revision=? WHERE job_id=?',
+            (dumps(state, sort_keys=True), revision + 1, job_id))
+        return revision + 1
+
+    def get_question(self, job_id, question_id):
+        from .question_state import validate_question_id
+
+        validate_question_id(question_id)
+        for question in self._question_rows(self.state(job_id)):
+            if question['question_id'] == question_id:
+                return question
+        raise KeyError('Unknown research question')
+
+    def put_question(self, job_id, question_id, question, *, status=None, conclusion=None,
+                     evidence_ids=None, gaps=None, origin=None):
+        """Create a question or explicitly assess its current research progress."""
+        from .question_state import assess_question, question_patch, validate_question_id
+
+        self._job(job_id)
+        validate_question_id(question_id)
+        patch = question_patch(question, status, conclusion, evidence_ids, gaps)
+        for key in ('question', 'conclusion'):
+            if key in patch:
+                patch[key] = self.redact(patch[key])
+        if 'gaps' in patch:
+            patch['gaps'] = [self.redact(gap) for gap in patch['gaps']]
+        if self.evidence_lookup:
+            for evidence_id in patch.get('evidence_ids', []):
+                try:
+                    self.evidence_lookup(evidence_id)
+                except KeyError as exc:
+                    raise ValueError(f'Question assessment references an unavailable source: {evidence_id}') from exc
+
+        with self.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            state, revision = self._load_task(connection, job_id)
+            questions = self._question_rows(state)
+            index = next((i for i, item in enumerate(questions) if item['question_id'] == question_id), None)
+            previous = None if index is None else questions[index]
+            updated = assess_question(question_id, previous, patch)
+            if origin is not None and previous is None:
+                updated['origin'] = json.loads(self.redact(_serial(origin)))
+                updated['candidate_evidence_ids'] = list(origin.get('candidate_ids', []))
+            if updated['status'] == 'ready':
+                known = {source['evidence_id'] for source in state['research_state'].get('sources', [])
+                    if source['source_status'] in ('opened', 'registered_derived')}
+                for item in questions:
+                    known.update(item['opened_evidence_ids'])
+                    known.update(item['registered_evidence_ids'])
+                if not set(updated['evidence_ids']) <= known:
+                    raise ValueError('Read or register the evidence in this research task before marking this question ready.')
+            duplicate = updated == previous
+            if not duplicate:
+                updated['updated_at'] = utcnow()
+                if index is None:
+                    updated['created_at'] = updated['updated_at']
+                    questions.append(updated)
+                else:
+                    questions[index] = updated
+                revision = self._save_task(connection, job_id, state, revision)
+        return {**updated, 'duplicate': duplicate, 'research_state_revision': revision}
+
+    def merge_questions(self, job_id, source_id, target_id):
+        """Consolidate coverage and leave the original receipt trail addressable."""
+        if source_id == target_id:
+            raise ValueError('Merge into a different question.')
+        with self.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            state, revision = self._load_task(connection, job_id)
+            by_id = {row['question_id']: row for row in self._question_rows(state)}
+            source, target = by_id.get(source_id), by_id.get(target_id)
+            if not source or not target or target.get('merged_into'):
+                raise ValueError('Both questions must exist, and the target must be active.')
+            if source.get('merged_into') == target_id:
+                return target
+            if source.get('merged_into'):
+                raise ValueError('The source question is already merged.')
+            for key in ('candidate_evidence_ids', 'opened_evidence_ids', 'registered_evidence_ids',
+                        'gaps', 'reader_findings', 'conflicts'):
+                target[key] += [item for item in source[key] if item not in target[key]]
+            if source['gaps'] and target['status'] in ('open', 'ready'):
+                target['status'] = 'needs_evidence'
+            target.setdefault('merged_questions', []).append(source_id)
+            source.update(status='deferred', merged_into=target_id, updated_at=utcnow())
+            target['updated_at'] = source['updated_at']
+            self._save_task(connection, job_id, state, revision)
+            return target
+
+    def record_question_result(self, job_id, qid, tool, args, payload, status='success', tool_call_id=None):
+        """Attach an actual tool result to a question without advancing it to ready."""
+        from .question_progress import describe_attempt, finish_attempt
+        from .question_state import merge_question_result, project_question_result
+        from .research_state import digest
+
+        self.get_question(job_id, qid)
+        if not isinstance(args, dict):
+            raise ValueError('Question observation requires actual tool arguments.')
+        if tool_call_id is not None and (not isinstance(tool_call_id, str)
+                or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,200}', tool_call_id)):
+            raise ValueError('Invalid actual tool call ID')
+        if status not in ('success', 'error'):
+            raise ValueError('Invalid actual tool result status')
+        clean_payload = self.redact(_serial(payload))
+        clean_args = json.loads(self.redact(_serial(args)))
+        artifact = self.record_tool(job_id, tool, clean_payload)
+        identity = {'job_id': job_id, 'question_id': qid, 'tool': tool, 'status': status,
+            'tool_call_id': tool_call_id, 'args_sha256': digest(clean_args), 'artifact_id': artifact['artifact_id']}
+        observation_id = 'question-observation-' + digest(identity)[:24]
+        projection = project_question_result(tool, clean_payload, status=status,
+            artifact_id=artifact['artifact_id'], observation_id=observation_id, root=self.root,
+            reader_task=tool == 'task' and clean_args.get('subagent_type') == 'evidence-reader')
+        attempt = finish_attempt(describe_attempt(tool, clean_args), projection['attempt_payload'], status=status)
+        if attempt is not None:
+            attempt['observation_id'] = observation_id
+        artifact_path = '/memory/task-state/' + Path(artifact['path']).relative_to(self.root).as_posix()
+        receipt = {**identity, **projection['reader'], 'observation_id': observation_id,
+            'known_at': utcnow(), 'artifact_path': artifact_path, 'artifact_sha256': artifact['sha256'],
+            'source_refs': projection['sources'], 'gaps': projection['gaps']}
+
+        with self.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            state, revision = self._load_task(connection, job_id)
+            questions = self._question_rows(state)
+            for item in questions:
+                for prior in item['observations']:
+                    if prior['job_id'] != job_id:
+                        continue
+                    if prior['observation_id'] == observation_id:
+                        return {**prior, 'duplicate': True, 'question_status': item['status'],
+                            'research_state_revision': revision}
+                    if tool_call_id is not None and prior['tool_call_id'] == tool_call_id:
+                        raise ValueError('A question tool call ID cannot be rebound to another question or output.')
+            index = next(i for i, item in enumerate(questions) if item['question_id'] == qid)
+            updated = merge_question_result(questions[index], receipt, projection, attempt)
+            updated['updated_at'] = receipt['known_at']
+            questions[index] = updated
+            revision = self._save_task(connection, job_id, state, revision)
+        return {**receipt, 'duplicate': False, 'question_status': updated['status'],
+            'research_state_revision': revision}
+
+    def carry_questions(self, previous_job_id, new_job_id):
+        """Carry the question ledger for an explicit continuation of the same task."""
+        self._job(previous_job_id)
+        self._job(new_job_id)
+        if previous_job_id == new_job_id:
+            return 0
+        with self.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            previous, _ = self._load_task(connection, previous_job_id)
+            current, revision = self._load_task(connection, new_job_id)
+            if any(previous.get(key) != current.get(key) for key in ('goal', 'cutoff', 'mode')):
+                raise ValueError('Cannot carry research questions into a different task or time scope.')
+            current_questions = self._question_rows(current)
+            current_ids = {item['question_id']: item['question'] for item in current_questions}
+            new_questions = []
+            for question in self._question_rows(previous):
+                qid = question['question_id']
+                if qid not in current_ids:
+                    new_questions.append({**question, 'carried_from_job_id': previous_job_id})
+                elif current_ids[qid] != question['question']:
+                    raise ValueError('A continued question ID already names a different question.')
+            if new_questions:
+                current_questions.extend(new_questions)
+                self._save_task(connection, new_job_id, current, revision)
+            return len(new_questions)
+
     def state_snapshot(self, job_id):
         """Write an immutable per-revision JSON view, preserving the SQL source."""
-        state=self.state(job_id);body=dumps(state,sort_keys=True,indent=2).encode()
+        return self._state_snapshot(self.state(job_id))
+
+    def _state_snapshot(self, state):
+        job_id=state['job_id'];body=dumps(state,sort_keys=True,indent=2).encode()
         directory=self.root/'states'/job_id;directory.mkdir(parents=True,exist_ok=True)
         if not directory.resolve().is_relative_to(self.root):raise ValueError('Working state directory escaped its root')
         path=directory/('revision-'+str(state['revision'])+'.json')
@@ -301,7 +485,8 @@ class WorkingMemory:
         if not 256 <= budget_chars <= 32000:
             raise ValueError('Working context budget must be 256..32000 characters')
         from .research_state import empty_state
-        state=self.state(job_id);snapshot=self.state_snapshot(job_id)
+        from .question_state import question_context
+        state=self.state(job_id);snapshot=self._state_snapshot(state)
         research=state.get('research_state') or empty_state()
         header='Working task memory (derived, not source evidence).\nFull state relative to memory root: '+snapshot['relative_path']+'\n'
         # A long user request must not crowd unresolved conflicts out of memory.
@@ -312,20 +497,29 @@ class WorkingMemory:
         # full target index first; issue details remain in immutable artifacts.
         critical_limit=min(3600,max(900,budget_chars//2))
         critical_view=_issue_navigation(critical,critical_limit) if critical else []
-        fields += [('Unresolved tool/review issues','research_unknowns',critical_view),
-            ('Conflicts to preserve','conflicts',[*state.get('conflicts',[]),*research.get('conflicts',[])]),
+        conflicts=[*state.get('conflicts',[]),*research.get('conflicts',[])]
+        known_links=any(isinstance(row,dict) and row.get('kind')=='source_relationship' for row in conflicts)
+        fields.append(('Unresolved tool/review issues','research_unknowns',critical_view))
+        question_rows=research.get('questions',[])
+        if question_rows:
+            fields.append(('Research questions','questions',question_context(question_rows,min(1300,budget_chars//3))))
+        phase_plan = (state.get('periodic_workflow') or {}).get('stages')
+        fields += [
+            ('Saved source links and conflicts' if known_links else 'Conflicts to preserve','conflicts',conflicts),
             ('Unknowns','unknowns',state.get('unknowns',[])),
             ('Saved publication receipts','publications',research.get('publications',[])),
             ('Check receipts (not truth certificates)','checks',research.get('checks',[])[-8:]),
             ('Source pointers; inspect originals','sources',[{k:r[k] for k in ('evidence_id','source_status','artifact_id','published_at','retrieved_at','observed_at','period_end') if k in r} for r in research.get('sources',[])[-8:]]),
             ('Explicit unverified research notes','derived_notes',research.get('derived_notes',[])[-6:]),
             ('Deferred checks','deferred_checks',state.get('deferred_checks',[])),
-            ('Plan','plan',state.get('plan',[])),('Todos','todos',state.get('todos',[])),
+            ('Plan','plan',phase_plan or state.get('plan',[])),
+            ('Todos','todos',[] if phase_plan else state.get('todos',[])),
             ('Evidence-linked notes (not automatic verification)','facts',state.get('facts',[])),
             ('Active artifacts','active_artifacts',state.get('active_artifacts',[])[-8:])]
         artifacts=self.artifacts(job_id,limit=4)
         fields.append(('Recent saved outputs','artifacts',[{k:r[k] for k in ('artifact_id','tool','path','bytes','evidence_ids')} for r in artifacts]))
         counts={key:len(research.get(key,[])) for key in ('sources','checks','unknowns','conflicts','publications','derived_notes')}
+        if question_rows:counts['questions']=len(question_rows)
         summary='Persisted research counts: '+', '.join(k+'='+str(v) for k,v in counts.items() if v)+'.\n' if any(counts.values()) else ''
         reserve='[View omits state; read full revision file before resolving or citing omitted material.]'
         # Keep the state reference intact under the minimum context budget.

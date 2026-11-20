@@ -2,7 +2,10 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from langchain.agents.middleware.types import ModelRequest
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage,HumanMessage,ToolMessage
+from research_agent.prompts import research_system_prompt
 from research_agent.report_context import delivery_view,CompleteAfterPublication,ReportContextMiddleware,report_checkpoint_tool
 from research_agent.source_views import focused_source_view
 from research_agent.tool_result_views import recommended_view_budget
@@ -18,6 +21,97 @@ class Request(SimpleNamespace):
 
 
 class ReportContextTests(unittest.TestCase):
+    def test_periodic_report_prompt_leaves_method_to_skill(self):
+        meta = {'cutoff': '2026-10-25T00:00:00Z', 'mode': 'observed'}
+        prompt = research_system_prompt(meta, True, True, periodic=True)
+        self.assertIn('/skills/research/SKILL.md', prompt)
+        self.assertIn('independent source review', prompt)
+        for legacy_instruction in ('fund flows', 'reading order', 'Use date-scoped', 'scope and publish', 'write_todos'):
+            self.assertNotIn(legacy_instruction, prompt)
+        self.assertIn('For broad period reports follow this reading order', research_system_prompt(meta, True, True))
+
+    def test_periodic_report_tracks_workflow_phases_past_legacy_cutoff(self):
+        phase = 'prepare'
+        verified = False
+        captured = []
+        events = []
+
+        def reserve_delivery():
+            nonlocal phase
+            self.assertEqual(phase, 'verify')
+            self.assertTrue(verified)
+            phase = 'draft'
+
+        workflow = SimpleNamespace(phase=lambda: phase, has_verified_evidence=lambda: verified,
+                                   pending_originals=lambda: captured, reserve_delivery=reserve_delivery)
+        service = SimpleNamespace(latest_report_draft_id=None, used_records=('candidate',))
+        names = ['get_research_leads', 'write_todos', 'task', 'read_evidence', 'save_report_draft', 'publish_report', 'publish_saved_report']
+        request = ModelRequest(model=FakeMessagesListChatModel(responses=[]),
+            messages=[HumanMessage(content='Create an ETH weekly report.'), result('register_calculation', {}, 'old')],
+            tools=[{'name': name} for name in names])
+        middleware = ReportContextMiddleware(lambda kind, event: events.append((kind, event)), service,
+                                              max_model_calls=10, periodic_workflow=workflow)
+
+        def turn(expected):
+            selected = middleware.wrap_model_call(request, lambda value: value)
+            self.assertEqual([tool['name'] for tool in selected.tools], expected)
+            self.assertEqual(selected.messages, request.messages)
+            return str(selected.system_message.content)
+
+        turn(names[:4])
+        phase = 'discover'
+        for _ in range(5):
+            turn(names[:4])
+        phase = 'verify'
+        turn(['task', 'read_evidence'])
+        captured.append(('Q1', 'page-' + 'a' * 24))
+        guidance = turn(['read_evidence'])
+        self.assertIn('Q1 page-' + 'a' * 24, guidance)
+        verified = True
+        turn(['save_report_draft'])
+        phase = 'review'
+        service.latest_report_draft_id = 'draft-test'
+        guidance = turn(['publish_report', 'publish_saved_report'])
+        self.assertIn('/drafts/draft-test.json', guidance)
+        self.assertIn('publish_saved_report and empty edits', guidance)
+        with self.assertRaisesRegex(RuntimeError, 'authoring budget ended'):
+            middleware.wrap_model_call(request, lambda value: value)
+        self.assertEqual([(kind, data['phase'], data['author_call']) for kind, data in events], [
+            ('report_author_phase', 'prepare', 1), ('report_author_phase', 'discover', 2),
+            ('report_author_phase', 'verify', 7), ('report_author_phase', 'draft', 9),
+            ('report_author_phase', 'review', 10),
+        ])
+
+    def test_periodic_repeat_of_deterministic_preflight_targets_exact_optional_row(self):
+        original = HumanMessage(content='Create a weekly report.')
+
+        def rejected(path, identifier):
+            return ToolMessage(name='publish_saved_report', tool_call_id=identifier, status='error',
+                content=f'Source-data validation failed at {path}. Unverified example value 12345.')
+
+        first = rejected('/observations/4', 'first')
+        same_row = rejected('/observations/4', 'second')
+        other_row = rejected('/observations/2', 'different')
+        names = ['publish_report', 'publish_saved_report', 'read_evidence']
+        request = ModelRequest(model=FakeMessagesListChatModel(responses=[]), messages=[original, first],
+                               tools=[{'name': name} for name in names])
+        middleware = ReportContextMiddleware(service=SimpleNamespace(latest_report_draft_id='draft-test'),
+            max_model_calls=32, periodic_workflow=SimpleNamespace(phase=lambda: 'review'))
+
+        for history in ([original, first], [original, first, other_row]):
+            control = middleware.wrap_model_call(request.override(messages=history), lambda value: value)
+            self.assertEqual([tool['name'] for tool in control.tools], names)
+            self.assertNotIn('use an exact remove edit', str(control.system_message.content))
+
+        history = [original, first, same_row]
+        repair = middleware.wrap_model_call(request.override(messages=history), lambda value: value)
+        self.assertEqual([tool['name'] for tool in repair.tools], ['publish_saved_report'])
+        self.assertEqual(repair.messages, history)
+        guidance = str(repair.system_message.content)
+        self.assertIn('use an exact remove edit on /observations/4', guidance)
+        self.assertIn('Keep checked rows intact', guidance)
+        self.assertNotIn('12345', guidance)
+
     def test_successful_calculation_offers_early_checkpoint_then_allows_research(self):
         names = ['save_report_draft','read_evidence','search_web','publish_report','publish_saved_report','write_todos']
         request = Request(messages=[HumanMessage(content='A report'),result('register_calculation',{},'calculation')],
@@ -32,8 +126,12 @@ class ReportContextTests(unittest.TestCase):
         for _ in range(16):
             delivery = middleware.wrap_model_call(request,lambda value:value)
         self.assertNotIn('search_web',[tool['name'] for tool in delivery.tools])
-        for _ in range(14):
-            middleware.wrap_model_call(request,lambda value:value)
+        for _ in range(11):
+            delivery = middleware.wrap_model_call(request,lambda value:value)
+        self.assertIn('read_evidence',[tool['name'] for tool in delivery.tools])
+        for _ in range(3):
+            submission = middleware.wrap_model_call(request,lambda value:value)
+            self.assertEqual([tool['name'] for tool in submission.tools],['publish_report','publish_saved_report'])
         with self.assertRaisesRegex(RuntimeError,'authoring budget ended'):
             middleware.wrap_model_call(request,lambda value:value)
 

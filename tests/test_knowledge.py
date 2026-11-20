@@ -10,6 +10,7 @@ from research_agent.knowledge import KnowledgeStore,canonical_url
 from research_agent.tools import ResearchTools
 from research_agent.runtime import AgentRuntime,PROJECT_ROOT
 from research_agent.answers import AnswerDraft,validate_answer
+from research_data.library import ResearchLibrary
 
 
 class KnowledgeTests(unittest.TestCase):
@@ -64,6 +65,48 @@ class KnowledgeTests(unittest.TestCase):
         self.assertEqual(tools.evidence(row['record_id'])['record']['text'],row['text'])
         forbidden=ResearchTools(run,self.root/'historical','2026-01-01T00:00:00Z',knowledge=self.store)
         with self.assertRaises(ValueError):forbidden.lookup(row['record_id'])
+
+    def test_exact_saved_url_distinguishes_misses_and_uses_both_time_bounds(self):
+        first=self.page()
+        future=self.page('b','2026-01-15T00:00:00Z','Ethereum upgrade was cancelled.')
+        other=self.page('c',text='A similarly named Ethereum upgrade.')
+        other['url']='https://example.org/another-upgrade'
+        for row in (first,future,other):
+            self.store.register(row)
+        run=fixture_run(self.root/'project')
+        tools=ResearchTools(run,self.root/'workspace','2026-02-01T00:00:00Z',allow_live=True,knowledge=self.store)
+        tool=next(item for item in tools.as_tools() if item.name=='find_saved_news_url')
+        window={'start':'2026-01-01T00:00:00Z','end':'2026-02-01T00:00:00Z'}
+        url='https://example.org/upgrade?utm_campaign=ignored'
+        with self.assertRaises(ValueError):
+            tool.invoke({'url':'https://user:password@example.org/upgrade'})
+        scoped=json.loads(tool.invoke({'url':url,'as_of':'2026-01-12T00:00:00Z',
+            'start':window['start'],'end':'2026-01-10T00:00:00Z'}))
+        self.assertEqual([item['record_id'] for item in scoped['results']],[first['record_id']])
+        self.assertNotIn('text',scoped['results'][0])
+        current=json.loads(tool.invoke({'url':url,**window,'as_of':'2026-02-02T00:00:00Z'}))
+        self.assertEqual([item['record_id'] for item in current['results']],[future['record_id']])
+        for query in ('https://example.org/not-in-store','https://example.org/upgrade#other-post'):
+            missing=json.loads(tool.invoke({'url':query,**window,'as_of':'2026-02-02T00:00:00Z'}))
+            self.assertEqual((missing['status'],missing['results']),('saved_source_unavailable',[]))
+
+    def test_exact_archived_url_preserves_forum_post_and_archive_capture_cutoff(self):
+        self.store.library=library=ResearchLibrary(self.root/'library',
+            window_start='2026-01-01T00:00:00Z',window_end='2026-02-01T00:00:00Z')
+        base='https://example.org/governance'
+        first_url=base+'#one'
+        other_url=base+'#two'
+        publication='2026-01-05T00:00:00Z'
+        for url,body,known in ((first_url,'Initial proposal','2026-01-06T00:00:00Z'),
+                               (first_url,'Later correction','2026-01-16T00:00:00Z'),
+                               (other_url,'Another post','2026-01-06T00:00:00Z')):
+            capture=library.capture('forum',url,body.encode(),retrieved_at=known)
+            rid=library.put_document('forum',url,'Forum topic',body,capture,published_at=publication)
+            if body=='Initial proposal':
+                old=rid
+        until={'cutoff':'2026-01-10T00:00:00Z','acquisition_cutoff':'2026-01-12T00:00:00Z'}
+        self.assertEqual(self.store.news_originals_by_url(first_url,**until),[old])
+        self.assertEqual(self.store.news_originals_by_url(base,**until),[])
 
     def test_event_revisions_require_review_and_preserve_cutoff(self):
         row=self.page();self.store.register(row)

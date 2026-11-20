@@ -52,7 +52,7 @@ def check_framework():
             expected = {'list_data_sources', 'request_public_api', 'search_web', 'fetch_webpage',
                 'read_evidence', 'register_calculation', 'get_private_portfolio',
                 'record_news_event', 'submit_research_answer', 'publish_report', 'publish_saved_report',
-                'get_research_context', 'recall_memory'}
+                'get_research_context', 'recall_memory', 'find_saved_news_url'}
             assert set(names) == expected
     return {'status': 'passed', 'python': platform.python_version(), 'demo': demo,
             'current_business_tools': names, 'sdk_operations': sorted(SDK_OPERATIONS),

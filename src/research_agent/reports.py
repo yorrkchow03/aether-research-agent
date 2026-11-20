@@ -1,6 +1,7 @@
 """Typed research reports with mandatory citation and numeric-field checks."""
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from functools import cache
 from html import escape
@@ -17,6 +18,13 @@ from .report_presentation import (FeaturedDocument, ReportChart, ReportScope,
                                   report_display_limits, report_display_summary, report_display_title,
                                   report_timeline, report_watch_items)
 from .etf_flow_validation import check_etf_flow_statement
+
+
+GREGORIAN_WEEKDAYS = ('Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+_LEADING_DATE_WEEKDAY = re.compile(
+    r'^\s*(\d{4}-\d{2}-\d{2})\s*\((' + '|'.join(GREGORIAN_WEEKDAYS) + r')\)',
+    re.IGNORECASE,
+)
 
 
 def distinct_sources(sources):
@@ -118,6 +126,19 @@ def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None, 
     claim_paths=[f'/{field}/{index}' for field in ('observations','key_changes','interpretations')
                  for index, _ in enumerate(getattr(draft,field))]
     claims=report_claims(draft)
+    calendar_labels_checked=0
+    for claim,path in zip(claims,claim_paths):
+        label=_LEADING_DATE_WEEKDAY.match(claim.statement)
+        if label:
+            day,weekday=label.groups()
+            try:
+                expected=GREGORIAN_WEEKDAYS[date.fromisoformat(day).weekday()]
+            except ValueError:
+                raise ValueError(f'Invalid calendar date {day} at {path}/statement') from None
+            if weekday.casefold()!=expected.casefold():
+                raise ValueError(f'Calendar label at {path}/statement says {weekday}, but {day} falls on '
+                                 f'{expected}. Check the event date with the original before editing.')
+            calendar_labels_checked+=1
     checked,numeric=validate_claims(claims,lookup,claim_paths=claim_paths)
     for rid in draft.narrative_evidence_ids:lookup(rid);checked.add(rid)
     media=resolve_report_media(draft,lookup,evidence_as_of=as_of,raw_reader=raw_reader)
@@ -141,6 +162,8 @@ def validate_report(draft: ReportDraft, lookup, as_of=None, *, raw_reader=None, 
     result={"status":"passed","unique_evidence_records":len(checked),"numeric_claims_checked":numeric,
             "explanations_checked":explanation_check['explanations_checked'],
             "scope":"Citation eligibility and structured numeric fields; does not prove the prose, causation or forecasts."}
+    if calendar_labels_checked:
+        result['calendar_labels_checked']=calendar_labels_checked
     if check_etf_flows:
         dated_totals = sum(
             check_etf_flow_statement(claim.statement, claim.evidence_ids, lookup, path=path, raw_reader=raw_reader)
@@ -213,9 +236,8 @@ def render_report(draft: ReportDraft, cutoff, validation, sources, online_throug
                   "- Evidence cutoff " + overview["evidence_as_of"]]
     charts = (presentation or {}).get("charts", [])
     if factual:
-        lines += ["", "## Key data charts", ""]
-        if not charts:
-            lines.append("No price series was available for this report.")
+        if charts:
+            lines += ["", "## Key data charts", ""]
         for chart in charts:
             first,last=chart["points"][0],chart["points"][-1]
             lines += ["", "### " + escape(chart["asset"] + " " + chart["title"]), "",

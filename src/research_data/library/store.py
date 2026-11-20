@@ -304,7 +304,7 @@ class ResearchLibrary:
             'total':len(unique),'records':selected,'next_offset':offset+limit if offset+limit<len(unique) else None,
             'scope':'Retrospective observations; acquisition time does not authenticate original historical availability' if mode=='observed' else 'Only versions locally acquired by known_by'}
 
-    def search_documents(self,query='',*,asset=None,start=None,end=None,kind=None,source=None,mode='observed',known_by=None,limit=30,offset=0):
+    def search_documents(self,query='',*,asset=None,start=None,end=None,kind=None,source=None,mode='observed',known_by=None,limit=30,offset=0,exact_urls=()):
         if mode not in ('observed','strict') or not 1<=limit<=100 or offset<0:raise ValueError('Invalid document query')
         import re
         start=start or self.window_start;end=end or self.window_end
@@ -317,6 +317,12 @@ class ResearchLibrary:
         if asset:where.append("json_extract(v.body,'$.assets') LIKE ?");params.append('%"'+asset.upper()+'"%')
         if kind:where.append('d.kind=?');params.append(kind)
         if source:where.append('d.source_id=?');params.append(source)
+        if exact_urls:
+            if (not isinstance(exact_urls,(tuple,list)) or len(exact_urls)>2
+                    or any(not isinstance(url,str) or not url for url in exact_urls)):
+                raise ValueError('Supply one or two exact archived URLs')
+            where.append('d.url IN ('+','.join('?' for _ in exact_urls)+')')
+            params.extend(exact_urls)
         if mode=='strict':where.append('v.known_at<=?');params.append(instant(known_by or end))
         latest="NOT EXISTS (SELECT 1 FROM document_versions newer WHERE newer.document_id=v.document_id AND (newer.known_at>v.known_at OR (newer.known_at=v.known_at AND newer.rowid>v.rowid))"
         latest+=' AND newer.published_at>=? AND newer.published_at<?'

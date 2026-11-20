@@ -78,8 +78,11 @@ class SummaryUsageRecorder(BaseCallbackHandler):
 
 def make_context_middleware(model, backend, emit, *, trigger_tokens=None,token_counter=None):
     # A shallow copy shares the job's authorized client, not a second credential.
-    summary_model = model.model_copy(update={'max_tokens': 4096,
-                                             'callbacks': [SummaryUsageRecorder(emit)]})
+    options_for_summary = {'max_tokens': 4096, 'callbacks': [SummaryUsageRecorder(emit)]}
+    from .bridge import ConversationModel
+    if isinstance(model,ConversationModel) and model.role == 'author':
+        options_for_summary.update(role='compaction',calls=0)
+    summary_model = model.model_copy(update=options_for_summary)
     options={'token_counter':token_counter} if token_counter else {}
     policy=context_policy(model,trigger_tokens=trigger_tokens)
     emit('context_policy_configured',policy)

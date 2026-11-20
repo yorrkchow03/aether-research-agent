@@ -21,6 +21,7 @@ from langchain_openai.chat_models.base import OpenAITimeoutError
 
 from research_agent.evidence_reader import build_evidence_reader,validate_reader_result,_ReaderBudget,ReaderResult,ReaderAccessError,write_reader_artifacts,_compact_reader_output
 from research_agent.tools import ResearchTools
+from research_agent.working_memory import WorkingMemory
 
 
 RID='page-'+'a'*24
@@ -97,6 +98,44 @@ class ReaderTests(unittest.TestCase):
         finished=[data for kind,data in self.events if kind=='reader_model_finished']
         self.assertEqual(finished[-1]['usage'],{'input_tokens':120,'output_tokens':35,'total_tokens':155})
         self.assertEqual(finished[-1]['actual_model'],'doubao-seed-2.1-pro')
+
+    def test_question_scoped_reader_stops_retrying_a_declined_read(self):
+        self.service.working_memory=memory=WorkingMemory(self.root/'task-state')
+        self.service.job_id='reader-job'
+        memory.begin('reader-job','Check the upgrade schedule')
+        memory.put_question('reader-job','Q1','What date is confirmed?')
+        memory.put_question('reader-job','Q2','What release was deployed?')
+        responses=[]
+        for index in range(4):
+            read=self.read_response()
+            responses.append(read.model_copy(update={'tool_calls':[{**read.tool_calls[0],'id':f'read-{index}'}]}))
+
+        result,_,receipt=self.invoke(responses,question='[Q1] Inspect the saved public upgrade announcement.')
+
+        self.assertEqual(result['status'],'incomplete')
+        self.assertEqual(receipt['tool_calls'],2)
+        self.assertEqual(receipt['read_ids'],[RID])
+        self.assertEqual(len(memory.get_question('reader-job','Q1')['attempts']),2)
+        self.assertFalse(memory.get_question('reader-job','Q2')['attempts'])
+        self.assertEqual(sum(kind=='reader_no_progress' for kind,_ in self.events),2)
+
+    def test_reader_can_open_its_own_range_after_other_attempts(self):
+        self.service.working_memory=memory=WorkingMemory(self.root/'task-state')
+        self.service.job_id='reader-job'
+        memory.begin('reader-job','Check the upgrade schedule')
+        memory.put_question('reader-job','Q1','What date is confirmed?')
+        read=self.read_response()
+        for index in range(2):
+            memory.record_question_result('reader-job','Q1','read_evidence',read.tool_calls[0]['args'],
+                {'record': self.rows[RID]},tool_call_id=f'prior-{index}')
+
+        result,_,receipt=self.invoke([read,self.typed_response(self.output())],
+            question='[Q1] Inspect the saved public upgrade announcement.')
+
+        self.assertEqual(result['status'],'completed',result)
+        self.assertEqual(receipt['read_ids'],[RID])
+        self.assertEqual(receipt['tool_calls'],1)
+        self.assertEqual(len(memory.get_question('reader-job','Q1')['attempts']),3)
 
     def test_opened_catalog_and_compact_packet_from_real_worker(self):
         result,_,_=self.invoke([self.read_response(),self.typed_response(self.output())])

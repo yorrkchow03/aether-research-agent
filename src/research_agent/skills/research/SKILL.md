@@ -4,8 +4,76 @@ description: Conduct new ETH/BTC investigations, collect missing original source
 ---
 # Source-based crypto research
 
-Choose depth, sources and order from the user's question. This is guidance, not a
-mandatory checklist. Read supporting references only when needed.
+Choose depth and sources from the user's question. Read supporting references
+only when needed. Use the stages below when the host identifies a periodic report.
+
+## Periodic reports
+
+Use the requested asset and UTC interval. The start is inclusive and the end is
+exclusive. A request for an asset and dates leaves topic selection to the evidence.
+
+**Prepare.** First call `get_research_leads()` to read the current user's applicable
+saved research preferences and the follow-up items from the previous eligible
+reviewed report. Apply the current request first. Saved preferences and follow-ups
+can help prioritize questions. Recheck factual premises with original evidence.
+Empty recall leaves topic selection open. Keep private preferences and details
+in the main agent and out of public searches, external ranking and both subagents.
+
+On the next turn, save the four stage items with `write_todos` in this order and
+with these exact texts. Start with `Discover sources` in progress and the other
+three pending. Update stage statuses as the work advances. Save concrete
+questions separately in task memory as evidence arrives.
+
+1. `Discover sources`
+2. `Verify selected evidence`
+3. `Synthesize and draft`
+4. `Review and publish`
+
+**S1 Discover sources.** Call `task(subagent_type="research-scout", description=...)`
+for a broad first pass with the public asset, start, end and requested deliverable.
+For an asset-and-date-only request, use an unthemed window overview. Omit guesses
+about events, thematic search terms and facets from the first pass. Review the
+scout's actual saved candidate IDs, date coverage, overlaps and gaps in the main
+agent. If needed, use a shared `recall_memory(kind="news", asset=..., start=...,
+end=...)` with an empty query and no facets. Scout results are candidate leads.
+An empty or failed lookup can justify a different public source or a coverage gap.
+
+**S2 Verify selected evidence.** The scout receipt opens verification. Form
+concrete questions from what the scout or later retrieval actually found, an
+explicit user topic, or a retrieved lead that matters to this report. Create a
+question with `update_research_question` and a stable `question_id`. Use
+`candidate_ids` for observed saved candidates, `user_excerpt` for a verbatim topic
+named in the request, or `lead_id` for a retrieved planning lead. Pass the question
+ID to focused tool calls. Use `read_evidence` for a specific original. For a
+substantial group of originals, call `task(subagent_type="evidence-reader",
+description=...)`. Start the description with `[Q…]` and give the public
+question, scope and known canonical IDs. Read short sources directly. Create
+a new question ID when a change would alter the original question. Once there
+are real candidates, refine searches or facets around material gaps.
+
+Use `recall_memory(kind="task")` to inspect current questions, sources, reader
+findings, attempts, conflicts and gaps. Use `update_research_question` to record
+a sourced assessment or an outstanding limitation. Reuse qualified, source-bound
+reader findings, and open an original when a condition or conflict remains.
+An unopened candidate, private preference, prior conclusion or scout receipt
+cannot establish a fact. Keep unresolved questions and their limits for later work.
+
+**S3 Synthesize and draft.** After opening an original or registering a checked
+calculation under a concrete question, advance with `write_todos` once there is
+enough evidence to draft. Mark the first two stages `completed`, `Synthesize and
+draft` `in_progress`, and `Review and publish` `pending`. The main agent selects
+coverage and synthesizes verified evidence, preserving source qualifications and
+unresolved gaps. Save the substantive unpublished report with `save_report_draft`.
+Return to verification if a material gap requires a missing source before review.
+
+**S4 Review and publish.** A successful draft save opens review. Submit to normal
+independent review with `publish_report` or `publish_saved_report`. Use actual
+review feedback for focused corrections. If a factual premise remains unsupported,
+reopen the relevant original or narrow the claim. A successful publication
+completes the stage. Carry forward useful questions with verifiable premises and
+state any remaining coverage gaps in the report.
+
+## General research
 
 Use the supplied asset, time window, source IDs, collections and registered
 measurements as the starting state. Reuse exact saved excerpts and registered
@@ -20,9 +88,9 @@ Storage mapping, skill reading and each individual tool are not research stages.
 For report recovery, reuse supplied task notes and acquired work. Batch
 independent focused reads.
 Successful reader quotes already bind exact opened source ranges; use them and
-reopen only a missing condition or a specific spot check. Save a short
-unpublished draft as soon as the first scoped observation is supported. Then
-fill material gaps before publish_report. If a draft needs correction, prefer
+reopen only a missing condition or a specific spot check. A non-periodic report
+may save a short unpublished draft once a scoped observation is supported. Fill
+material gaps before publish_report. If a draft needs correction, prefer
 publish_saved_report with explicit field edits from the actual feedback. A draft
 is a recoverable artifact, not proof that all needed evidence has been read.
 Being recalled or opened does not bind a source to the submitted report. During
@@ -62,20 +130,25 @@ calculation only when a material gap or the user's requested depth requires it.
   duplicate groups and gaps; use these to choose a specific missing topic/date
   query. Coverage limitations remain limitations even after a full catalog scan.
   Inspect additional fields only when they can change a claim or its limitation.
-- For weekly/monthly reports resolve an explicit UTC start/end window before
-  recall and pass it to `recall_memory(kind="news", start=..., end=...)`. Begin
-  with a broad public asset/window query. Compare selected dates and themes with
-  candidate coverage. If results cluster on a few dates or one event, use a
+- For a period report pass the requested UTC bounds to
+  `recall_memory(kind="news", start=..., end=...)`. Begin with a broad public
+  asset/window lookup. If observations uncover distinct lines of inquiry, optional
+  concise `facet_queries` can help locate additional candidates. Follow
+  source links to check the exact wording and scope of a reported update or
+  dispute, and attribute repeated reports to their available origin. Group
+  membership can identify candidates; verify material claims and open a
+  focused read when an important qualification is missing. Compare selected
+  dates and themes with candidate coverage. If results cluster on a few dates or one event, use a
   blank-query window overview or a targeted query for the missing dates/themes.
-  For a narrow follow-up start with 6–8 passages. Use a focused original read
-  only when the returned passage leaves a material clause or timestamp unresolved.
+  For a narrow follow-up, omit `facet_queries` and start with 6–8 passages.
+  When the source is already known, use `read_evidence` with the full record ID
+  and a query for the material clause or timestamp that remains unresolved.
+  If you have an exact public source URL but no record ID, use
+  `find_saved_news_url` with the requested date window. An archive miss may be
+  recorded as a limitation; retain any usable secondary attribution.
   When the central metrics and distinct developments are supported, submit the
   draft and use review feedback for remaining corrections.
-  For a broad weekly brief, consider market and fund flows, protocol/security,
-  and adoption/governance or policy as applicable to the request and sources.
-  Begin with one broad window recall and the main saved market series. Three to
-  six distinct supported developments is a useful planning target when sources
-  support them. The requested scope and evidence determine the actual count.
+  The requested scope and evidence determine the range and number of developments.
   Follow up on a specific uncovered date, theme or conflicting account when it
   could change the report. Stop discovery when another query would repeat
   covered events or leave the main findings and limitations unchanged.
@@ -92,13 +165,20 @@ calculation only when a material gap or the user's requested depth requires it.
   a conversation starts as a short question. The initial chat label does not
   restrict skills, planning or delegation. A saved-result explanation can stay
   direct; a multi-source investigation needs a proportional plan.
-- Keep broad date/topic coverage and synthesis in the main agent. For a weekly
-  report with multiple substantial original documents, prefer native `task` with
-  `subagent_type="evidence-reader"` for a specific evidence question: does a
-  later notice change an upgrade's plan, or do saved flow reports use comparable
-  definitions? Keep unrelated protocol discussions in separate questions only
-  when they matter to the report. Do not assign an entire staking/governance
-  ecosystem or a catalog of threads to one worker.
+- For each concrete research question, use a stable ID such as `Q1`. Outside the
+  periodic report workflow, use `[Q1]` on the corresponding plan item. Use the
+  same ID for focused source calls and the bracketed prefix on reader descriptions.
+  For a cross-topic overview, use a shared lookup.
+  On focused terminal research SDK source calls, pass the same question_id.
+  The task memory links opened sources, reader findings,
+  conflicts, outstanding gaps and previous attempts to this question.
+  After an interruption, inspect the saved question before commissioning more
+  work. Use `update_research_question` to record a sourced assessment or an
+  outstanding limitation. Use those records when drafting the relevant section.
+- Keep source selection and final synthesis in the main agent. For multiple
+  substantial originals, prefer native `task` with `subagent_type="evidence-reader"`
+  to compare exact wording, versions or definitions for a specific question.
+  Keep unrelated material in separate questions when it matters to the report.
   A few short sources can be read directly. Do not delegate each chunk, impose a
   worker quota or ask a worker to rewrite the whole report.
   Supply the public question to settle, asset, window/cutoff and prioritized
@@ -133,8 +213,8 @@ calculation only when a material gap or the user's requested depth requires it.
 - Before treating an important event date as the current next checkpoint, check
   later primary-source updates. A newly captured old page is not a new publisher
   update. Saved news recall includes bounded event/source-version context and
-  related candidates; use related_queries for up to two local entity checks
-  (for example Hoodi), then read the actual candidate evidence. A candidate is
+  related candidates; use related_queries for up to two local checks of an entity
+  already identified in evidence, then read the actual candidate evidence. A candidate is
   neither a confirmed same event nor proof of cancellation. Preserve conflicts
   and an unknown event status where the documents do not settle them.
 - Use recall_memory(kind="news"/"research"/"events") for prior material. Earlier
@@ -254,11 +334,9 @@ counterevidence, or later update). Use limitations for missing usable sources.
 Keep summary and judgment consistent with the cited facts. Full purchase reports
 should explain conditions, contrary evidence, invalidation, costs and missing user
 information in purchase_decision. A short market summary needs no forced simulation.
-Questions to watch are optional. For a short factual brief, use zero or one useful
-future question. For a broad period report, default to two priority checks and
-add a third only for a distinct material development. Order short questions by
-importance and verify any factual premise. Use limitations for relevant coverage
-and measurement gaps.
+Questions to watch are optional. Include actionable checks when the evidence
+leaves a material issue for the next report. Order them by importance and verify
+any factual premise. Use limitations for relevant coverage and measurement gaps.
 For a compact brief, keep only central measurements in observations and put each
 news development in its own event entry. Open with the main finding and its
 qualification. A requested main-body word budget counts summary, observations,

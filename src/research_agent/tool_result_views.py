@@ -26,7 +26,7 @@ def _fields(value, names):
 
 def publication_schema_errors(tool, arguments, *, status):
     """Host schema errors only; never infer validation from returned source text."""
-    if status!='error' or getattr(tool,'name',None) not in ('publish_report','publish_saved_report'):
+    if status!='error' or getattr(tool,'name',None) not in ('save_report_draft','publish_report','publish_saved_report'):
         return None
     schema=getattr(tool,'args_schema',None)
     if not isinstance(schema,type) or not issubclass(schema,BaseModel):return None
@@ -106,6 +106,24 @@ def _passage_packet(obj):
             'abstained_or_unavailable_count','unjudged_positions_unchanged','scope'))
         if 'accepted_ranks' in reranking:
             packet['selection']['jev_reranking']['diagnostics_pointer']='/selection/jev_reranking/accepted_ranks'
+    memory = obj.get('memory_bundles')
+    if isinstance(memory, dict):
+        facets = []
+        selected_ids = {row['passage_id'] for row in packet['results']}
+        for item in memory.get('facets', [])[:6]:
+            if not isinstance(item, dict):
+                continue
+            ids = [pid for pid in item.get('passage_ids', []) if pid in selected_ids]
+            facets.append({**_fields(item, ('question', 'state')),
+                           'passage_ids': ids[:10], 'passage_count': len(ids)})
+        links = memory.get('relations', [])
+        packet['memory_bundles'] = {
+            'facets': facets, 'source_origins': memory.get('source_origins', {}),
+            'relations': links[:12], 'relation_count': len(links),
+            'scope': memory.get('scope'),
+        }
+        if len(links) > 12 or any(item['passage_count'] > 10 for item in facets):
+            packet['memory_bundles']['diagnostics_pointer'] = '/memory_bundles'
     for key in ('conflicts', 'gaps'):
         rows = obj.get(key)
         if isinstance(rows, list):
